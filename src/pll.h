@@ -1,24 +1,46 @@
 #pragma once
 
+// Fixed-refresh vblank phase tracker. Follows real
+// vblank edges with a PI-smoothed phase and supplies the cadence grid's fixed
+// reference. It never re-anchors on CPU wakes. Pure C++17; owned and called
+// only by the scheduler owner.
+
+#include "cadence_grid.h"
+
 #include <cstdint>
 
-// Strong PLL for Fixed mode: PI controller (Kp=0.05, Ki=0.002).
-// Spec §II.5.
+class VBlankPhaseTracker {
+public:
+    static constexpr double kPhaseGain = 0.1;      // proportional phase correction per edge
+    static constexpr double kIntegralGain = 0.01;  // accumulated phase trim per edge
+    // Edge errors beyond this share of a refresh relock to the observed edge.
+    static constexpr double kRelockFraction = 0.25;
 
-struct PLL {
-    double period_us = 0.0;       // target grid period in μs
-    double phase_error_accum = 0.0; // integral term
-    int64_t last_grid_qpc = 0;   // last grid edge in QPC
-    int64_t last_vblank_qpc = 0;
+    void Reset() noexcept;
 
-    static constexpr double Kp = 0.05;
-    static constexpr double Ki = 0.002;
+    // One observed vblank edge. estimated_refresh_us > 0 supplies the refresh
+    // period; otherwise the period follows adjacent vblank deltas (missed
+    // vblanks divide out). Non-positive or backward timestamps are ignored.
+    void IngestVBlank(
+        int64_t vblank_qpc,
+        int64_t qpc_frequency,
+        double estimated_refresh_us) noexcept;
 
-    void SetPeriodIfChanged(double new_period_us);
-    void IngestVBlank(int64_t vblank_qpc);
-    int64_t NextGridEdge(int64_t now_qpc) const;
-    void RecordWake(int64_t actual_qpc, uint64_t frameID);
-    void Reanchor(int64_t now_qpc);
+    // Grid reference {edge_qpc, refresh_ticks}; edge_qpc 0 until two edges
+    // have been observed with a known refresh period.
+    CadenceGridFixedReference Reference() const noexcept;
+
+    uint64_t Relocks() const noexcept { return relocks_; }
+
+private:
+    int64_t edge_qpc_ = 0;        // smoothed edge, whole ticks
+    double edge_fraction_ = 0.0;  // fractional tick of the smoothed edge, [0, 1)
+    double refresh_ticks_ = 0.0;
+    double integral_ticks_ = 0.0;
+    int64_t last_vblank_qpc_ = 0;
+    uint32_t observations_ = 0;
+    uint64_t relocks_ = 0;
 };
 
-extern PLL g_pll;
+// Scheduler owner only.
+extern VBlankPhaseTracker g_vblank_phase;

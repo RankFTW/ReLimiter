@@ -1,5 +1,6 @@
 #pragma once
 
+#include "fg_state_policy.h"
 #include <Windows.h>
 #include <atomic>
 #include <cstdint>
@@ -9,49 +10,65 @@
 
 #ifdef _WIN64
 
-// FG state — read by scheduler
-extern std::atomic<int>  g_fg_multiplier;  // raw numFramesToGenerate
+// FG state, read by the scheduler, the route and the overlay: the EFFECTIVE state, published only by the resolver in
+// streamline_hooks.cpp (FrameGeneration_ResolveState in fg_state_policy.h) from Streamline's options, the legacy
+// evidence (GetState, the deferred inference) and Streamline's fresh in-band statement (SetReflexSync fgMultiplier).
+extern std::atomic<int>  g_fg_multiplier;  // effective generated frames per real frame (numFramesToGenerate's meaning)
 extern std::atomic<bool> g_fg_active;
 extern std::atomic<bool> g_fg_presenting;  // true when FG is actually producing frames
 
-// DMFG state — DLSSGMode: 0=eOff, 1=eOn (static FG), 2=eAuto (Dynamic MFG)
+// Public DLSSGMode: 0=eOff, 1=eOn, 2=eAuto, 3=eDynamic.
 extern std::atomic<int>  g_fg_mode;
 
 // Game's requested MaxFrameLatency, captured by FLC vtable hook
 extern std::atomic<uint32_t> g_game_requested_latency;
 
-// Driver-reported actual FG multiplier from GetState
+// Effective multiplier (output frames per real frame) when known: the in-band statement or GetState's
 extern std::atomic<int> g_fg_actual_multiplier;
 
-// Called from LoadLibrary hook when sl.interposer.dll is detected.
-void HookStreamlinePCL(HMODULE hInterposer);
+// Owned loader-install worker only, with a referenced interposer module and
+// no loader lock held. Lazy game callbacks only request deferred retries.
+// True once Streamline resolves slDLSSGSetOptions: slInit has loaded DLSS-G.
+bool HookStreamlinePCL(HMODULE hInterposer);
 
-// Called each frame from the scheduler to check if deferred FG inference
-// should be promoted (for games that never call GetState, e.g. HFW).
-void CheckDeferredFGInference();
+// Once per Present: the deferred inference, the in-band statement's acceptance and freshness, the Dynamic MFG
+// check, then the resolver publishes the effective state when it changed.
+void FrameGeneration_OnPresent();
+
+// Hook_SetReflexSync, every call (Streamline's DLSS-G thread): one lock-free fold of the stated multiplier. A call
+// that states nothing (0, a disable call) neither changes the statement nor keeps it fresh.
+void Streamline_RecordReflexSyncStatement(uint32_t stated, bool disable) noexcept;
+
+// The published resolver results: whether the in-band statement decided the state, and why the FG input route
+// cannot take frames now (None: it can; FrameGeneration_RouteRejection).
+bool Streamline_StatementAuthority() noexcept;
+FgRouteRejection Streamline_RouteRejection() noexcept;
 
 // Returns true if the FG runtime DLL is loaded (nvngx_dlssg.dll etc.)
 bool IsFGDllLoaded();
 
-// Returns true if DMFG is inferred from latency hint (latency >= 4, no FG DLL)
+// Historical static helper for the latency/no-FG-DLL heuristic.
 bool IsDmfgSession();
 
-// Returns true if g_fg_mode == 2 OR IsDmfgSession() returns true.
-// Single authoritative DMFG check for all subsystems.
+// Returns true for the NVIDIA DRS Dynamic-MFG override or the legacy manual
+// passthrough setting. Single authoritative DMFG check for all subsystems.
 bool IsDmfgActive();
 
 // Returns true if NVIDIA Smooth Motion (nvpresent64.dll) is loaded.
 // SM is a driver-level 2x frame gen — always doubles output FPS.
 bool IsNvSmoothMotionActive();
 
-// Streamline Compatibility: poll GetState without hooking.
-// Call from the OSD draw loop. Throttled internally to every 500ms.
+// Compatibility entry retained for call-site stability. It intentionally does
+// not issue non-thread-safe GetState calls outside the game's own boundary.
 void StreamlineCompat_Poll();
 
 // Returns true if Streamline SetOptions has ever provided FG mode data.
 // When false, g_fg_mode is unreliable (stays at 0) and g_fg_presenting
 // should be used as the FG state authority instead.
 bool Streamline_HasModeData();
+
+// Clear all frame-generation authority on a full swapchain lifetime teardown.
+void Streamline_ResetLifetime();
 
 #else // 32-bit stubs — FG/Streamline/DLSS are 64-bit only
 
@@ -63,13 +80,17 @@ inline std::atomic<int>      g_fg_mode{0};
 inline std::atomic<uint32_t> g_game_requested_latency{0};
 inline std::atomic<int>      g_fg_actual_multiplier{0};
 
-inline void HookStreamlinePCL(HMODULE) {}
-inline void CheckDeferredFGInference() {}
+inline bool HookStreamlinePCL(HMODULE) { return false; }
+inline void FrameGeneration_OnPresent() {}
+inline void Streamline_RecordReflexSyncStatement(uint32_t, bool) noexcept {}
+inline bool Streamline_StatementAuthority() noexcept { return false; }
+inline FgRouteRejection Streamline_RouteRejection() noexcept { return FgRouteRejection::NotPresenting; }
 inline bool IsFGDllLoaded() { return false; }
 inline bool IsDmfgSession() { return false; }
 inline bool IsDmfgActive() { return false; }
 inline bool IsNvSmoothMotionActive() { return false; }
 inline void StreamlineCompat_Poll() {}
 inline bool Streamline_HasModeData() { return false; }
+inline void Streamline_ResetLifetime() {}
 
 #endif // _WIN64

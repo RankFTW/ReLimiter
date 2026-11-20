@@ -1,18 +1,19 @@
 #include "osd.h"
+#include "osd_position_policy.h"
+#include "osd_cadence_policy.h"
+#include "osd_overlay_policy.h"
 #include "config.h"
 #include "scheduler.h"
-#include "predictor.h"
+#include "pacing_resolver.h"
 #include "fg_divisor.h"
 #include "display_state.h"
 #include "marker_log.h"
 #include "nvapi_types.h"
 #include "correlator.h"
-#include "stress_detector.h"
 #include "streamline_hooks.h"
+#include "streamline_gpu_handoff.h"
 #include "wake_guard.h"
-#include "pqi.h"
 #include "csv_writer.h"
-#include "baseline.h"
 #include "swapchain_manager.h"
 #include "enforcement_dispatcher.h"
 #include "loadlib_hooks.h"
@@ -23,29 +24,78 @@
 #include "reflex_inject.h"
 #include "presentation_gate.h"
 #include "flip_model.h"
-#include "adaptive_smoothing.h"
 #include "hw_monitor.h"
 #include "feedback.h"
 #include "ngx_hooks.h"
 #include "dlss_presets.h"
 #include "blackout.h"
+#include "hotkey_edge.h"
+#include "hotkey_poller.h"
+#include "background_tasks.h"
 #include "focus_lock.h"
 #include "logger.h"
+#include "native_pcl_measurement.h"
+#include "pacing_telemetry.h"
+#include "runtime_lifecycle.h"
 #include <string>
+#include <array>
 #include <atomic>
 #include <algorithm>
+#include <cmath>
+#include <mutex>
+#include <new>
 
 // ── OSD readout state ──
 static double s_real_fps = 0.0;
+static osd_cadence_policy::Consumer s_cadence_consumer;
 
 // ── Frametime history for graph ──
 static constexpr int FT_HISTORY_SIZE = 200;
 static float s_ft_history[FT_HISTORY_SIZE] = {};
 static int   s_ft_history_idx = 0;
+static int   s_ft_history_count = 0;
 
 // ── Adaptive graph scale ──
 static float s_graph_scale_min = 0.0f;
 static float s_graph_scale_max = 33.0f;
+
+static HotkeySlot s_capturing_hotkey = HotkeySlot::Count;
+static bool s_binding_drawn = false;
+static std::atomic<reshade::api::effect_runtime*> s_capture_runtime{nullptr};
+static bool s_overlay_registered = false;
+static unsigned s_runtime_count = 0;
+static bool s_readout = false;
+static osd_overlay_policy::DetailsPanels s_details;
+static bool s_showing = false;
+static unsigned s_sensor_mask = 0;
+static std::atomic<bool> s_registration_pending{false};
+static std::atomic<bool> s_poll_fallback{false};
+// Teardown must not wait for an entire settings callback (it can be in a
+// driver call). Only cold registration and consumer admission take this lock.
+static std::mutex s_transition_lock;
+
+// ReShade draws the settings panel before reshade_overlay in one ImGui frame.
+// Reuse its DRS and NGX reads when both surfaces are visible. The runtime and
+// frame token prevent replay after a skipped draw; the config owner serializes
+// the callbacks even when two runtimes have independent ImGui contexts.
+static struct {
+    reshade::api::effect_runtime* runtime = nullptr;
+    int frame = -1;
+    DLSSPresets presets{};
+    NGXDLSSInfo dlss{};
+} s_panel;
+static void PublishHotkeyBindings();
+static void UpdateOsdDemand();
+
+static bool DrawKeybind(const char* label, std::string* binding, HotkeySlot slot, bool editable);
+
+void OSD_CyclePosition() {
+    const auto next = osd_position_policy::NextClockwise(g_config.osd_x, g_config.osd_y);
+    g_config.osd_x = next.x;
+    g_config.osd_y = next.y;
+    LOG_INFO("OSD: position cycle -> %.0f, %.0f", next.x, next.y);
+    RequestSaveConfig();
+}
 
 // Tooltip helper
 static void HelpTip(const char* text) {
@@ -96,19 +146,25 @@ static void MoveWindowToMonitor(int idx) {
     HWND hwnd = SwapMgr_GetHWND();
     if (!hwnd || idx < 0 || idx >= s_monitor_count) return;
     struct MoveData { HWND hwnd; RECT rc; };
-    auto* data = new MoveData{ hwnd, s_monitors[idx].rc };
-    CreateThread(nullptr, 0, [](LPVOID param) -> DWORD {
-        auto* d = static_cast<MoveData*>(param);
-        RECT& rc = d->rc;
-        int w = rc.right - rc.left;
-        int h = rc.bottom - rc.top;
-        SetWindowPos(d->hwnd, nullptr, rc.left, rc.top, w, h,
-                     SWP_NOZORDER | SWP_NOACTIVATE);
-        Sleep(100);
-        QueryVRRCeiling();
-        delete d;
-        return 0;
-    }, data, 0, nullptr);
+    auto* data = new (std::nothrow) MoveData{ hwnd, s_monitors[idx].rc };
+    if (!data) return;
+    if (!BackgroundTasks_Start([](LPVOID param) -> DWORD {
+            auto* d = static_cast<MoveData*>(param);
+            RECT& rc = d->rc;
+            int w = rc.right - rc.left;
+            int h = rc.bottom - rc.top;
+            SetWindowPos(d->hwnd, nullptr, rc.left, rc.top, w, h,
+                         SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+            Sleep(100);
+            if (!RuntimeLifecycle_IsStopping()) {
+                try { QueryVRRCeiling(); }
+                catch (...) { }
+            }
+            delete d;
+            return 0;
+        }, data)) {
+        delete data;
+    }
 }
 
 // ── Sticky monitor: re-apply after alt-tab if window drifted ──
@@ -133,8 +189,267 @@ static void EnforceStickyMonitor() {
     MoveWindowToMonitor(idx);
 }
 
-void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
-    // Dirty flag — set by any config change, triggers SaveConfig at end of frame
+// ── Pacing pipeline controls ──
+
+static const char* PacingRouteLabel() {
+    const auto path = EnfDisp_GetActivePath();
+    if (path == EnforcementPath::NvAPIMarkers || path == EnforcementPath::PCLMarkers) return "Reflex markers";
+    if (path == EnforcementPath::PresentBased) return "Present-based";
+    return "waiting for a presenting swapchain";
+}
+
+// The Frame Pacing readings are defined with the OSD drawing below; the settings panel's Details tree prints
+// the same Jitter figure.
+static const PacingTelemetrySnapshot* ReadFreshPacingSnapshot();
+static void FormatPacingSourceWhat(const PacingTelemetrySnapshot& snapshot, char* buf, size_t size);
+
+// Resolved pipeline (resolver publication) and the source stage's lead and grid.
+static void DrawPacingPipelineStatus() {
+    const PacingPipelineSnapshot pipeline = PacingPipeline_Read();
+    ImGui::TextDisabled("Route: %s", PacingRouteLabel());
+    ImGui::TextDisabled("Mode: %s | Output: %s | Reason: %s",
+        PacingTimingMode_Text(pipeline.mode), PacingRung_Text(pipeline.rung),
+        PacingFallbackReason_Text(pipeline.reason));
+    // The Jitter the OSD shows, with what was measured; nothing while no source has samples.
+    if (const PacingTelemetrySnapshot* pacing = ReadFreshPacingSnapshot()) {
+        if (pacing->display_valid && pacing->jitter_samples != 0) {
+            char what[96];
+            FormatPacingSourceWhat(*pacing, what, sizeof(what));
+            ImGui::TextDisabled("Jitter: %.2f ms (%s)", pacing->adjacent_jitter_mean_us / 1000.0, what);
+        }
+    }
+    SchedulerPacingStatus status;
+    const bool has_status = Scheduler_ReadPacingStatus(&status);
+    // Source placement.
+    if (pipeline.placement == PacingSourcePlacement::DriverLimiter) {
+        if (has_status && status.driver_limiter_interval_us > 0)
+            ImGui::TextDisabled("Placement: Reflex driver limiter (%.2f ms)",
+                status.driver_limiter_interval_us / 1000.0);
+        else
+            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "Placement: Reflex driver limiter (not applied)");
+    } else {
+        ImGui::TextDisabled("Placement: %s", PacingSourcePlacement_Text(pipeline.placement));
+    }
+    if (has_status && status.valid) {
+        ImGui::TextDisabled("Lead: %.2f ms (%s, %u samples%s) | Grid epoch: %u",
+            status.lead_us / 1000.0, status.lead_warm ? "warm" : "warming",
+            status.lead_samples, status.lead_budget_limited ? ", at budget" : "", status.grid_epoch);
+        // Lead spike floor (lead_controller.h): shown where it applies.
+        if (status.lead_floor_us > 0.0) {
+            ImGui::TextDisabled("Lead spike floor: %.2f ms | own quantile %.2f ms%s", status.lead_floor_us / 1000.0,
+                status.lead_quantile_us / 1000.0, status.lead_floor_limited ? " | sets the lead" : "");
+        }
+    } else {
+        ImGui::TextDisabled("Lead: - | Grid epoch: -");
+    }
+    const bool gpu_rung = pipeline.rung == PacingRung::GpuQueueWait || pipeline.rung == PacingRung::FgInputWait;
+    if (has_status && status.valid && pipeline.rung == PacingRung::GpuQueueWait) {
+        // Collision-aware release: the release headroom (to the next frame's
+        // heavy GPU work) or, without current Reflex GPU active times, the
+        // release margin (to the next Present call); the newest limit, the
+        // share of leads it lowered and the late resumes measured.
+        if (status.collision_aside) {
+            ImGui::TextDisabled("Release headroom %.2f ms | guard off (no next-frame GPU work seen beside the gate, %u pairs)",
+                status.release_headroom_us / 1000.0, status.queue_order_pairs);
+        } else if (status.collision_checked > 0 && status.collision_headroom) {
+            ImGui::TextDisabled("Release headroom %.2f ms | limit %.2f ms | guarded %.0f%% | late %u/%u",
+                status.release_headroom_us / 1000.0, status.collision_limit_us / 1000.0,
+                100.0 * status.collision_guarded / status.collision_checked,
+                status.release_headroom_late, status.release_headroom_samples);
+        } else if (status.collision_checked > 0) {
+            ImGui::TextDisabled("Release margin %.2f ms | limit %.2f ms | guarded %.0f%% | late %u/%u",
+                status.release_margin_us / 1000.0, status.collision_limit_us / 1000.0,
+                100.0 * status.collision_guarded / status.collision_checked,
+                status.release_margin_late, status.release_margin_samples);
+        } else {
+            ImGui::TextDisabled("Release margin %.2f ms | limit - (measuring) | late %u/%u",
+                status.release_margin_us / 1000.0, status.release_margin_late, status.release_margin_samples);
+        }
+    }
+    // Driver Sleep time while the GPU wait holds (measured, not acted on).
+    if (gpu_rung)
+        ImGui::TextDisabled("Driver Sleep: %.2f ms",
+            g_pacer_latency_us.load(std::memory_order_relaxed) / 1000.0);
+    HelpTip("Mode, output point and fallback reason resolved from the pacing route and the display. "
+        "Lead is how far ahead of each output target the game is released; 'at budget' means it is clamped "
+        "to three frame intervals. A grid epoch starts on a cap, LFC or FG divisor change, or after a late "
+        "frame; the cadence never catches up. 'Release headroom' keeps "
+        "the release at least this long before the next frame's heavy GPU work starts (its GPU ready time "
+        "minus its Reflex GPU active time): the GPU does not interrupt that work for the frame being "
+        "released, so the lead is limited to one interval plus the game's short release-to-GPU-work time "
+        "minus the headroom ('limit'); a frame that would need more arrives a little late and is shown when "
+        "ready. The headroom is 1 ms. Without Reflex GPU times, 'Release margin' does the same against the "
+        "next frame's Present call instead (2.5 ms). 'guarded' is the share of leads the limit lowered, "
+        "'late' the waited GPU resumes more than 1 ms after the release among those measured; nothing acts "
+        "on them.");
+}
+
+// Plain-language pacing state for the main view; the technical lines are in
+// Details (DrawPacingPipelineStatus).
+static void DrawPacingSummaryLine(const PacingPipelineSnapshot& pipeline, bool has_status,
+    const SchedulerPacingStatus& status) {
+    const ImVec4 green(0.2f, 0.9f, 0.2f, 1.0f);
+    const ImVec4 gray(0.6f, 0.6f, 0.6f, 1.0f);
+    const ImVec4 amber(1.0f, 0.7f, 0.3f, 1.0f);
+    const bool holding = pipeline.rung != PacingRung::SourceOnly;
+    const bool gpu = pipeline.rung == PacingRung::GpuQueueWait || pipeline.rung == PacingRung::FgInputWait;
+    const PacingTestMode test_mode = PacingPipeline_TestMode();
+    if (test_mode == PacingTestMode::ReflexOnly) {
+        ImGui::TextColored(gray, "Test mode reflex_only: ReLimiter paces nothing (the game's own Reflex runs)");
+        return;
+    }
+    if (test_mode == PacingTestMode::DriverLimiter && pipeline.reason != PacingFallbackReason::DriverLimiterUnavailable) {
+        // The limiter holds the cap only while the resolved placement is the driver limiter; every other state of the
+        // mode is a pass-through that claims no cap.
+        if (pipeline.placement == PacingSourcePlacement::DriverLimiter)
+            ImGui::TextColored(gray, "Test mode driver_limiter: the NVIDIA limiter holds the cap (ReLimiter holds nothing)");
+        else
+            ImGui::TextColored(gray, "Test mode driver_limiter: not applied right now (the game runs as it is)");
+        return;
+    }
+    if (const char* capped = PacingFallbackReason_CappedSummary(pipeline.reason)) {
+        ImGui::TextColored(gray, "%s", capped);
+        return;
+    }
+    switch (pipeline.reason) {
+    case PacingFallbackReason::Passthrough:
+        ImGui::TextColored(gray, g_config.target_fps > 0 ? "Not pacing right now" : "No FPS cap set");
+        return;
+    case PacingFallbackReason::IdleCap:
+        ImGui::TextColored(gray, "Idle cap active (background, FG-Off Cap or OLED Care)");
+        return;
+    case PacingFallbackReason::DriverLimiterUnavailable:
+        ImGui::TextColored(gray, "Test mode driver_limiter: the NVIDIA limiter can't apply here (the game runs as it is)");
+        return;
+    case PacingFallbackReason::NoNativeRoute:
+    case PacingFallbackReason::NoGpuQueue:
+    case PacingFallbackReason::FgUnqualified:
+        if (!holding) {
+            ImGui::TextColored(amber, "Getting ready...");
+            return;
+        }
+        break;
+    default:
+        break;
+    }
+    if (holding && has_status && status.valid && !status.lead_warm)
+        ImGui::TextColored(amber, "Learning the game's frame timing...");
+    else if (gpu)
+        ImGui::TextColored(green, "Smooth: frames are held on the GPU to an even cadence");
+    else if (holding)
+        ImGui::TextColored(green, "Smooth: frames are held to an even cadence");
+    else
+        ImGui::TextColored(gray, "Capped (frames are not held)");
+}
+
+// Main view: the plain state, a warning while developer diagnostics differ
+// from the recommended defaults, and the technical lines under Details.
+static void DrawPacingSummary(reshade::api::effect_runtime* runtime, bool* config_dirty) {
+    const PacingPipelineSnapshot pipeline = PacingPipeline_Read();
+    SchedulerPacingStatus status;
+    const bool has_status = Scheduler_ReadPacingStatus(&status);
+    DrawPacingSummaryLine(pipeline, has_status, status);
+    const int overrides = Config_DeveloperOverrides();
+    if (overrides > 0) {
+        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "%d developer setting%s changed from the defaults",
+            overrides, overrides == 1 ? "" : "s");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Reset##developer")) {
+            Config_ResetDeveloperSettings();
+            *config_dirty = true;
+        }
+        HelpTip("Developer diagnostics (developer_settings=true in relimiter.ini) are set away from the "
+            "recommended defaults, which can make pacing worse. Reset returns all of them to the defaults.");
+    }
+    if (ImGui::TreeNode("Details##pacing")) {
+        if (s_details.Draw(runtime)) UpdateOsdDemand();
+        DrawPacingPipelineStatus();
+        ImGui::TreePop();
+    }
+}
+
+#ifdef _WIN64
+// Pacing preference: one combo for the queue-based pacer's trade between latency and even frames (64-bit).
+static void DrawPacingPreferenceControl(bool* config_dirty) {
+    static const char* const kPreferenceLabels[] = {"Lower latency", "Balanced", "Smoother"};
+    static_assert(IM_ARRAYSIZE(kPreferenceLabels) == static_cast<int>(PacingPreference::Count),
+        "one label per pacing preference");
+    int selected = static_cast<int>(g_config.pacing_preference);
+    if (ImGui::Combo("Pacing preference", &selected, kPreferenceLabels, IM_ARRAYSIZE(kPreferenceLabels))) {
+        g_config.pacing_preference = static_cast<PacingPreference>(selected);
+        Config_ApplyPacingPipeline();
+        LOG_INFO("OSD: pacing preference -> %s", PacingPreference_Text(g_config.pacing_preference));
+        *config_dirty = true;
+    }
+    HelpTip("Smoother: with DLSS frame generation 2x and no cap the GPU can hold, gives up about 3% frame rate for "
+        "more even frames; no effect with a cap the GPU can hold or without frame generation. Lower latency: "
+        "keeps less work waiting for the GPU; in testing up to about 2 ms lower latency, in some games a "
+        "slightly lower frame rate and less even frames. Balanced is the default. Applies to 64-bit "
+        "DirectX 12 games.");
+    // A developer key that differs from its default decides its own value: the selected position is then not what runs.
+    const PacingPreferenceResolution position = PacingPipeline_ResolvePreference(g_config.pacing_preference,
+        kPacingUnifiedQueueRankDefault, kPacingUnifiedHoldShareDefault);
+    const PacingPreferenceResolution effective = PacingPipeline_ResolvePreference(g_config.pacing_preference,
+        g_config.unified_queue_rank, g_config.unified_hold_share);
+    if (position.queue_rank != effective.queue_rank || position.hold_share != effective.hold_share)
+        ImGui::TextDisabled("A developer setting overrides the selected position.");
+}
+#endif
+
+// Advanced → Developer diagnostics (developer_settings=true in the INI): the pacing owner for comparison captures
+// (pacing_test_mode), the GPU wait probes and flip metering. Each control can make pacing worse on purpose.
+static void DrawPacingDiagnostics(bool* config_dirty) {
+    ImGui::Spacing();
+    ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "Developer diagnostics");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Reset to defaults##developer")) {
+        Config_ResetDeveloperSettings();
+        *config_dirty = true;
+    }
+    HelpTip("Shown because developer_settings=true in relimiter.ini. For comparison captures; each "
+        "control can make pacing worse on purpose. Reset returns all of them to the recommended defaults.");
+    static const char* const kOwnerLabels[] = {"ReLimiter (default)", "Reflex only (ReLimiter paces nothing)",
+        "Reflex driver limiter"};
+    static_assert(IM_ARRAYSIZE(kOwnerLabels) == static_cast<int>(PacingTestMode::Count),
+        "one label per pacing test mode");
+    int owner = static_cast<int>(g_config.pacing_test_mode);
+    if (ImGui::Combo("Pacing owner (test)", &owner, kOwnerLabels, IM_ARRAYSIZE(kOwnerLabels))) {
+        g_config.pacing_test_mode = static_cast<PacingTestMode>(owner);
+        Config_ApplyPacingPipeline();
+        LOG_INFO("OSD: pacing test mode -> %s", PacingTestMode_Text(g_config.pacing_test_mode));
+        *config_dirty = true;
+    }
+    HelpTip("Diagnostic, 64-bit Reflex games. ReLimiter (default) paces. Reflex only: ReLimiter paces nothing and "
+        "the game's own Reflex calls run as they are, with the saved cap kept. Reflex driver limiter: the cap "
+        "goes to the NVIDIA driver's own limiter as its minimum interval and ReLimiter holds nothing; where the "
+        "limiter cannot apply (idle caps, no Reflex Sleep from the game, Present-based routes, 32-bit) the game "
+        "runs as it is and the pacing state says so. The saved choice is kept in relimiter.ini.");
+#ifdef _WIN64
+    if (ImGui::Checkbox("GPU Wait Probes", &g_config.gpu_present_gate_probes)) {
+        Config_ApplyPacingPipeline();
+        LOG_INFO("OSD: GPU wait probes -> %s", g_config.gpu_present_gate_probes ? "on" : "off");
+        *config_dirty = true;
+    }
+    HelpTip("GPU wait output only: GPU timestamp queries immediately before and after the queue Wait. "
+        "The times are exported as gate_pre_wait_qpc and gate_post_wait_qpc in the pacing CSV, refine "
+        "the lead and measure the late GPU resumes shown on the Details lines. Off removes two command "
+        "lists and two fence signals per frame from the game's queue.");
+
+    if (ImGui::Checkbox("Flip metering off (next launch)", &g_config.flip_metering_off)) {
+        LOG_INFO("OSD: flip metering off -> %s (applies from the next launch)",
+            g_config.flip_metering_off ? "on" : "off");
+        *config_dirty = true;
+    }
+    HelpTip("Diagnostic, DLSS Frame Generation on GPUs with hardware flip metering (RTX 50). On hides "
+        "NvAPI_D3D12_SetFlipConfig from the game, so frame generation runs as on a GPU without hardware flip "
+        "metering: the display engine no longer spaces the generated frames. Takes effect at the next "
+        "game launch. Leave off with Smooth Motion, which needs flip metering.");
+#endif
+    ImGui::Spacing();
+}
+
+static void DrawSettingsImpl(reshade::api::effect_runtime* runtime, bool editable_bindings) {
+    // Dirty flag — enqueue an immutable save snapshot at end of frame.
     bool config_dirty = false;
 
     // Lazy install focus lock if enabled in config but not yet installed,
@@ -168,12 +483,11 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         reflex_cap = static_cast<int>(ceiling_hz - (ceiling_hz * ceiling_hz / 3600.0));
 
     // Check for Dynamic DMFG early — affects all FPS controls
-    bool dmfg_dynamic_active = false;
-    {
-        DLSSPresets p_drs = DLSSPresets_Get();
-        if (p_drs.available && p_drs.mfg_mode_override == 4)
-            dmfg_dynamic_active = true;
-    }
+    s_panel.runtime = runtime;
+    s_panel.frame = s_overlay_registered ? ImGui::GetFrameCount() : -1;
+    const auto& presets = (s_panel.presets = DLSSPresets_Get());
+    const auto& dlss = (s_panel.dlss = NGXHooks_GetInfo(true));
+    const bool dmfg_dynamic_active = presets.available && presets.mfg_mode_override == 4;
 
     if (dmfg_dynamic_active) ImGui::BeginDisabled();
     if (ImGui::RadioButton("VRR Cap", reflex_cap > 0 && target == reflex_cap)) {
@@ -217,8 +531,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
 
     if (dmfg_dynamic_active) {
         // Dynamic DMFG: show driver target, slider disabled
-        DLSSPresets p_drs_fps = DLSSPresets_Get();
-        int drs_target = p_drs_fps.mfg_dynamic_target_fps;
+        int drs_target = presets.mfg_dynamic_target_fps;
 
         // Resolve display value
         int display_target = 0;
@@ -348,16 +661,30 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             }
             ImGui::EndCombo();
         }
-        HelpTip("Game = use the game's VSync setting. Off = force VSync off (recommended with frame limiter). On = force VSync on.");
+        HelpTip("Game (default) keeps the game's own VSync setting. Off or On forces it.");
     }
 
     // ════════════════════════════════════════════
+    // Primary pacing controls belong with the FPS controls, before display/OSD customization.
+    ImGui::Separator();
+    DrawPacingSummary(runtime, &config_dirty);
+    if (dmfg_dynamic_active) ImGui::TextDisabled("Dynamic frame generation: pacing passthrough");
+#ifdef _WIN64
+    if (!dmfg_dynamic_active)
+        DrawPacingPreferenceControl(&config_dirty);
+#endif
+    if (ImGui::Checkbox("Enable advanced settings", &g_config.advanced_settings)) config_dirty = true;
+
     // SECTION 2: OSD (collapsible)
     // ════════════════════════════════════════════
     ImGui::Separator();
     if (ImGui::CollapsingHeader("OSD")) {
         if (ImGui::Checkbox("Show OSD", &g_config.osd_enabled)) config_dirty = true;
         HelpTip("Toggle the in-game overlay on or off.");
+        if (ImGui::Button("Move OSD")) OSD_CyclePosition();
+        HelpTip("Move clockwise: top-left, top-right, bottom-right, bottom-left.");
+        if (DrawKeybind("Move OSD Key", &g_config.osd_position_cycle_key, HotkeySlot::PositionCycle, editable_bindings))
+            config_dirty = true;
         float osd_x_pct = g_config.osd_x * 100.0f;
         float osd_y_pct = g_config.osd_y * 100.0f;
         if (ImGui::SliderFloat("OSD X", &osd_x_pct, 0.0f, 100.0f, "%.1f%%"))
@@ -409,8 +736,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             p.show_frametime = true;
             p.show_frametime_graph = true;
             p.show_gpu_render_time = true;
-            p.show_pqi = true;
-            p.show_smoothness = true;
+            p.show_jitter = true;
             p.show_fg = true;
             p.show_gpu_temp = true;
             p.show_gpu_usage = true;
@@ -427,20 +753,17 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             p.show_0_1pct_low = true;
             p.show_frametime = true;
             p.show_frametime_graph = true;
-            p.show_cpu_latency = true;
+            p.show_cpu_latency = true; p.show_native_pcl = true; p.show_native_pcl_breakdown = true;
             p.show_gpu_render_time = true;
             p.show_total_frame_cost = true;
             p.show_fg_time = true;
-            p.show_pqi = true;
-            p.show_pqi_breakdown = true;
-            p.show_smoothness = true;
+            p.show_jitter = true;
+            p.show_pacing_quality = true;
             p.show_fg = true;
             p.show_limiter = true;
-            p.show_adaptive_smoothing = true;
             p.show_gpu_temp = true;
             p.show_gpu_clock = true;
             p.show_gpu_usage = true;
-            p.show_gpu_power = true;
             p.show_vram = true;
             p.show_cpu_usage = true;
             p.show_ram = true;
@@ -564,231 +887,15 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             }
         }
 
-        // ── Default preset (shared mode only) ──
-        // Applied automatically at game launch for every game.
-        if (g_config.shared_presets) {
-            ImGui::SameLine();
-            ImGui::TextDisabled("|");
-            ImGui::SameLine();
-            if (OSDPreset_HasDefault()) {
-                char def_label[48];
-                snprintf(def_label, sizeof(def_label), "Default: %s", OSDPreset_GetDefault().name);
-                ImGui::TextDisabled("%s", def_label);
-                ImGui::SameLine();
-                if (ImGui::Button("Update##default_preset")) {
-                    OSDPreset p = OSDPreset_FromConfig();
-                    snprintf(p.name, sizeof(p.name), "%s", OSDPreset_GetDefault().name);
-                    OSDPreset_SaveDefault(p);
-                }
-                HelpTip("Update the default preset with the current OSD layout. Applied automatically on launch for every game.");
-                ImGui::SameLine();
-                if (ImGui::Button("Clear##default_preset")) {
-                    OSDPreset_ClearDefault();
-                }
-                HelpTip("Remove the default preset. Games will use their own saved OSD layout.");
-            } else {
-                if (ImGui::Button("Set as Default##default_preset")) {
-                    OSDPreset p = OSDPreset_FromConfig();
-                    snprintf(p.name, sizeof(p.name), "Default");
-                    OSDPreset_SaveDefault(p);
-                }
-                HelpTip("Save the current OSD layout as the default. It will be applied automatically on launch for every game using the shared presets file.");
-            }
-        }
-
         // ── Preset cycling keybinds ──
         {
-            // Built-in preset definitions for cycling
-            // Index: 0=Min, 1=Med, 2=Full, then 3..N = user presets (occupied only)
-            auto ApplyPresetByIndex = [&](int idx) {
-                if (idx == 0) {
-                    OSDPreset p = {};
-                    p.show_fps = true; p.show_frametime = true; p.show_gpu_temp = true;
-                    OSDPreset_ApplyTogglesOnly(p);
-                } else if (idx == 1) {
-                    OSDPreset p = {};
-                    p.show_fps = true; p.show_1pct_low = true; p.show_frametime = true;
-                    p.show_frametime_graph = true; p.show_gpu_render_time = true;
-                    p.show_pqi = true; p.show_smoothness = true; p.show_fg = true;
-                    p.show_gpu_temp = true; p.show_gpu_usage = true; p.show_vram = true;
-                    OSDPreset_ApplyTogglesOnly(p);
-                } else if (idx == 2) {
-                    OSDPreset p = {};
-                    p.show_fps = true; p.show_1pct_low = true; p.show_0_1pct_low = true;
-                    p.show_frametime = true; p.show_frametime_graph = true;
-                    p.show_cpu_latency = true; p.show_gpu_render_time = true;
-                    p.show_total_frame_cost = true; p.show_fg_time = true;
-                    p.show_pqi = true; p.show_pqi_breakdown = true;
-                    p.show_smoothness = true; p.show_fg = true; p.show_limiter = true;
-                    p.show_adaptive_smoothing = true; p.show_gpu_temp = true;
-                    p.show_gpu_clock = true; p.show_gpu_usage = true; p.show_gpu_power = true; p.show_vram = true;
-                    p.show_cpu_usage = true; p.show_ram = true;
-                    p.show_dlss_quality = true; p.show_dlss_features = true;
-                    p.show_dlss_resolution = true; p.show_dlss_presets = true;
-                    p.show_dlss_versions = true;
-                    OSDPreset_ApplyTogglesOnly(p);
-                } else {
-                    // User preset (idx - 3)
-                    int user_idx = idx - 3;
-                    if (user_idx >= 0 && user_idx < OSDPreset_GetCount()) {
-                        OSDPreset& slot = OSDPreset_GetSlot(user_idx);
-                        if (slot.occupied)
-                            OSDPreset_ApplyToConfig(slot);
-                    }
-                }
-                config_dirty = true;
-            };
-
-            // Count total presets: 3 built-in + occupied user presets
-            static int s_current_preset = 0;
-            int total_presets = 3;
-            for (int i = 0; i < OSDPreset_GetCount(); i++)
-                if (OSDPreset_GetSlot(i).occupied) total_presets++;
-
-            // Keybind UI
+            // The present callback applies cycle requests, even with the OSD hidden.
             ImGui::Spacing();
 
-            // Prev Preset keybind
-            {
-                static bool s_capturing = false;
-                ImGui::Text("Prev Preset:");
-                ImGui::SameLine();
-                if (s_capturing) {
-                    ImGui::TextColored(ImVec4(1,1,0.3f,1), "Press key...");
-                    ImGui::SameLine();
-                    if (ImGui::Button("Cancel##prev")) s_capturing = false;
-                    for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; k++) {
-                        ImGuiKey key = static_cast<ImGuiKey>(k);
-                        if (key == ImGuiKey_LeftCtrl || key == ImGuiKey_RightCtrl) continue;
-                        if (key == ImGuiKey_LeftShift || key == ImGuiKey_RightShift) continue;
-                        if (key == ImGuiKey_LeftAlt || key == ImGuiKey_RightAlt) continue;
-                        if (key == ImGuiKey_LeftSuper || key == ImGuiKey_RightSuper) continue;
-                        if (k == ImGuiMod_Ctrl || k == ImGuiMod_Shift || k == ImGuiMod_Alt || k == ImGuiMod_Super) continue;
-                        if (key >= ImGuiKey_MouseLeft && key <= ImGuiKey_MouseWheelY) continue;
-                        const char* kn = ImGui::GetKeyName(key);
-                        if (kn && kn[0] == 'M' && kn[1] == 'o' && kn[2] == 'd') continue;
-                        if (ImGui::IsKeyPressed(key, false)) {
-                            std::string name;
-                            if (ImGui::IsKeyDown(ImGuiMod_Ctrl)) name += "Ctrl+";
-                            if (ImGui::IsKeyDown(ImGuiMod_Alt)) name += "Alt+";
-                            if (ImGui::IsKeyDown(ImGuiMod_Shift)) name += "Shift+";
-                            name += ImGui::GetKeyName(key);
-                            g_config.osd_preset_prev_key = name;
-                            s_capturing = false;
-                            config_dirty = true;
-                            break;
-                        }
-                    }
-                } else {
-                    ImGui::Text("%s", g_config.osd_preset_prev_key.empty() ? "None" : g_config.osd_preset_prev_key.c_str());
-                    ImGui::SameLine();
-                    if (ImGui::Button("Bind##prev")) s_capturing = true;
-                    if (!g_config.osd_preset_prev_key.empty()) {
-                        ImGui::SameLine();
-                        if (ImGui::Button("Clear##prev")) {
-                            g_config.osd_preset_prev_key.clear();
-                            config_dirty = true;
-                        }
-                    }
-                }
-            }
-
-            // Next Preset keybind
-            {
-                static bool s_capturing = false;
-                ImGui::Text("Next Preset:");
-                ImGui::SameLine();
-                if (s_capturing) {
-                    ImGui::TextColored(ImVec4(1,1,0.3f,1), "Press key...");
-                    ImGui::SameLine();
-                    if (ImGui::Button("Cancel##next")) s_capturing = false;
-                    for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; k++) {
-                        ImGuiKey key = static_cast<ImGuiKey>(k);
-                        if (key == ImGuiKey_LeftCtrl || key == ImGuiKey_RightCtrl) continue;
-                        if (key == ImGuiKey_LeftShift || key == ImGuiKey_RightShift) continue;
-                        if (key == ImGuiKey_LeftAlt || key == ImGuiKey_RightAlt) continue;
-                        if (key == ImGuiKey_LeftSuper || key == ImGuiKey_RightSuper) continue;
-                        if (k == ImGuiMod_Ctrl || k == ImGuiMod_Shift || k == ImGuiMod_Alt || k == ImGuiMod_Super) continue;
-                        if (key >= ImGuiKey_MouseLeft && key <= ImGuiKey_MouseWheelY) continue;
-                        const char* kn = ImGui::GetKeyName(key);
-                        if (kn && kn[0] == 'M' && kn[1] == 'o' && kn[2] == 'd') continue;
-                        if (ImGui::IsKeyPressed(key, false)) {
-                            std::string name;
-                            if (ImGui::IsKeyDown(ImGuiMod_Ctrl)) name += "Ctrl+";
-                            if (ImGui::IsKeyDown(ImGuiMod_Alt)) name += "Alt+";
-                            if (ImGui::IsKeyDown(ImGuiMod_Shift)) name += "Shift+";
-                            name += ImGui::GetKeyName(key);
-                            g_config.osd_preset_next_key = name;
-                            s_capturing = false;
-                            config_dirty = true;
-                            break;
-                        }
-                    }
-                } else {
-                    ImGui::Text("%s", g_config.osd_preset_next_key.empty() ? "None" : g_config.osd_preset_next_key.c_str());
-                    ImGui::SameLine();
-                    if (ImGui::Button("Bind##next")) s_capturing = true;
-                    if (!g_config.osd_preset_next_key.empty()) {
-                        ImGui::SameLine();
-                        if (ImGui::Button("Clear##next")) {
-                            g_config.osd_preset_next_key.clear();
-                            config_dirty = true;
-                        }
-                    }
-                }
-            }
-
-            // Move OSD (corner cycling) keybind + button
-            {
-                static bool s_capturing = false;
-                ImGui::Text("Move OSD:");
-                ImGui::SameLine();
-                if (s_capturing) {
-                    ImGui::TextColored(ImVec4(1,1,0.3f,1), "Press key...");
-                    ImGui::SameLine();
-                    if (ImGui::Button("Cancel##pos")) s_capturing = false;
-                    for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; k++) {
-                        ImGuiKey key = static_cast<ImGuiKey>(k);
-                        if (key == ImGuiKey_LeftCtrl || key == ImGuiKey_RightCtrl) continue;
-                        if (key == ImGuiKey_LeftShift || key == ImGuiKey_RightShift) continue;
-                        if (key == ImGuiKey_LeftAlt || key == ImGuiKey_RightAlt) continue;
-                        if (key == ImGuiKey_LeftSuper || key == ImGuiKey_RightSuper) continue;
-                        if (k == ImGuiMod_Ctrl || k == ImGuiMod_Shift || k == ImGuiMod_Alt || k == ImGuiMod_Super) continue;
-                        if (key >= ImGuiKey_MouseLeft && key <= ImGuiKey_MouseWheelY) continue;
-                        const char* kn = ImGui::GetKeyName(key);
-                        if (kn && kn[0] == 'M' && kn[1] == 'o' && kn[2] == 'd') continue;
-                        if (ImGui::IsKeyPressed(key, false)) {
-                            std::string name;
-                            if (ImGui::IsKeyDown(ImGuiMod_Ctrl)) name += "Ctrl+";
-                            if (ImGui::IsKeyDown(ImGuiMod_Alt)) name += "Alt+";
-                            if (ImGui::IsKeyDown(ImGuiMod_Shift)) name += "Shift+";
-                            name += ImGui::GetKeyName(key);
-                            g_config.osd_position_cycle_key = name;
-                            s_capturing = false;
-                            config_dirty = true;
-                            break;
-                        }
-                    }
-                } else {
-                    ImGui::Text("%s", g_config.osd_position_cycle_key.empty() ? "None" : g_config.osd_position_cycle_key.c_str());
-                    ImGui::SameLine();
-                    if (ImGui::Button("Bind##pos")) s_capturing = true;
-                    if (!g_config.osd_position_cycle_key.empty()) {
-                        ImGui::SameLine();
-                        if (ImGui::Button("Clear##pos")) {
-                            g_config.osd_position_cycle_key.clear();
-                            config_dirty = true;
-                        }
-                    }
-                    ImGui::SameLine();
-                    if (ImGui::Button("Move##pos_now")) {
-                        // Cycle through corners: top-right → bottom-right → bottom-left → top-left → top-right
-                        OSD_CyclePosition();
-                        config_dirty = true;
-                    }
-                    HelpTip("Cycle the OSD position through each corner of the screen (clockwise).");
-                }
-            }
+            if (DrawKeybind("Prev Preset", &g_config.osd_preset_prev_key, HotkeySlot::PresetPrev, editable_bindings))
+                config_dirty = true;
+            if (DrawKeybind("Next Preset", &g_config.osd_preset_next_key, HotkeySlot::PresetNext, editable_bindings))
+                config_dirty = true;
         }
 
         // ── Elements by category ──
@@ -816,10 +923,10 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         HelpTip("Show the current FPS. When Frame Generation is active, shows both output and render FPS.");
         FlowSeparator();
         if (ImGui::Checkbox("1%% Low##osd_elem", &g_config.osd_show_1pct_low)) config_dirty = true;
-        HelpTip("Show the 1%% low FPS over a rolling window. Uses display FPS when Frame Generation is active.");
+        HelpTip("Show the 1% low FPS over a rolling window. With frame generation it is the real-frame figure multiplied by the frame generation multiplier, an estimate of the displayed frames; the generated frames are not measured.");
         FlowSeparator();
         if (ImGui::Checkbox("0.1%% Low##osd_elem", &g_config.osd_show_0_1pct_low)) config_dirty = true;
-        HelpTip("Show the 0.1%% low FPS over a rolling window. Requires more samples than 1%% low to stabilize.");
+        HelpTip("Show the 0.1% low FPS over a rolling window. Requires more samples than 1% low to stabilize. With frame generation it is the real-frame figure multiplied by the frame generation multiplier, an estimate of the displayed frames.");
         FlowSeparator();
         if (ImGui::Checkbox("Frametime##osd_elem", &g_config.osd_show_frametime)) config_dirty = true;
         HelpTip("Show the current frame time in milliseconds.");
@@ -832,6 +939,18 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "Latency");
         if (ImGui::Checkbox("CPU Latency##osd_elem", &g_config.osd_show_cpu_latency)) config_dirty = true;
         HelpTip("CPU pipeline time: SIM_START to RENDERSUBMIT_END. Measures how long the CPU spends on simulation + render submission.");
+        if (g_config.native_pcl_enabled) {
+            FlowSeparator();
+            if (ImGui::Checkbox("PC Latency##osd_elem", &g_config.osd_show_native_pcl)) config_dirty = true;
+            HelpTip("Show native NVIDIA PC Latency correlated to the displayed application frame.");
+            if (g_config.osd_show_native_pcl) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("-");
+                ImGui::SameLine();
+                if (ImGui::Checkbox("Breakdown##native_pcl_osd_elem", &g_config.osd_show_native_pcl_breakdown)) config_dirty = true;
+                HelpTip("Show input-to-frame-start (I2FS), frame-start-to-present (FS2P), and present-to-display (P2D).");
+            }
+        }
         FlowSeparator();
         if (ImGui::Checkbox("GPU Render##osd_elem", &g_config.osd_show_gpu_render_time)) config_dirty = true;
         HelpTip("GPU active render time in ms. Shows actual GPU work excluding idle bubbles. DX12+Reflex only.");
@@ -845,18 +964,21 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
 
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "Quality");
-        if (ImGui::Checkbox("PQI##osd_elem", &g_config.osd_show_pqi)) config_dirty = true;
-        HelpTip("Pacing Quality Index: a 0-100%% composite score. Green=great, yellow=ok, red=poor.");
-        if (g_config.osd_show_pqi) {
-            ImGui::SameLine();
-            ImGui::TextDisabled("-");
-            ImGui::SameLine();
-            if (ImGui::Checkbox("Breakdown##osd_elem", &g_config.osd_show_pqi_breakdown)) config_dirty = true;
-            HelpTip("Show individual PQI sub-scores: cadence, stutter, and deadline.");
-        }
+        if (ImGui::Checkbox("Jitter##osd_elem", &g_config.osd_show_jitter)) config_dirty = true;
+        HelpTip("Average change from one frame interval to the next over the last 5 seconds. Lower is smoother. "
+            "Measured on the displayed frames where ReLimiter can time them: DLSS Frame Generation presenting from "
+            "its own thread, no frame generation, or PC latency collection. With hardware flip metering it is "
+            "measured on the real frames entering frame generation and marked (real frames). Other frame generation "
+            "reads '-' without PC latency collection. Green under 8% of the frame interval, yellow under 16%, red "
+            "above.");
         FlowSeparator();
-        if (ImGui::Checkbox("Smoothness##osd_elem", &g_config.osd_show_smoothness)) config_dirty = true;
-        HelpTip("Frame interval deviation from target in milliseconds. Lower = smoother. Green < 0.5ms, yellow < 1.5ms, red above. EMA-smoothed, skips loading screen outliers.");
+        if (ImGui::Checkbox("Frame Pacing##osd_elem", &g_config.osd_show_pacing_quality)) config_dirty = true;
+        HelpTip("How evenly frames arrive over the last 5 seconds: the typical and slowest frame time, the average "
+            "and worst change between frames, and hitches (frames over 1.5 times the typical frame time). The "
+            "heading names what is measured: displayed frames (ETW with PC latency collection, DXGI without frame "
+            "generation, or ReLimiter's flip gate where DLSS Frame Generation presents from its own thread), or the "
+            "real frames entering frame generation where hardware flip metering places the generated ones. Other "
+            "frame generation is measured only with PC latency collection. Measures pacing without changing it.");
 
 #ifdef _WIN64
         ImGui::Spacing();
@@ -864,13 +986,11 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         if (ImGui::Checkbox("Frame Generation##osd_elem", &g_config.osd_show_fg)) config_dirty = true;
         HelpTip("Show FG mode and multiplier (DLSS FG, Dynamic MFG, Smooth Motion).");
         FlowSeparator();
-        if (ImGui::Checkbox("Limiter / Tier##osd_elem", &g_config.osd_show_limiter)) config_dirty = true;
-        HelpTip("Show how much time the limiter added and the current degradation tier (T0=full, T4=suspended).");
+        if (ImGui::Checkbox("Limiter##osd_elem", &g_config.osd_show_limiter)) config_dirty = true;
+        HelpTip("Show how much time the limiter added.");
 #endif
 
-        {
-        NGXDLSSInfo dlss_check = NGXHooks_GetInfo();
-        if (dlss_check.available) {
+        if (dlss.available) {
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "DLSS");
         if (ImGui::Checkbox("Quality Level##osd_elem", &g_config.osd_show_dlss_quality)) config_dirty = true;
@@ -888,7 +1008,6 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         if (ImGui::Checkbox("Versions##osd_elem", &g_config.osd_show_dlss_versions)) config_dirty = true;
         HelpTip("Show DLSS DLL versions (SR, RR, FG) and Streamline version if loaded.");
         }
-        }
 
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "System");
@@ -900,9 +1019,6 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         FlowSeparator();
         if (ImGui::Checkbox("GPU Usage##osd_elem", &g_config.osd_show_gpu_usage)) config_dirty = true;
         HelpTip("GPU graphics engine utilization percentage. NVIDIA only.");
-        FlowSeparator();
-        if (ImGui::Checkbox("GPU Power##osd_elem", &g_config.osd_show_gpu_power)) config_dirty = true;
-        HelpTip("GPU board power draw in watts. NVIDIA only.");
         FlowSeparator();
         if (ImGui::Checkbox("VRAM##osd_elem", &g_config.osd_show_vram)) config_dirty = true;
         HelpTip("Video memory usage (used / total). NVIDIA only.");
@@ -985,43 +1101,48 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                             config_dirty = true;
 
                             struct WMData { HWND hwnd; int mode; };
-                            auto* data = new WMData{ hwnd, i };
-                            CreateThread(nullptr, 0, [](LPVOID param) -> DWORD {
-                                auto* d = static_cast<WMData*>(param);
-                                HMONITOR hmon = MonitorFromWindow(d->hwnd, MONITOR_DEFAULTTONEAREST);
-                                MONITORINFO mi = {};
-                                mi.cbSize = sizeof(mi);
-                                GetMonitorInfo(hmon, &mi);
-                                RECT& rc = mi.rcMonitor;
-                                int w = rc.right - rc.left;
-                                int h = rc.bottom - rc.top;
+                            auto* data = new (std::nothrow) WMData{ hwnd, i };
+                            if (data && !BackgroundTasks_Start(
+                                    [](LPVOID param) -> DWORD {
+                                        auto* d = static_cast<WMData*>(param);
+                                        HMONITOR hmon = MonitorFromWindow(
+                                            d->hwnd, MONITOR_DEFAULTTONEAREST);
+                                        MONITORINFO mi = {};
+                                        mi.cbSize = sizeof(mi);
+                                        GetMonitorInfo(hmon, &mi);
+                                        RECT& rc = mi.rcMonitor;
+                                        int w = rc.right - rc.left;
+                                        int h = rc.bottom - rc.top;
 
-                                if (d->mode == 0) {
-                                    LONG style = GetWindowLong(d->hwnd, GWL_STYLE);
-                                    style |= (WS_CAPTION | WS_THICKFRAME | WS_BORDER);
-                                    SetWindowLong(d->hwnd, GWL_STYLE, style);
-                                    SetWindowPos(d->hwnd, nullptr,
-                                                 rc.left + 20, rc.top + 20,
-                                                 w - 40, h - 40,
-                                                 SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE);
-                                } else if (d->mode == 1) {
-                                    LONG style = GetWindowLong(d->hwnd, GWL_STYLE);
-                                    SetWindowLong(d->hwnd, GWL_STYLE,
-                                                  style & ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER));
-                                    SetWindowPos(d->hwnd, HWND_TOP,
-                                                 rc.left, rc.top, w, h,
-                                                 SWP_FRAMECHANGED | SWP_NOACTIVATE);
-                                } else if (d->mode == 2) {
-                                    LONG style = GetWindowLong(d->hwnd, GWL_STYLE);
-                                    SetWindowLong(d->hwnd, GWL_STYLE,
-                                                  style & ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER));
-                                    SetWindowPos(d->hwnd, HWND_TOPMOST,
-                                                 rc.left, rc.top, w, h,
-                                                 SWP_FRAMECHANGED | SWP_NOACTIVATE);
-                                }
-                                delete d;
-                                return 0;
-                            }, data, 0, nullptr);
+                                        if (d->mode == 0) {
+                                            LONG style = GetWindowLong(d->hwnd, GWL_STYLE);
+                                            style |= (WS_CAPTION | WS_THICKFRAME | WS_BORDER);
+                                            SetWindowLong(d->hwnd, GWL_STYLE, style);
+                                            SetWindowPos(d->hwnd, nullptr,
+                                                rc.left + 20, rc.top + 20,
+                                                w - 40, h - 40,
+                                                SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+                                        } else if (d->mode == 1) {
+                                            LONG style = GetWindowLong(d->hwnd, GWL_STYLE);
+                                            SetWindowLong(d->hwnd, GWL_STYLE,
+                                                style & ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER));
+                                            SetWindowPos(d->hwnd, HWND_TOP,
+                                                rc.left, rc.top, w, h,
+                                                SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+                                        } else if (d->mode == 2) {
+                                            LONG style = GetWindowLong(d->hwnd, GWL_STYLE);
+                                            SetWindowLong(d->hwnd, GWL_STYLE,
+                                                style & ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER));
+                                            SetWindowPos(d->hwnd, HWND_TOPMOST,
+                                                rc.left, rc.top, w, h,
+                                                SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+                                        }
+                                        delete d;
+                                        return 0;
+                                    },
+                                    data)) {
+                                delete data;
+                            }
                         }
                     }
                 }
@@ -1035,6 +1156,45 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         HelpTip("Intercept exclusive fullscreen and run as borderless window instead. "
                 "The game still thinks it's in exclusive fullscreen. "
                 "Takes effect on next fullscreen transition or game restart.");
+
+        // ── Monitor Blackout ──
+        ImGui::Spacing();
+        {
+            bool blackout_on = Blackout_IsActive();
+            if (ImGui::Checkbox("Blackout Other Monitors", &blackout_on)) {
+                Blackout_SetActive(blackout_on);
+            }
+            if (Blackout_IsActive()) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "(Active)");
+            }
+            HelpTip("Cover all non-game monitors with a black screen. "
+                    "Useful for reducing distractions and light bleed in dark rooms. "
+                    "Toggle with the keybind below or this checkbox.");
+
+            if (DrawKeybind("Blackout Key", &g_config.blackout_key, HotkeySlot::Blackout, editable_bindings))
+                config_dirty = true;
+        }
+
+        // ── OLED Care ──
+        ImGui::Spacing();
+        bool oled_care_on = OLEDCare_IsActive();
+        if (ImGui::Checkbox("OLED Care", &oled_care_on))
+            OLEDCare_SetActive(oled_care_on);
+        HelpTip("Cover the selected monitor scope with black screens. Activation is not saved.");
+        if (ImGui::Checkbox("All Monitors##oled_care", &g_config.oled_care_all_monitors)) {
+            OLEDCare_SetConfig(g_config.oled_care_all_monitors, g_config.oled_care_idle_minutes);
+            config_dirty = true;
+        }
+        HelpTip("Enabled: all monitors. Disabled: the game monitor only.");
+        if (ImGui::SliderInt("Idle Minutes##oled_care", &g_config.oled_care_idle_minutes, 0, 120)) {
+            g_config.oled_care_idle_minutes = (std::clamp)(g_config.oled_care_idle_minutes, 0, 120);
+            OLEDCare_SetConfig(g_config.oled_care_all_monitors, g_config.oled_care_idle_minutes);
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) config_dirty = true;
+        HelpTip("Automatically activate after this many idle minutes. 0 disables automatic activation.");
+        if (DrawKeybind("OLED Care Key", &g_config.oled_care_key, HotkeySlot::OledCare, editable_bindings))
+            config_dirty = true;
 
         // ── Focus Lock ──
         ImGui::Spacing();
@@ -1055,226 +1215,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                 "Audio and game logic continue running in the background. "
                 "The background FPS cap still applies independently. "
                 "May not work with all games (UWP/Game Pass titles use system-level notifications).");
-
-        // ── Monitor Blackout ──
-        ImGui::Spacing();
-        {
-            bool blackout_on = Blackout_IsActive();
-            if (ImGui::Checkbox("Blackout Other Monitors", &blackout_on)) {
-                Blackout_SetActive(blackout_on);
-            }
-            if (Blackout_IsActive()) {
-                ImGui::SameLine();
-                ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "(Active)");
-            }
-            HelpTip("Cover all non-game monitors with a black screen. "
-                    "Useful for reducing distractions and light bleed in dark rooms. "
-                    "Toggle with the keybind below or this checkbox.");
-
-            // Blackout keybind
-            static bool s_blackout_capturing = false;
-            ImGui::Text("Blackout Key:");
-            ImGui::SameLine();
-            if (s_blackout_capturing) {
-                ImGui::TextColored(ImVec4(1,1,0.3f,1), "Press key...");
-                ImGui::SameLine();
-                if (ImGui::Button("Cancel##blackout")) s_blackout_capturing = false;
-                for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; k++) {
-                    ImGuiKey key = static_cast<ImGuiKey>(k);
-                    if (key == ImGuiKey_LeftCtrl || key == ImGuiKey_RightCtrl) continue;
-                    if (key == ImGuiKey_LeftShift || key == ImGuiKey_RightShift) continue;
-                    if (key == ImGuiKey_LeftAlt || key == ImGuiKey_RightAlt) continue;
-                    if (key == ImGuiKey_LeftSuper || key == ImGuiKey_RightSuper) continue;
-                    if (k == ImGuiMod_Ctrl || k == ImGuiMod_Shift || k == ImGuiMod_Alt || k == ImGuiMod_Super) continue;
-                    if (key >= ImGuiKey_MouseLeft && key <= ImGuiKey_MouseWheelY) continue;
-                    const char* kn = ImGui::GetKeyName(key);
-                    if (kn && kn[0] == 'M' && kn[1] == 'o' && kn[2] == 'd') continue;
-                    if (ImGui::IsKeyPressed(key, false)) {
-                        std::string name;
-                        if (ImGui::IsKeyDown(ImGuiMod_Ctrl)) name += "Ctrl+";
-                        if (ImGui::IsKeyDown(ImGuiMod_Alt)) name += "Alt+";
-                        if (ImGui::IsKeyDown(ImGuiMod_Shift)) name += "Shift+";
-                        name += ImGui::GetKeyName(key);
-                        g_config.blackout_key = name;
-                        s_blackout_capturing = false;
-                        config_dirty = true;
-                        break;
-                    }
-                }
-            } else {
-                ImGui::Text("%s", g_config.blackout_key.empty() ? "None" : g_config.blackout_key.c_str());
-                ImGui::SameLine();
-                if (ImGui::Button("Bind##blackout")) s_blackout_capturing = true;
-                if (!g_config.blackout_key.empty()) {
-                    ImGui::SameLine();
-                    if (ImGui::Button("Clear##blackout")) {
-                        g_config.blackout_key.clear();
-                        config_dirty = true;
-                    }
-                }
-            }
-        }
-
-        // ── OLED Care (sectioned off) ──
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::Spacing();
-        {
-            ImGui::Text("OLED Care");
-            HelpTip("Blacks out monitors and reduces FPS to background cap for screen protection while AFK. "
-                     "Toggle with the keybind below.");
-
-            // OLED Care keybind + All Monitors on same line
-            static bool s_oled_care_capturing = false;
-            ImGui::Text("OLED Care Key:");
-            ImGui::SameLine();
-            if (s_oled_care_capturing) {
-                ImGui::TextColored(ImVec4(1,1,0.3f,1), "Press key...");
-                ImGui::SameLine();
-                if (ImGui::Button("Cancel##oled_care")) s_oled_care_capturing = false;
-                for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; k++) {
-                    ImGuiKey key = static_cast<ImGuiKey>(k);
-                    if (key == ImGuiKey_LeftCtrl || key == ImGuiKey_RightCtrl) continue;
-                    if (key == ImGuiKey_LeftShift || key == ImGuiKey_RightShift) continue;
-                    if (key == ImGuiKey_LeftAlt || key == ImGuiKey_RightAlt) continue;
-                    if (key == ImGuiKey_LeftSuper || key == ImGuiKey_RightSuper) continue;
-                    if (k == ImGuiMod_Ctrl || k == ImGuiMod_Shift || k == ImGuiMod_Alt || k == ImGuiMod_Super) continue;
-                    if (key >= ImGuiKey_MouseLeft && key <= ImGuiKey_MouseWheelY) continue;
-                    const char* kn = ImGui::GetKeyName(key);
-                    if (kn && kn[0] == 'M' && kn[1] == 'o' && kn[2] == 'd') continue;
-                    if (ImGui::IsKeyPressed(key, false)) {
-                        std::string name;
-                        if (ImGui::IsKeyDown(ImGuiMod_Ctrl)) name += "Ctrl+";
-                        if (ImGui::IsKeyDown(ImGuiMod_Alt)) name += "Alt+";
-                        if (ImGui::IsKeyDown(ImGuiMod_Shift)) name += "Shift+";
-                        name += ImGui::GetKeyName(key);
-                        g_config.oled_care_key = name;
-                        s_oled_care_capturing = false;
-                        config_dirty = true;
-                        break;
-                    }
-                }
-            } else {
-                ImGui::Text("%s", g_config.oled_care_key.empty() ? "None" : g_config.oled_care_key.c_str());
-                ImGui::SameLine();
-                if (ImGui::Button("Bind##oled_care")) s_oled_care_capturing = true;
-                if (!g_config.oled_care_key.empty()) {
-                    ImGui::SameLine();
-                    if (ImGui::Button("Clear##oled_care")) {
-                        g_config.oled_care_key.clear();
-                        config_dirty = true;
-                    }
-                }
-                ImGui::SameLine();
-                ImGui::TextDisabled("|");
-                ImGui::SameLine();
-                if (ImGui::Checkbox("All Monitors##oled_care", &g_config.oled_care_all_monitors))
-                    config_dirty = true;
-                HelpTip("When ticked, all monitors are blacked out. When unticked, only the game's display is blacked out.");
-            }
-
-            // ── Idle timer ──
-            {
-                static int s_idle_edit = 0;
-                static bool s_idle_active = false;
-                if (!s_idle_active)
-                    s_idle_edit = g_config.oled_care_idle_minutes;
-
-                ImGui::Text("Auto after idle:");
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(45.0f);
-                if (ImGui::InputInt("min##oled_care_idle_input", &s_idle_edit, 0, 0)) {
-                    if (s_idle_edit < 0) s_idle_edit = 0;
-                    if (s_idle_edit > 999) s_idle_edit = 999;
-                    g_config.oled_care_idle_minutes = s_idle_edit;
-                    config_dirty = true;
-                }
-                s_idle_active = ImGui::IsItemActive();
-                if (ImGui::IsItemDeactivatedAfterEdit()) {
-                    g_config.oled_care_idle_minutes = s_idle_edit;
-                    config_dirty = true;
-                }
-                HelpTip("Automatically activate OLED Care after this many minutes without any mouse, keyboard, or controller input. 0 = disabled. Any input (moving the mouse, pressing a key, clicking, or using a controller) will turn it back off.");
-            }
-        }
     }
-
-    // ════════════════════════════════════════════
-    // SECTION: Adaptive Smoothing (collapsible, DX12 only)
-    // ════════════════════════════════════════════
-    if (SwapMgr_GetActiveAPI() == ActiveAPI::DX12 && !dmfg_dynamic_active) {
-    ImGui::Separator();
-    if (ImGui::CollapsingHeader("Adaptive Smoothing")) {
-        bool adaptive = g_config.adaptive_smoothing;
-        if (ImGui::Checkbox("Enable##adaptive", &adaptive)) {
-            g_config.adaptive_smoothing = adaptive;
-            g_adaptive_smoothing.SetConfig(
-                g_config.smoothing_window == "dual",
-                g_config.smoothing_percentile,
-                adaptive);
-            config_dirty = true;
-        }
-        if (g_adaptive_smoothing.IsWarm() && g_config.adaptive_smoothing) {
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "(+%.1f us)",
-                               g_smoothing_offset_us.load(std::memory_order_relaxed));
-        }
-        HelpTip("P99-based adaptive interval extension. Extends the target interval "
-                "so 99%% of frames complete within it, reducing micro-stutters from "
-                "render time variance. DX12+Reflex path only.");
-
-        if (g_config.adaptive_smoothing) {
-            if (ImGui::Checkbox("Show on OSD##adaptive", &g_config.osd_show_adaptive_smoothing))
-                config_dirty = true;
-            HelpTip("Show adaptive smoothing offset and P99 render time on the in-game overlay.");
-
-            // Percentile slider
-            float pct = static_cast<float>(g_config.smoothing_percentile * 100.0);
-            if (ImGui::SliderFloat("Percentile##adaptive", &pct, 50.0f, 99.9f, "P%.1f")) {
-                g_config.smoothing_percentile = static_cast<double>(pct) / 100.0;
-            }
-            if (ImGui::IsItemDeactivatedAfterEdit()) {
-                g_adaptive_smoothing.SetConfig(
-                    g_config.smoothing_window == "dual",
-                    g_config.smoothing_percentile,
-                    g_config.adaptive_smoothing);
-                config_dirty = true;
-            }
-            HelpTip("Target percentile for the threshold. P99 = 99%% of frames fit within the interval. Lower = more headroom, higher = tighter.");
-
-            // Window mode combo
-            const char* win_labels[] = {"Medium (256)", "Dual (64+512)"};
-            int current_win = (g_config.smoothing_window == "dual") ? 1 : 0;
-            if (ImGui::BeginCombo("Window##adaptive", win_labels[current_win])) {
-                for (int i = 0; i < 2; i++) {
-                    bool selected = (current_win == i);
-                    if (ImGui::Selectable(win_labels[i], selected)) {
-                        g_config.smoothing_window = (i == 1) ? "dual" : "medium";
-                        g_adaptive_smoothing.SetConfig(
-                            i == 1,
-                            g_config.smoothing_percentile,
-                            g_config.adaptive_smoothing);
-                        config_dirty = true;
-                    }
-                }
-                ImGui::EndCombo();
-            }
-            HelpTip("Medium: single 256-frame window (~4s). Dual: short 64 + long 512 window, uses max of both P99s for robustness against scene changes.");
-
-            // Bias slider
-            float bias = static_cast<float>(g_config.smoothing_bias_us);
-            if (ImGui::SliderFloat("Bias##adaptive", &bias, 0.0f, 1000.0f, "%.0f us")) {
-                g_config.smoothing_bias_us = static_cast<double>(bias);
-            }
-            if (ImGui::IsItemDeactivatedAfterEdit()) {
-                config_dirty = true;
-            }
-            HelpTip("Constant offset added on top of the computed P99 smoothing. "
-                     "Use this to add extra headroom if the automatic offset isn't enough. "
-                     "0 = no extra bias, 1000 = +1ms added to every frame interval.");
-        }
-    }
-    } // DX12 only (Adaptive Smoothing)
 
     // ════════════════════════════════════════════
     // SECTION: Frame Generation (collapsible, DX12 only)
@@ -1282,12 +1223,13 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
     // SECTION 4: Advanced (collapsible)
     // ════════════════════════════════════════════
     ImGui::Separator();
-    if (ImGui::CollapsingHeader("Advanced")) {
+    if (g_config.advanced_settings && ImGui::CollapsingHeader("Advanced")) {
 #ifdef _WIN64
         // Reflex Injection toggle
         bool inject = g_config.reflex_inject;
         if (ImGui::Checkbox("Inject Reflex Markers", &inject)) {
             g_config.reflex_inject = inject;
+            ReflexInject_SetEnabled(inject);
             config_dirty = true;
         }
         HelpTip("Synthesize NVIDIA Reflex markers for non-Reflex games. "
@@ -1302,6 +1244,38 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "(Waiting for device)");
         }
+
+    #ifdef RELIMITER_DEVELOPER_SETTINGS
+        // Native NVIDIA PC Latency collection
+        ImGui::Spacing();
+        bool native_pcl_enabled = g_config.native_pcl_enabled;
+        if (ImGui::Checkbox("Native NVIDIA PC Latency", &native_pcl_enabled)) {
+            g_config.native_pcl_enabled = native_pcl_enabled;
+            NativePcl_SetEnabled(native_pcl_enabled);
+            config_dirty = true;
+        }
+        const NativePclSnapshot native_pcl_snapshot = NativePcl_GetSnapshot();
+        ImVec4 native_pcl_status_color(0.6f, 0.6f, 0.6f, 1.0f);
+        if (native_pcl_snapshot.reliable) {
+            native_pcl_status_color = ImVec4(0.2f, 0.9f, 0.2f, 1.0f);
+        }
+        else if (native_pcl_snapshot.status == NativePclStatus::Starting ||
+                 native_pcl_snapshot.status == NativePclStatus::Warming ||
+                 native_pcl_snapshot.status == NativePclStatus::LowFpsUnreliable) {
+            native_pcl_status_color = ImVec4(1.0f, 0.7f, 0.3f, 1.0f);
+        }
+        else if (native_pcl_snapshot.status != NativePclStatus::Disabled) {
+            native_pcl_status_color = ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
+        }
+        ImGui::SameLine();
+        ImGui::TextColored(
+            native_pcl_status_color,
+            "(%s)",
+            NativePcl_StatusText(native_pcl_snapshot.status));
+        HelpTip("Collect true NVIDIA PC Latency from PCLStats ETW and correlate it with the displayed application frame. "
+            "Requires a game that emits NVIDIA PCL markers; ETW starts lazily after the next present. "
+            "Results arrive in delayed batches. Stale means no new latency sample was collected for two seconds, not two seconds since its display event.");
+    #endif
 
         // Flip Model Override toggle (DX11 only)
         ImGui::Spacing();
@@ -1329,17 +1303,21 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                 ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "(Restart required)");
         }
 
-        // Telemetry Logging toggle
         ImGui::Spacing();
 #endif // _WIN64
 
+        // Developer diagnostics, shown only with developer_settings=true in the INI.
+        if (g_config.developer_settings) DrawPacingDiagnostics(&config_dirty);
+
+        // Telemetry Logging toggle
         bool csv = g_config.csv_enabled;
         if (ImGui::Checkbox("Telemetry Logging", &csv)) {
             g_config.csv_enabled = csv;
             CSV_SetEnabled(csv);
             config_dirty = true;
         }
-        HelpTip("Enable per-frame CSV telemetry recording. Toggle in-game with the CSV hotkey (default F11).");
+        HelpTip("Records per-frame pacing CSV files next to the game, for problem reports. Each time it is "
+                "turned on a new capture starts; it is off at every launch.");
 
         // Advanced Logging toggle (log_level: warn <-> info)
         bool info_logging = (g_config.log_level == "info");
@@ -1401,61 +1379,8 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
     // ════════════════════════════════════════════
     ImGui::Separator();
     {
-        static bool s_capturing = false;
-
-        ImGui::Text("OSD Toggle Key:");
-        ImGui::SameLine();
-
-        if (s_capturing) {
-            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.3f, 1.0f), "Press key combo...");
-            ImGui::SameLine();
-            if (ImGui::Button("Cancel")) {
-                s_capturing = false;
-            }
-
-            // Use ImGui key state — works inside the ReShade overlay
-            bool ctrl  = ImGui::IsKeyDown(ImGuiMod_Ctrl);
-            bool alt   = ImGui::IsKeyDown(ImGuiMod_Alt);
-            bool shift = ImGui::IsKeyDown(ImGuiMod_Shift);
-
-            // Scan ImGuiKey range for a non-modifier key press
-            for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; k++) {
-                ImGuiKey key = static_cast<ImGuiKey>(k);
-                // Skip modifiers (both physical keys and mod flags)
-                if (key == ImGuiKey_LeftCtrl  || key == ImGuiKey_RightCtrl)  continue;
-                if (key == ImGuiKey_LeftShift || key == ImGuiKey_RightShift) continue;
-                if (key == ImGuiKey_LeftAlt   || key == ImGuiKey_RightAlt)   continue;
-                if (key == ImGuiKey_LeftSuper || key == ImGuiKey_RightSuper) continue;
-                if (k == ImGuiMod_Ctrl || k == ImGuiMod_Shift || k == ImGuiMod_Alt || k == ImGuiMod_Super) continue;
-                // Skip mouse buttons
-                if (key == ImGuiKey_MouseLeft || key == ImGuiKey_MouseRight ||
-                    key == ImGuiKey_MouseMiddle || key == ImGuiKey_MouseX1 ||
-                    key == ImGuiKey_MouseX2 || key == ImGuiKey_MouseWheelX ||
-                    key == ImGuiKey_MouseWheelY) continue;
-                // Skip any key whose name starts with "Mod" (catches ModCtrl, ModAlt, etc.)
-                const char* kname = ImGui::GetKeyName(key);
-                if (kname && kname[0] == 'M' && kname[1] == 'o' && kname[2] == 'd') continue;
-
-                if (ImGui::IsKeyPressed(key, false)) {
-                    std::string name;
-                    if (ctrl)  name += "Ctrl+";
-                    if (alt)   name += "Alt+";
-                    if (shift) name += "Shift+";
-                    name += ImGui::GetKeyName(key);
-
-                    g_config.osd_toggle_key = name;
-                    s_capturing = false;
-                    config_dirty = true;
-                    break;
-                }
-            }
-        } else {
-            ImGui::Text("%s", g_config.osd_toggle_key.c_str());
-            ImGui::SameLine();
-            if (ImGui::Button("Bind")) {
-                s_capturing = true;
-            }
-        }
+        if (DrawKeybind("OSD Toggle Key", &g_config.osd_toggle_key, HotkeySlot::OsdToggle, editable_bindings))
+            config_dirty = true;
         HelpTip("Keybind to toggle the OSD overlay on/off. Click Bind, then press a key combo (e.g. Ctrl+F12, Alt+P). Works in-game and with the ReShade UI open.");
     }
 
@@ -1473,7 +1398,9 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         else if (api == ActiveAPI::OpenGL) api_name = "OpenGL";
 
 #ifdef _WIN64
-        bool native_reflex = (g_dev != nullptr) || AreNvAPIMarkersFlowing();
+        bool native_reflex =
+            NvAPI_HasFeedbackDevice() ||
+            AreNvAPIMarkersFlowing();
         bool pcl_markers = PCL_MarkersFlowing();
         const char* reflex_str = "None";
         if (native_reflex) reflex_str = "Native";
@@ -1496,28 +1423,17 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
 
         bool gsync = g_gsync_active.load(std::memory_order_relaxed);
         PacingMode mode = g_pacing_mode.load(std::memory_order_relaxed);
-        {
-            // Per-game G-Sync state from DRS profile
-            DLSSPresets drs = DLSSPresets_Get();
-            const char* gsync_str = "Active";
-            if (drs.available && drs.gsync_requested_state == 1)
-                gsync_str = "Disabled";
-            else if (!gsync)
-                gsync_str = "Off";
-
-            double ceil = g_ceiling_hz.load(std::memory_order_relaxed);
-            double floor = g_floor_hz.load(std::memory_order_relaxed);
-            if (mode == PacingMode::VRR && ceil > 1.0 && floor > 0.0)
-                ImGui::Text("G-Sync: %s  |  Mode: VRR (%.0f-%.0fHz)", gsync_str, floor, ceil);
-            else
-                ImGui::Text("G-Sync: %s  |  Mode: %s", gsync_str, mode == PacingMode::VRR ? "VRR" : "Fixed");
-        }
+        ImGui::Text("G-Sync: %s  |  Mode: %s",
+                    gsync ? "Active" : "Off",
+                    mode == PacingMode::VRR ? "VRR" : "Fixed");
 
 #ifdef _WIN64
         // FG pacing status
-        int fg_div_raw = ComputeFGDivisorRaw();
-        if (IsDmfgActive()) {
+        const int fg_div_raw = g_resolved_fg_divisor.load(std::memory_order_relaxed);
+        if (dmfg_dynamic_active || g_config.dynamic_mfg_passthrough) {
             ImGui::Text("FG Pacing: Dynamic (passthrough)");
+        } else if (fg_div_raw > 1 && Streamline_RouteRejection() == FgRouteRejection::Dynamic) {
+            ImGui::Text("FG Pacing: Dynamic");
         } else if (fg_div_raw > 1) {
             double eff_us = g_effective_interval_us.load(std::memory_order_relaxed);
             double native_fps = (eff_us > 0.0) ? 1000000.0 / eff_us : 0.0;
@@ -1534,24 +1450,10 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
 
         ImVec4 col_ok = ImVec4(0.2f, 0.9f, 0.2f, 1.0f);
         ImVec4 col_bad = ImVec4(0.9f, 0.2f, 0.2f, 1.0f);
-        ImVec4 col_na  = ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
 
         ImGui::Text("Pipeline:");
         ImGui::SameLine();
         ImGui::TextColored(sim_ok ? col_ok : col_bad, "SIM %s", sim_ok ? "ok" : "X");
-        ImGui::SameLine();
-        ImGui::Text("|");
-        ImGui::SameLine();
-#ifdef _WIN64
-        if (IsDmfgActive())
-            ImGui::TextColored(col_na, "RENDER n/a");
-        else {
-            bool render_ok = IsCorrelatorValid() && IsDXGIStatsFresh();
-            ImGui::TextColored(render_ok ? col_ok : col_bad, "RENDER %s", render_ok ? "ok" : "X");
-        }
-#else
-        ImGui::TextColored(col_na, "RENDER n/a");
-#endif
         ImGui::SameLine();
         ImGui::Text("|");
         ImGui::SameLine();
@@ -1560,10 +1462,8 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
 
     // DLSS / Streamline info — always visible in settings panel
     {
-        NGXDLSSInfo dlss = NGXHooks_GetInfo();
         if (dlss.available) {
-            DLSSPresets_Poll();
-            DLSSPresets presets = DLSSPresets_Get();
+            DLSSPresets_EnsureStarted();
 
             // Quality level
             const char* quality_str = "Unknown";
@@ -1664,9 +1564,32 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         }
     }
 
-    // Save immediately when any setting was changed this frame
-    if (config_dirty)
-        SaveConfig();
+    // Snapshot changed settings now; persistence runs on the save worker.
+    if (config_dirty) {
+        PublishHotkeyBindings();
+        UpdateOsdDemand();
+        RequestSaveConfig();
+    }
+}
+
+static void DrawSettings(reshade::api::effect_runtime* runtime) {
+    RuntimeCallbackGuard callback;
+    if (callback.IsStopping()) return;
+    try {
+        ConfigOwnerLock owner;
+        if (RuntimeLifecycle_IsStopping()) return;
+        auto* capture = s_capture_runtime.load(std::memory_order_relaxed);
+        const bool editable = !capture || capture == runtime;
+        if (editable) s_binding_drawn = false;
+        DrawSettingsImpl(runtime, editable);
+        if (editable && s_binding_drawn) {
+            s_capture_runtime.store(runtime, std::memory_order_release);
+            Hotkeys_SetSuppressed(true);
+        }
+    }
+    catch (...) {
+        OutputDebugStringA("ReLimiter: settings callback rejected an exception.\n");
+    }
 }
 
 // ── 1% low tracking ──
@@ -1675,114 +1598,47 @@ static double s_low_history[LOW_HISTORY_SIZE] = {};
 static int    s_low_history_idx = 0;
 static int    s_low_history_count = 0;
 
-// Cached results — recomputed every 30 frames instead of every frame
+// Cached results — recomputed every 30 accepted scheduler samples.
 static double s_cached_1pct_low = 0.0;
 static double s_cached_01pct_low = 0.0;
 static int    s_low_recompute_counter = 0;
 
-void OSD_ResetLowHistory() {
-    s_low_history_count = 0;
+static void ResetCadenceHistory() {
+    s_real_fps = 0.0;
+    s_ft_history_idx = 0;
+    s_ft_history_count = 0;
+    s_graph_scale_min = 0.0f;
+    s_graph_scale_max = 33.0f;
     s_low_history_idx = 0;
+    s_low_history_count = 0;
     s_cached_1pct_low = 0.0;
     s_cached_01pct_low = 0.0;
-}
-
-void OSD_CyclePosition() {
-    // Corner positions (clockwise): top-left, top-right, bottom-right, bottom-left
-    // Determine current corner based on osd_x and osd_y
-    // x < 0.5 = left, x >= 0.5 = right
-    // y < 0.5 = top, y >= 0.5 = bottom
-    
-    bool is_right = g_config.osd_x >= 0.5f;
-    bool is_bottom = g_config.osd_y >= 0.5f;
-    
-    // Current corner: 0=top-left, 1=top-right, 2=bottom-right, 3=bottom-left
-    int corner = 0;
-    if (!is_right && !is_bottom) corner = 0;      // top-left
-    else if (is_right && !is_bottom) corner = 1;  // top-right
-    else if (is_right && is_bottom) corner = 2;   // bottom-right
-    else corner = 3;                               // bottom-left
-    
-    // Cycle clockwise: top-left → top-right → bottom-right → bottom-left → top-left
-    corner = (corner + 1) % 4;
-    
-    // Set new position - exact corners, no margin
-    switch (corner) {
-        case 0:  // top-left
-            g_config.osd_x = 0.0f;
-            g_config.osd_y = 0.0f;
-            break;
-        case 1:  // top-right
-            g_config.osd_x = 1.0f;
-            g_config.osd_y = 0.0f;
-            break;
-        case 2:  // bottom-right
-            g_config.osd_x = 1.0f;
-            g_config.osd_y = 1.0f;
-            break;
-        case 3:  // bottom-left
-            g_config.osd_x = 0.0f;
-            g_config.osd_y = 1.0f;
-            break;
-    }
+    s_low_recompute_counter = 0;
 }
 
 static void RecomputeLowFPS() {
-    int n = s_low_history_count < LOW_HISTORY_SIZE ? s_low_history_count : LOW_HISTORY_SIZE;
-
-    // 1% low
-    if (n >= 30) {
-        static double sorted[LOW_HISTORY_SIZE];
-        for (int i = 0; i < n; i++)
-            sorted[i] = s_low_history[i];
-        std::sort(sorted, sorted + n);
-
-        int tail_start = static_cast<int>(0.99 * (n - 1));
-        int tail_count = n - tail_start;
-        double sum = 0.0;
-        for (int i = tail_start; i < n; i++)
-            sum += sorted[i];
-        double avg_worst = sum / tail_count;
-        s_cached_1pct_low = (avg_worst > 0.0) ? 1000000.0 / avg_worst : 0.0;
-
-        // 0.1% low (reuse sorted array)
-        if (n >= 100) {
-            int tail_01 = static_cast<int>(0.999 * (n - 1));
-            int count_01 = n - tail_01;
-            if (count_01 < 1) count_01 = 1;
-            double sum_01 = 0.0;
-            for (int i = tail_01; i < n; i++)
-                sum_01 += sorted[i];
-            double avg_01 = sum_01 / count_01;
-            s_cached_01pct_low = (avg_01 > 0.0) ? 1000000.0 / avg_01 : 0.0;
-        }
-    }
+    const auto lows = osd_cadence_policy::GetLowFps(s_low_history, s_low_history_count);
+    s_cached_1pct_low = lows.one_percent;
+    s_cached_01pct_low = lows.tenth_percent;
 }
 
 // ── Category colors ──
 static ImVec4 ColPerf()     { float b = g_config.osd_text_brightness; return ImVec4(0.4f*b, 0.9f*b, 0.9f*b, 1.0f); }
 static ImVec4 ColLatency()  { float b = g_config.osd_text_brightness; return ImVec4(1.0f*b, 0.7f*b, 0.3f*b, 1.0f); }
+#ifdef _WIN64 // the Pipeline section is x64-only
 static ImVec4 ColPipeline() { float b = g_config.osd_text_brightness; return ImVec4(0.6f*b, 0.8f*b, 1.0f*b, 1.0f); }
+#endif
 static ImVec4 ColSystem()   { float b = g_config.osd_text_brightness; return ImVec4(0.7f*b, 0.7f*b, 0.7f*b, 1.0f); }
 static ImVec4 ColDLSS()     { float b = g_config.osd_text_brightness; return ImVec4(0.5f*b, 1.0f*b, 0.5f*b, 1.0f); }
 static ImVec4 ColStatus()   { float b = g_config.osd_text_brightness; return ImVec4(1.0f*b, 0.3f*b, 0.3f*b, 1.0f); }
+static ImVec4 ColWarning()  { float b = g_config.osd_text_brightness; return ImVec4(0.9f*b, 0.7f*b, 0.2f*b, 1.0f); }
 
-static ImVec4 PQIColor(double score) {
+// Jitter as a share of the frame interval: green under 8%, yellow under 16%, red above.
+static ImVec4 JitterColor(double ratio) {
     float b = g_config.osd_text_brightness;
-    if (score >= 0.9) return ImVec4(0.2f*b, 0.9f*b, 0.2f*b, 1.0f);
-    if (score >= 0.7) return ImVec4(0.9f*b, 0.9f*b, 0.2f*b, 1.0f);
+    if (ratio < 0.08) return ImVec4(0.2f*b, 0.9f*b, 0.2f*b, 1.0f);
+    if (ratio < 0.16) return ImVec4(0.9f*b, 0.9f*b, 0.2f*b, 1.0f);
     return ImVec4(0.9f*b, 0.2f*b, 0.2f*b, 1.0f);
-}
-
-static void OSDText(const char* text) {
-    float b = g_config.osd_text_brightness;
-    if (g_config.osd_drop_shadow) {
-        ImVec2 pos = ImGui::GetCursorScreenPos();
-        float offset = (std::max)(1.0f, g_config.osd_scale);
-        ImU32 shadow = ImGui::ColorConvertFloat4ToU32(ImVec4(0, 0, 0, 0.8f));
-        ImGui::GetWindowDrawList()->AddText(ImVec2(pos.x + offset, pos.y + offset), shadow, text);
-    }
-    ImGui::TextColored(ImVec4(b, b, b, 1.0f), "%s", text);
 }
 
 static void OSDTextColored(ImVec4 col, const char* text) {
@@ -1793,6 +1649,160 @@ static void OSDTextColored(ImVec4 col, const char* text) {
         ImGui::GetWindowDrawList()->AddText(ImVec2(pos.x + offset, pos.y + offset), shadow, text);
     }
     ImGui::TextColored(col, "%s", text);
+}
+
+// ── Frame Pacing (pacing telemetry snapshot) ──
+
+// What the snapshot's samples are: displayed frames (ETW, DXGI or ReLimiter's flip gate), or the real frames
+// entering frame generation where hardware flip metering places the generated ones.
+static void FormatPacingSourceWhat(const PacingTelemetrySnapshot& snapshot, char* buf, size_t size) {
+    switch (snapshot.display_source) {
+        case PacingDisplaySource::Etw: snprintf(buf, size, "displayed frames, ETW"); break;
+        case PacingDisplaySource::Dxgi: snprintf(buf, size, "displayed frames, DXGI"); break;
+        case PacingDisplaySource::FlipGate: snprintf(buf, size, "displayed frames, flip gate"); break;
+        case PacingDisplaySource::FgInput:
+            if (snapshot.frames_per_sample > 1)
+                snprintf(buf, size, "real frames, %u displayed per real frame", snapshot.frames_per_sample);
+            else
+                snprintf(buf, size, "real frames");
+            break;
+        default: snprintf(buf, size, "no frames"); break;
+    }
+}
+
+// Single unavailable-state line; snapshot is null without a fresh publication.
+static void DrawFramePacingUnavailable(const PacingTelemetrySnapshot* snapshot) {
+    const float brightness = g_config.osd_text_brightness;
+    const PacingDisplaySource source = snapshot ? snapshot->display_source : PacingDisplaySource::None;
+    const bool loss_window = snapshot && snapshot->loss_window;
+    const ImVec4 color = loss_window ? ColWarning()
+        : ImVec4(0.6f * brightness, 0.6f * brightness, 0.6f * brightness, 1.0f);
+    char buf[160];
+    if (source == PacingDisplaySource::None) {
+        if (g_resolved_fg_divisor.load(std::memory_order_relaxed) > 1) {
+            // With frame generation presenting, DXGI statistics cannot time the generated frames. ReLimiter times
+            // the flips its gate lets go, or the real frames under hardware flip metering; nothing else but ETW.
+            snprintf(buf, sizeof(buf),
+                     "Frame Pacing: not timed with this frame generation (PC latency collection times it)");
+        } else {
+            // DXGI frame statistics stand in for ETW, so a failed ETW collector is
+            // reported as context, not as the reason display timing is missing.
+            const NativePclStatus status = NativePcl_GetSnapshot().status;
+            if (status == NativePclStatus::EtwAccessDenied || status == NativePclStatus::StartFailed)
+                snprintf(buf, sizeof(buf), "Frame Pacing: waiting for DXGI display timing (ETW: %s)",
+                         NativePcl_StatusText(status));
+            else
+                snprintf(buf, sizeof(buf), "Frame Pacing: waiting for display timing");
+        }
+        OSDTextColored(color, buf);
+        return;
+    }
+    char what[96];
+    FormatPacingSourceWhat(*snapshot, what, sizeof(what));
+    snprintf(buf, sizeof(buf), "Frame Pacing (%s): waiting for frames%s", what, loss_window ? ", event loss" : "");
+    OSDTextColored(color, buf);
+}
+
+// The worker republishes every 250 ms. A read that fails on writer contention
+// reuses the previous publication instead of flickering and resizing the OSD;
+// a stalled or restarted worker must not leave old values on screen.
+static constexpr double PACING_SNAPSHOT_MAX_AGE_US = 1000000.0;
+
+// One snapshot read per OSD frame; no allocation, locks, I/O or logging.
+// Returns the latest publication, or null when none is fresh.
+static const PacingTelemetrySnapshot* ReadFreshPacingSnapshot() {
+    static PacingTelemetrySnapshot s_snapshot{};
+    static bool s_snapshot_read = false;
+    PacingTelemetrySnapshot latest;
+    if (PacingTelemetry_ReadSnapshot(&latest)) {
+        s_snapshot = latest;
+        s_snapshot_read = true;
+    }
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    const bool fresh = s_snapshot_read &&
+        qpc_to_us(now.QuadPart - s_snapshot.publication_qpc) <= PACING_SNAPSHOT_MAX_AGE_US;
+    return fresh ? &s_snapshot : nullptr;
+}
+
+// Jitter: the mean change from one frame interval to the next over the window, '-' when not measured.
+static void DrawJitter(const PacingTelemetrySnapshot* snapshot) {
+    char buf[48];
+    if (snapshot && snapshot->display_valid && snapshot->jitter_samples != 0 &&
+        snapshot->display_interval_p50_us > 0.0) {
+        snprintf(buf, sizeof(buf), "Jitter: %.2f ms%s", snapshot->adjacent_jitter_mean_us / 1000.0,
+                 snapshot->display_source == PacingDisplaySource::FgInput ? " (real frames)" : "");
+        OSDTextColored(JitterColor(snapshot->adjacent_jitter_mean_us / snapshot->display_interval_p50_us), buf);
+    } else {
+        const float b = g_config.osd_text_brightness;
+        OSDTextColored(ImVec4(0.6f * b, 0.6f * b, 0.6f * b, 1.0f), "Jitter: -");
+    }
+}
+
+// Measured frame pacing over the telemetry window: the frame time, jitter and hitches of what the source
+// measures, then the latency lines the source has data for.
+static void DrawFramePacing(const PacingTelemetrySnapshot* snapshot) {
+    if (!snapshot || !snapshot->display_valid) {
+        DrawFramePacingUnavailable(snapshot);
+        return;
+    }
+
+    const PacingTelemetrySnapshot& pacing = *snapshot;
+    const ImVec4 color = ColPerf();
+    char what[96];
+    FormatPacingSourceWhat(pacing, what, sizeof(what));
+    char buf[160];
+    snprintf(buf, sizeof(buf), "Frame Pacing (%s), last %u s", what, pacing.window_ms / 1000u);
+    OSDTextColored(color, buf);
+    if (pacing.loss_window)
+        OSDTextColored(ColWarning(), " ETW event loss: some intervals excluded");
+    if (pacing.display_source == PacingDisplaySource::FgInput)
+        OSDTextColored(color, " Generated frames are placed after ReLimiter and are not measured here");
+
+    if (pacing.target_output_interval_us > 0.0) {
+        snprintf(buf, sizeof(buf), " Frame time: %.2f ms, slowest 1%%: %.2f ms (target %.2f ms)",
+                 pacing.display_interval_p50_us / 1000.0, pacing.display_interval_p99_us / 1000.0,
+                 pacing.target_output_interval_us / 1000.0);
+    } else {
+        snprintf(buf, sizeof(buf), " Frame time: %.2f ms, slowest 1%%: %.2f ms",
+                 pacing.display_interval_p50_us / 1000.0, pacing.display_interval_p99_us / 1000.0);
+    }
+    OSDTextColored(color, buf);
+
+    if (pacing.jitter_samples != 0) {
+        snprintf(buf, sizeof(buf), " Jitter: %.2f ms, worst 1%%: %.2f ms",
+                 pacing.adjacent_jitter_mean_us / 1000.0, pacing.adjacent_jitter_p99_us / 1000.0);
+        OSDTextColored(color, buf);
+    }
+
+    snprintf(buf, sizeof(buf), " Hitches: %u", pacing.hitches);
+    OSDTextColored(color, buf);
+
+    if (pacing.animation_valid) {
+        snprintf(buf, sizeof(buf), " Animation Error: %.0f / %.0f us",
+                 pacing.animation_error_p50_us, pacing.animation_error_p99_us);
+        OSDTextColored(color, buf);
+    }
+    if (pacing.latency_valid) {
+        snprintf(buf, sizeof(buf), " Release to Display: %.1f / %.1f ms",
+                 pacing.latency_p50_us / 1000.0, pacing.latency_p99_us / 1000.0);
+        OSDTextColored(color, buf);
+    }
+    if (pacing.residence_valid) {
+        snprintf(buf, sizeof(buf), " GPU Residence: %.2f / %.2f ms",
+                 pacing.residence_p50_us / 1000.0, pacing.residence_p99_us / 1000.0);
+        OSDTextColored(color, buf);
+    }
+    if (pacing.cpu_hold_valid) {
+        snprintf(buf, sizeof(buf), " CPU Hold: %.2f / %.2f ms",
+                 pacing.cpu_hold_p50_us / 1000.0, pacing.cpu_hold_p99_us / 1000.0);
+        OSDTextColored(color, buf);
+    }
+    if (pacing.dropped_records != 0) {
+        snprintf(buf, sizeof(buf), " Dropped Records: %llu",
+                 static_cast<unsigned long long>(pacing.dropped_records));
+        OSDTextColored(color, buf);
+    }
 }
 
 // ── Parse keybind string into VK code + modifier flags ──
@@ -1807,8 +1817,9 @@ struct ParsedKeybind {
 static int KeyNameToVK(const std::string& name) {
     // F-keys
     if (name.size() >= 2 && (name[0] == 'F' || name[0] == 'f') && isdigit(name[1])) {
-        int fnum = atoi(name.c_str() + 1);
-        if (fnum >= 1 && fnum <= 24) return VK_F1 + fnum - 1;
+        char* end = nullptr;
+        long fnum = strtol(name.c_str() + 1, &end, 10);
+        if (*end == '\0' && fnum >= 1 && fnum <= 24) return VK_F1 + static_cast<int>(fnum) - 1;
     }
     // Single letter
     if (name.size() == 1 && isalpha(name[0])) return toupper(name[0]);
@@ -1858,8 +1869,11 @@ static int KeyNameToVK(const std::string& name) {
     if (_stricmp(name.c_str(), "Keypad8") == 0)      return VK_NUMPAD8;
     if (_stricmp(name.c_str(), "Keypad9") == 0)      return VK_NUMPAD9;
     // Hex fallback
-    if (name.size() >= 3 && name[0] == '0' && (name[1] == 'x' || name[1] == 'X'))
-        return static_cast<int>(strtol(name.c_str(), nullptr, 16));
+    if (name.size() >= 3 && name[0] == '0' && (name[1] == 'x' || name[1] == 'X')) {
+        char* end = nullptr;
+        long vk = strtol(name.c_str(), &end, 16);
+        if (*end == '\0' && vk > 0 && vk < 0xFF) return static_cast<int>(vk);
+    }
     return 0;
 }
 
@@ -1889,79 +1903,104 @@ static ParsedKeybind ParseKeybind(const std::string& str) {
     return kb;
 }
 
-void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
-    // ── Keybind polling (runs every frame via reshade_overlay event) ──
-    // Uses GetAsyncKeyState for the main key (works regardless of UI state)
-    // and for modifiers. Edge-triggered on press→release transition to avoid
-    // repeat toggles while held.
-    {
-        static bool s_was_pressed = false;
-        ParsedKeybind kb = ParseKeybind(g_config.osd_toggle_key);
-        if (kb.vk != 0) {
-            bool key_down = (GetAsyncKeyState(kb.vk) & 0x8000) != 0;
-
-            // For modifiers, check both left and right variants explicitly
-            // GetAsyncKeyState(VK_CONTROL) can miss if only checked once per frame
-            bool ctrl_held  = (GetAsyncKeyState(VK_LCONTROL) & 0x8000) ||
-                              (GetAsyncKeyState(VK_RCONTROL) & 0x8000);
-            bool alt_held   = (GetAsyncKeyState(VK_LMENU) & 0x8000) ||
-                              (GetAsyncKeyState(VK_RMENU) & 0x8000);
-            bool shift_held = (GetAsyncKeyState(VK_LSHIFT) & 0x8000) ||
-                              (GetAsyncKeyState(VK_RSHIFT) & 0x8000);
-
-            bool mods_ok = true;
-            if (kb.ctrl  && !ctrl_held)  mods_ok = false;
-            if (kb.alt   && !alt_held)   mods_ok = false;
-            if (kb.shift && !shift_held) mods_ok = false;
-
-            // Also reject if extra modifiers are held that weren't in the bind
-            // (prevents Ctrl+P from firing when just P is bound)
-            if (!kb.ctrl  && ctrl_held)  mods_ok = false;
-            if (!kb.alt   && alt_held)   mods_ok = false;
-            if (!kb.shift && shift_held) mods_ok = false;
-
-            bool pressed = key_down && mods_ok;
-            if (pressed && !s_was_pressed) {
-                g_config.osd_enabled = !g_config.osd_enabled;
+static bool DrawKeybind(const char* label, std::string* binding, HotkeySlot slot, bool editable) {
+    if (!editable) {
+        ImGui::Text("%s: %s", label, binding->empty() ? "None" : binding->c_str());
+        return false;
+    }
+    bool changed = false;
+    ImGui::PushID(label);
+    ImGui::Text("%s:", label);
+    ImGui::SameLine();
+    if (s_capturing_hotkey == slot) {
+        Hotkeys_Rearm(slot);
+        s_binding_drawn = true;
+        ImGui::TextColored(ImVec4(1, 1, 0.3f, 1), "Press key...");
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) {
+            s_capturing_hotkey = HotkeySlot::Count;
+        } else if (!ImGui::IsKeyDown(ImGuiMod_Super)) {
+            for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; ++k) {
+                const ImGuiKey key = static_cast<ImGuiKey>(k);
+                const char* name = ImGui::GetKeyName(key);
+                if (!name || !name[0] || KeyNameToVK(name) == 0) continue;
+                if (!ImGui::IsKeyPressed(key, false)) continue;
+                binding->clear();
+                if (ImGui::IsKeyDown(ImGuiMod_Ctrl)) *binding += "Ctrl+";
+                if (ImGui::IsKeyDown(ImGuiMod_Alt)) *binding += "Alt+";
+                if (ImGui::IsKeyDown(ImGuiMod_Shift)) *binding += "Shift+";
+                *binding += name;
+                s_capturing_hotkey = HotkeySlot::Count;
+                changed = true;
+                break;
             }
-            s_was_pressed = pressed;
+        }
+    } else {
+        ImGui::TextUnformatted(binding->empty() ? "None" : binding->c_str());
+        ImGui::SameLine();
+        if (ImGui::Button("Bind")) {
+            s_capturing_hotkey = slot;
+            s_binding_drawn = true;
+            Hotkeys_Rearm(slot);
+        }
+        if (!binding->empty()) {
+            ImGui::SameLine();
+            if (ImGui::Button("Clear")) {
+                binding->clear();
+                s_binding_drawn = true;
+                changed = true;
+            }
         }
     }
+    ImGui::PopID();
+    return changed;
+}
+
+// The binding of a slot, parsed only when its string changed (strings are edited under the config
+// owner lock, which every caller holds) and handed to the poller as one word.
+static void PublishHotkeyBinding(HotkeySlot slot, const std::string& binding) {
+    struct Published {
+        std::string text;
+        bool valid = false;
+    };
+    static std::array<Published, static_cast<size_t>(HotkeySlot::Count)> published;
+    Published& last = published[static_cast<size_t>(slot)];
+    if (last.valid && last.text == binding) return;
+    last.text = binding;
+    last.valid = true;
+    const ParsedKeybind kb = ParseKeybind(binding);
+    Hotkeys_SetBinding(slot, hotkey_edge::Pack(hotkey_edge::Binding{ kb.vk, kb.ctrl, kb.alt, kb.shift }));
+}
+
+static void PublishHotkeyBindings() {
+    PublishHotkeyBinding(HotkeySlot::OsdToggle, g_config.osd_toggle_key);
+    PublishHotkeyBinding(HotkeySlot::PresetPrev, g_config.osd_preset_prev_key);
+    PublishHotkeyBinding(HotkeySlot::PresetNext, g_config.osd_preset_next_key);
+    PublishHotkeyBinding(HotkeySlot::Blackout, g_config.blackout_key);
+    PublishHotkeyBinding(HotkeySlot::PositionCycle, g_config.osd_position_cycle_key);
+    PublishHotkeyBinding(HotkeySlot::OledCare, g_config.oled_care_key);
+    const bool bound = Hotkeys_HasBindings();
+    Blackout_SetHotkeyDemand(bound);
+    s_poll_fallback.store(bound && !Hotkeys_ServiceThreadPolling(), std::memory_order_release);
+}
+
+static void ApplyHotkeys() {
+    Hotkeys_PollFallback();
+    if (!Hotkeys_HasPending()) return;
+    Hotkeys_BeginDrain();
+    if (Hotkeys_Take(HotkeySlot::OsdToggle))
+        g_config.osd_enabled = !g_config.osd_enabled;
 
     // ── Preset cycling keybind polling ──
-    {
-        static bool s_prev_pressed = false;
-        static bool s_next_pressed = false;
+    const bool prev = Hotkeys_Take(HotkeySlot::PresetPrev);
+    const bool next = Hotkeys_Take(HotkeySlot::PresetNext);
+    if (prev || next) {
         static int s_active_preset = -1;  // -1 = no preset selected via keybind yet
 
         // Count total presets: 3 built-in + occupied user presets
         int total_presets = 3;
         for (int i = 0; i < OSDPreset_GetCount(); i++)
             if (OSDPreset_GetSlot(i).occupied) total_presets++;
-
-        auto PollPresetKey = [](const std::string& key_str, bool& was_pressed) -> bool {
-            if (key_str.empty()) return false;
-            ParsedKeybind kb = ParseKeybind(key_str);
-            if (kb.vk == 0) return false;
-
-            bool key_down = (GetAsyncKeyState(kb.vk) & 0x8000) != 0;
-            bool ctrl_held  = (GetAsyncKeyState(VK_LCONTROL) & 0x8000) || (GetAsyncKeyState(VK_RCONTROL) & 0x8000);
-            bool alt_held   = (GetAsyncKeyState(VK_LMENU) & 0x8000) || (GetAsyncKeyState(VK_RMENU) & 0x8000);
-            bool shift_held = (GetAsyncKeyState(VK_LSHIFT) & 0x8000) || (GetAsyncKeyState(VK_RSHIFT) & 0x8000);
-
-            bool mods_ok = true;
-            if (kb.ctrl && !ctrl_held) mods_ok = false;
-            if (kb.alt && !alt_held) mods_ok = false;
-            if (kb.shift && !shift_held) mods_ok = false;
-            if (!kb.ctrl && ctrl_held) mods_ok = false;
-            if (!kb.alt && alt_held) mods_ok = false;
-            if (!kb.shift && shift_held) mods_ok = false;
-
-            bool pressed = key_down && mods_ok;
-            bool triggered = pressed && !was_pressed;
-            was_pressed = pressed;
-            return triggered;
-        };
 
         // Apply preset by index: 0=Min, 1=Med, 2=Full, 3+=user presets
         auto ApplyCyclePreset = [](int idx) {
@@ -1973,42 +2012,43 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
                 OSDPreset p = {};
                 p.show_fps = true; p.show_1pct_low = true; p.show_frametime = true;
                 p.show_frametime_graph = true; p.show_gpu_render_time = true;
-                p.show_pqi = true; p.show_smoothness = true; p.show_fg = true;
+                p.show_jitter = true; p.show_fg = true;
                 p.show_gpu_temp = true; p.show_gpu_usage = true; p.show_vram = true;
                 OSDPreset_ApplyTogglesOnly(p);
             } else if (idx == 2) {
                 OSDPreset p = {};
                 p.show_fps = true; p.show_1pct_low = true; p.show_0_1pct_low = true;
                 p.show_frametime = true; p.show_frametime_graph = true;
-                p.show_cpu_latency = true; p.show_gpu_render_time = true;
+                p.show_cpu_latency = true; p.show_native_pcl = true; p.show_native_pcl_breakdown = true; p.show_gpu_render_time = true;
                 p.show_total_frame_cost = true; p.show_fg_time = true;
-                p.show_pqi = true; p.show_pqi_breakdown = true;
-                p.show_smoothness = true; p.show_fg = true; p.show_limiter = true;
-                p.show_adaptive_smoothing = true; p.show_gpu_temp = true;
-                p.show_gpu_clock = true; p.show_gpu_usage = true; p.show_gpu_power = true; p.show_vram = true;
+                p.show_jitter = true; p.show_pacing_quality = true; p.show_fg = true; p.show_limiter = true;
+                p.show_gpu_temp = true;
+                p.show_gpu_clock = true; p.show_gpu_usage = true; p.show_vram = true;
                 p.show_cpu_usage = true; p.show_ram = true;
                 p.show_dlss_quality = true; p.show_dlss_features = true;
                 p.show_dlss_resolution = true; p.show_dlss_presets = true;
                 p.show_dlss_versions = true;
                 OSDPreset_ApplyTogglesOnly(p);
             } else {
-                int user_idx = idx - 3;
-                if (user_idx >= 0 && user_idx < OSDPreset_GetCount()) {
-                    OSDPreset& slot = OSDPreset_GetSlot(user_idx);
-                    if (slot.occupied)
+                int ordinal = idx - 3;
+                for (int i = 0; i < OSDPreset_GetCount(); ++i) {
+                    OSDPreset& slot = OSDPreset_GetSlot(i);
+                    if (slot.occupied && ordinal-- == 0) {
                         OSDPreset_ApplyToConfig(slot);
+                        break;
+                    }
                 }
             }
-            SaveConfig();
+            RequestSaveConfig();
         };
 
         if (total_presets > 0) {
-            if (PollPresetKey(g_config.osd_preset_prev_key, s_prev_pressed)) {
+            if (prev) {
                 s_active_preset = (s_active_preset <= 0) ? total_presets - 1 : s_active_preset - 1;
                 LOG_INFO("OSD: Preset cycle prev -> %d/%d", s_active_preset, total_presets);
                 ApplyCyclePreset(s_active_preset);
             }
-            if (PollPresetKey(g_config.osd_preset_next_key, s_next_pressed)) {
+            if (next) {
                 s_active_preset = (s_active_preset >= total_presets - 1) ? 0 : s_active_preset + 1;
                 LOG_INFO("OSD: Preset cycle next -> %d/%d", s_active_preset, total_presets);
                 ApplyCyclePreset(s_active_preset);
@@ -2016,114 +2056,56 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
         }
     }
 
-    // ── Position cycle keybind polling ──
-    {
-        static bool s_pos_pressed = false;
-        if (!g_config.osd_position_cycle_key.empty()) {
-            ParsedKeybind kb = ParseKeybind(g_config.osd_position_cycle_key);
-            if (kb.vk != 0) {
-                bool key_down = (GetAsyncKeyState(kb.vk) & 0x8000) != 0;
-                bool ctrl_held  = (GetAsyncKeyState(VK_LCONTROL) & 0x8000) || (GetAsyncKeyState(VK_RCONTROL) & 0x8000);
-                bool alt_held   = (GetAsyncKeyState(VK_LMENU) & 0x8000) || (GetAsyncKeyState(VK_RMENU) & 0x8000);
-                bool shift_held = (GetAsyncKeyState(VK_LSHIFT) & 0x8000) || (GetAsyncKeyState(VK_RSHIFT) & 0x8000);
+    if (Hotkeys_Take(HotkeySlot::Blackout))
+        Blackout_Toggle();
+    if (Hotkeys_Take(HotkeySlot::PositionCycle))
+        OSD_CyclePosition();
+    if (Hotkeys_Take(HotkeySlot::OledCare))
+        OLEDCare_Toggle();
 
-                bool mods_ok = true;
-                if (kb.ctrl && !ctrl_held) mods_ok = false;
-                if (kb.alt && !alt_held) mods_ok = false;
-                if (kb.shift && !shift_held) mods_ok = false;
-                if (!kb.ctrl && ctrl_held) mods_ok = false;
-                if (!kb.alt && alt_held) mods_ok = false;
-                if (!kb.shift && shift_held) mods_ok = false;
+    UpdateOsdDemand();
+}
 
-                bool pressed = key_down && mods_ok;
-                if (pressed && !s_pos_pressed) {
-                    OSD_CyclePosition();
-                    SaveConfig();
-                    LOG_INFO("OSD: Position cycled to (%.3f, %.3f)", g_config.osd_x, g_config.osd_y);
-                }
-                s_pos_pressed = pressed;
-            }
-        }
-    }
-
-    // ── Blackout keybind polling ──
-    {
-        static bool s_blackout_pressed = false;
-        if (!g_config.blackout_key.empty()) {
-            ParsedKeybind kb = ParseKeybind(g_config.blackout_key);
-            if (kb.vk != 0) {
-                bool key_down = (GetAsyncKeyState(kb.vk) & 0x8000) != 0;
-                bool ctrl_held  = (GetAsyncKeyState(VK_LCONTROL) & 0x8000) || (GetAsyncKeyState(VK_RCONTROL) & 0x8000);
-                bool alt_held   = (GetAsyncKeyState(VK_LMENU) & 0x8000) || (GetAsyncKeyState(VK_RMENU) & 0x8000);
-                bool shift_held = (GetAsyncKeyState(VK_LSHIFT) & 0x8000) || (GetAsyncKeyState(VK_RSHIFT) & 0x8000);
-
-                bool mods_ok = true;
-                if (kb.ctrl && !ctrl_held) mods_ok = false;
-                if (kb.alt && !alt_held) mods_ok = false;
-                if (kb.shift && !shift_held) mods_ok = false;
-                if (!kb.ctrl && ctrl_held) mods_ok = false;
-                if (!kb.alt && alt_held) mods_ok = false;
-                if (!kb.shift && shift_held) mods_ok = false;
-
-                bool pressed = key_down && mods_ok;
-                if (pressed && !s_blackout_pressed)
-                    Blackout_Toggle();
-                s_blackout_pressed = pressed;
-            }
-        }
-    }
-
-    // ── OLED Care keybind polling ──
-    {
-        static bool s_oled_care_pressed = false;
-        if (!g_config.oled_care_key.empty()) {
-            ParsedKeybind kb = ParseKeybind(g_config.oled_care_key);
-            if (kb.vk != 0) {
-                bool key_down = (GetAsyncKeyState(kb.vk) & 0x8000) != 0;
-                bool ctrl_held  = (GetAsyncKeyState(VK_LCONTROL) & 0x8000) || (GetAsyncKeyState(VK_RCONTROL) & 0x8000);
-                bool alt_held   = (GetAsyncKeyState(VK_LMENU) & 0x8000) || (GetAsyncKeyState(VK_RMENU) & 0x8000);
-                bool shift_held = (GetAsyncKeyState(VK_LSHIFT) & 0x8000) || (GetAsyncKeyState(VK_RSHIFT) & 0x8000);
-
-                bool mods_ok = true;
-                if (kb.ctrl && !ctrl_held) mods_ok = false;
-                if (kb.alt && !alt_held) mods_ok = false;
-                if (kb.shift && !shift_held) mods_ok = false;
-                if (!kb.ctrl && ctrl_held) mods_ok = false;
-                if (!kb.alt && alt_held) mods_ok = false;
-                if (!kb.shift && shift_held) mods_ok = false;
-
-                bool pressed = key_down && mods_ok;
-                if (pressed && !s_oled_care_pressed)
-                    OLEDCare_Toggle();
-                s_oled_care_pressed = pressed;
-            }
-        }
-    }
-
+static void DrawOSDImpl(reshade::api::effect_runtime* runtime) {
     if (!g_config.osd_enabled) return;
+    const bool panel_frame = s_panel.runtime == runtime && s_panel.frame == ImGui::GetFrameCount();
+    s_panel.runtime = nullptr;
+    SchedulerActualFrameSample scheduler_sample;
+    const bool coherent_sample = Scheduler_ReadActualFrameSample(&scheduler_sample);
+    const osd_cadence_policy::Sample sample{
+        scheduler_sample.sequence, scheduler_sample.frame_time_us, scheduler_sample.valid};
+    const ULONGLONG cadence_now = GetTickCount64();
+    const auto cadence = s_cadence_consumer.Observe(
+        coherent_sample ? &sample : nullptr, cadence_now);
+    if (cadence.reset_history)
+        ResetCadenceHistory();
 
-    // Update hardware sensors (throttled internally to ~1Hz)
-    HWMonitor_Update();
-
-    // Streamline Compatibility: poll GetState for FG state (throttled to every 500ms)
-    StreamlineCompat_Poll();
-
-    // Retry NGX hook installation for games where DLLs load late.
-    // TryInstall is idempotent — no-ops once hooks are installed.
-    // Stops after ~30 seconds.
-    {
-        static int s_ngx_retry_counter = 0;
-        if (s_ngx_retry_counter < 5000) {  // ~30s at 165fps
-            s_ngx_retry_counter++;
-            if (s_ngx_retry_counter % 60 == 0 && g_config.dlss_info_hooks)
-                NGXHooks_TryInstall();
-        }
+    // Invalidation bypasses the display throttle, including lifecycle changes
+    // which leave the scheduler's publication sequence unchanged.
+    static double s_display_fps = 0.0;
+    static double s_display_output_fps = 0.0;
+    static ULONGLONG s_fps_display_tick = 0;
+    if (cadence.reset_history || cadence.frame_time_us <= 0.0) {
+        s_real_fps = 0.0;
+        s_display_fps = 0.0;
+        s_display_output_fps = 0.0;
     }
+
+#ifdef _WIN64
+    // Keep the existing observation window for late loads. Stop scanning as
+    // soon as init, the loader worker, or our own retry installs the hooks.
+    static int ngx_frames = 0;
+    if (g_config.dlss_info_hooks && ngx_frames < 5000) {
+        if (NGXHooks_HasInstalled()) ngx_frames = 5000;
+        else if (++ngx_frames % 60 == 0) NGXHooks_TryInstall();
+    }
+#endif
 
     // Real FPS from enforcement-to-enforcement interval (CPU frames only)
-    // EMA-smoothed so the OSD number is readable instead of flickering.
-    double ft = g_actual_frame_time_us.load(std::memory_order_relaxed);
-    if (ft > 0.0) {
+    // EMA advances only once per new valid coherent scheduler observation.
+    const double ft = cadence.frame_time_us;
+    const double ft_ms = ft / 1000.0;
+    if (cadence.new_sample) {
         double instant_fps = 1000000.0 / ft;
         if (s_real_fps > 0.0)
             s_real_fps += 0.02 * (instant_fps - s_real_fps);
@@ -2132,49 +2114,75 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
     }
 
     // Throttle FPS display update to 2x per second for readability
-    static double s_display_fps = 0.0;
-    static double s_display_render_fps = 0.0;
-    static double s_display_output_fps = 0.0;
-    static ULONGLONG s_fps_display_tick = 0;
-    {
-        ULONGLONG now = GetTickCount64();
-        if (now - s_fps_display_tick >= 500) {
-            s_fps_display_tick = now;
-            s_display_fps = s_real_fps;
-            s_display_render_fps = s_real_fps;
-            s_display_output_fps = g_output_fps.load(std::memory_order_relaxed);
-        }
+    if (ft > 0.0 && (s_display_fps == 0.0 || cadence_now - s_fps_display_tick >= 500)) {
+        s_fps_display_tick = cadence_now;
+        s_display_fps = s_real_fps;
+        s_display_output_fps = g_output_fps.load(std::memory_order_relaxed);
     }
 
     const char* fg_label = "off";
     int fg_mult = g_fg_multiplier.load(std::memory_order_relaxed);
     bool fg_presenting = g_fg_presenting.load(std::memory_order_relaxed);
-    int fg_mode = g_fg_mode.load(std::memory_order_relaxed);
     char fg_buf[32] = {};
-    // Determine if FG is actively producing frames:
-    // - With Streamline mode data: mode > 0 AND presenting
-    // - Without mode data: just presenting (mode is always 0)
-    bool fg_display_active = fg_presenting && fg_mult > 0;
-    if (Streamline_HasModeData() && fg_mode == 0)
-        fg_display_active = false;
+    // Histories are independent of ImGui window visibility/collapse and never
+    // train on overlay repeats, invalid zeros, or publication overlap.
+    if (cadence.new_sample && g_config.osd_show_frametime_graph) {
+        s_ft_history[s_ft_history_idx] = static_cast<float>(ft_ms);
+        s_ft_history_idx = (s_ft_history_idx + 1) % FT_HISTORY_SIZE;
+        if (s_ft_history_count < FT_HISTORY_SIZE) s_ft_history_count++;
+    }
+    const bool smooth_motion = IsNvSmoothMotionActive();
+    if (cadence.new_sample && (g_config.osd_show_1pct_low || g_config.osd_show_0_1pct_low)) {
+
+        double display_ft = ft;
+        if (smooth_motion)
+            display_ft = ft / 2.0;  // SM always 2x
+        else if (fg_presenting && fg_mult > 0) {
+            // Preserve the existing low-FPS divisor/label semantics.
+            const int divisor = g_resolved_fg_divisor.load(std::memory_order_relaxed);
+            if (divisor >= 2)
+                display_ft = ft / static_cast<double>(divisor);
+            else
+                display_ft = ft / static_cast<double>(fg_mult + 1);
+        }
+        s_low_history[s_low_history_idx] = display_ft;
+        s_low_history_idx = (s_low_history_idx + 1) % LOW_HISTORY_SIZE;
+        if (s_low_history_count < LOW_HISTORY_SIZE) s_low_history_count++;
+        if (++s_low_recompute_counter >= 30) {
+            s_low_recompute_counter = 0;
+            RecomputeLowFPS();
+        }
+    }
+
     // Driver-authoritative FG confirmation: if the Reflex ring is reporting GPU data
     // but aiFrameTimeUs is 0, FG isn't actually producing interpolated frames.
     // Prevents false positives where compat poll reports FG active but it's off in-game.
-    if (fg_display_active) {
-        double ai_ft = g_reflex_ai_frame_time_us.load(std::memory_order_relaxed);
-        double gpu_active = g_reflex_gpu_active_us.load(std::memory_order_relaxed);
-        if (gpu_active > 0.0 && ai_ft == 0.0)
-            fg_display_active = false;
-    }
-    if (fg_display_active) {
+    const double ai_us = (g_config.osd_show_fg || g_config.osd_show_fg_time)
+        ? g_reflex_ai_frame_time_us.load(std::memory_order_relaxed) : 0.0;
+    const double active_us = (g_config.osd_show_fg || g_config.osd_show_gpu_render_time)
+        ? g_reflex_gpu_active_us.load(std::memory_order_relaxed) : 0.0;
+    const bool fg_display_active = g_config.osd_show_fg && fg_presenting &&
+        !(Streamline_HasModeData() && g_fg_mode.load(std::memory_order_relaxed) == 0) &&
+        !(active_us > 0.0 && ai_us == 0.0);
+    if (!panel_frame && (g_config.osd_show_fps || g_config.osd_show_fg ||
+        g_config.osd_show_limiter || g_config.osd_show_dlss_presets))
+        s_panel.presets = DLSSPresets_Get();
+    const auto& presets = s_panel.presets;
+#ifdef _WIN64
+    const bool dmfg = (presets.available && presets.mfg_mode_override == 4) || g_config.dynamic_mfg_passthrough;
+#else
+    constexpr bool dmfg = false;
+#endif
+    if (fg_display_active && !dmfg && !smooth_motion && Streamline_RouteRejection() == FgRouteRejection::Dynamic) {
+        fg_label = "Dynamic";
+    } else if (fg_display_active && !dmfg && !smooth_motion && fg_mult > 0) {
         // Use actual driver multiplier when available (handles control panel overrides)
         int actual = g_fg_actual_multiplier.load(std::memory_order_relaxed);
         int display_mult = (actual >= 2) ? actual : (fg_mult + 1);
 
         // DRS MFG override: if Profile Inspector sets a higher generation factor, show that
-        DLSSPresets presets_fg = DLSSPresets_Get();
-        if (presets_fg.available && presets_fg.mfg_generation_factor > 0) {
-            int drs_mult = presets_fg.mfg_generation_factor + 1;
+        if (presets.available && presets.mfg_generation_factor > 0) {
+            int drs_mult = presets.mfg_generation_factor + 1;
             if (drs_mult > display_mult)
                 display_mult = drs_mult;
         }
@@ -2183,22 +2191,12 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
         fg_label = fg_buf;
     }
 
-    int tier = static_cast<int>(g_current_tier);
-
-    // Limiter-added latency: only the gate hold adds to input-to-photon latency.
-    // own_sleep happens at SIMULATION_START (before input sampling with Reflex),
-    // so it's frame pacing, not added latency. gate_sleep holds the present
-    // after rendering, which genuinely delays display.
-    double limiter_added_ms = g_last_gate_sleep_us.load(std::memory_order_relaxed) / 1000.0;
-
     // Compute pixel position from screen percentage
     ImVec2 display = ImGui::GetIO().DisplaySize;
     float px_x = g_config.osd_x * display.x;
     float px_y = g_config.osd_y * display.y;
-    // Anchor point flips based on position quadrant so the OSD stays within
-    // screen bounds and sits flush against whichever edge it's near.
-    float pivot_x = (g_config.osd_x > 0.5f) ? 1.0f : 0.0f;
-    float pivot_y = (g_config.osd_y > 0.5f) ? 1.0f : 0.0f;
+    const float pivot_x = osd_position_policy::Pivot(g_config.osd_x);
+    const float pivot_y = osd_position_policy::Pivot(g_config.osd_y);
     ImGui::SetNextWindowPos({px_x, px_y}, ImGuiCond_Always, {pivot_x, pivot_y});
     ImGui::SetNextWindowBgAlpha(g_config.osd_opacity);
 
@@ -2209,70 +2207,24 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
         float scale = g_config.osd_scale;
         ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * scale);
 
-        // Always update frame time history for graph and 1% low
-        double ft_ms = ft / 1000.0;
-        s_ft_history[s_ft_history_idx] = static_cast<float>(ft_ms);
-        s_ft_history_idx = (s_ft_history_idx + 1) % FT_HISTORY_SIZE;
-        if (ft > 0.0) {
-            double display_ft = ft;
-            if (IsNvSmoothMotionActive())
-                display_ft = ft / 2.0;  // SM always 2x
-            else if (fg_presenting && fg_mult > 0 && (IsFGDllLoaded() || IsDmfgActive())) {
-                // Use the real divisor (accounts for DRS MFG override)
-                int divisor = ComputeFGDivisorRaw();
-                if (divisor >= 2)
-                    display_ft = ft / static_cast<double>(divisor);
-                // else: divisor < 2 means FG not confirmed — don't divide, use ft as-is
-            }
-            // Feed 1% low history when actively pacing (T0-T2a).
-            // T3/T4 are passthrough — unlocked frame times corrupt the window.
-            if (g_current_tier < Tier::Tier3) {
-                s_low_history[s_low_history_idx] = display_ft;
-                s_low_history_idx = (s_low_history_idx + 1) % LOW_HISTORY_SIZE;
-                if (s_low_history_count < LOW_HISTORY_SIZE) s_low_history_count++;
-            }
-        }
-
-        // Recompute 1%/0.1% low every 30 frames (~5Hz) instead of every frame
-        if (++s_low_recompute_counter >= 30) {
-            s_low_recompute_counter = 0;
-            RecomputeLowFPS();
-        }
-
         // ═══════════════════════════════════
         // PERFORMANCE (cyan)
         // ═══════════════════════════════════
-        if (g_config.osd_show_fps) {
+        if (g_config.osd_show_fps && ft > 0.0) {
             double output = s_display_output_fps;
-            int fg_div_raw = ComputeFGDivisorRaw();
             char buf[64];
-            if (IsNvSmoothMotionActive()) {
+            if (smooth_motion) {
                 snprintf(buf, sizeof(buf), "%.0f fps (%.1f render)", s_display_fps * 2.0, s_display_fps);
-            } else if (IsDmfgActive() && output > 0.0) {
+            } else if (dmfg && output > 0.0) {
                 snprintf(buf, sizeof(buf), "%.0f fps (%.1f render)", output, s_display_fps);
-            } else if (output > 0.0 && fg_presenting && fg_mult > 0 && fg_div_raw > 1 && (IsFGDllLoaded() || IsDmfgActive())) {
-                // Check if output counter is seeing FG presents.
-                // If output ≈ render (within 20%), the counter only sees native presents
-                // (third-party FG injector case). Infer output from render × divisor.
-                double ratio = (s_display_fps > 1.0) ? output / s_display_fps : 0.0;
-                if (fg_div_raw > 1 && ratio < 1.3) {
-                    // Output counter missed FG presents — infer
-                    double inferred = s_display_fps * static_cast<double>(fg_div_raw);
-                    snprintf(buf, sizeof(buf), "~%.0f fps (%.1f render)", inferred, s_display_fps);
-                } else {
-                    snprintf(buf, sizeof(buf), "%.0f fps (%.1f render)", output, s_display_fps);
-                }
-            } else if (fg_div_raw > 1 && s_display_fps > 1.0 && (IsFGDllLoaded() || IsDmfgActive())) {
-                // FG active but no output counter data — infer
-                double inferred = s_display_fps * static_cast<double>(fg_div_raw);
-                snprintf(buf, sizeof(buf), "~%.0f fps (%.1f render)", inferred, s_display_fps);
-            } else {
+            } else if (output > 0.0 && fg_presenting && fg_mult > 0)
+                snprintf(buf, sizeof(buf), "%.0f fps (%.1f render)", output, s_display_fps);
+            else
                 snprintf(buf, sizeof(buf), "%.1f fps", s_display_fps);
-            }
             OSDTextColored(ColPerf(), buf);
         }
 
-        if (g_config.osd_show_1pct_low) {
+        if (g_config.osd_show_1pct_low && ft > 0.0) {
             if (s_cached_1pct_low > 0.0) {
                 char buf[32];
                 snprintf(buf, sizeof(buf), "1%% Low: %.0f", s_cached_1pct_low);
@@ -2280,7 +2232,7 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
             }
         }
 
-        if (g_config.osd_show_0_1pct_low) {
+        if (g_config.osd_show_0_1pct_low && ft > 0.0) {
             if (s_cached_01pct_low > 0.0) {
                 char buf[32];
                 snprintf(buf, sizeof(buf), "0.1%% Low: %.0f", s_cached_01pct_low);
@@ -2288,7 +2240,7 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
             }
         }
 
-        if (g_config.osd_show_frametime) {
+        if (g_config.osd_show_frametime && ft > 0.0) {
             char buf[32];
             snprintf(buf, sizeof(buf), "%.2f ms", ft_ms);
             OSDTextColored(ColPerf(), buf);
@@ -2306,8 +2258,79 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
             }
         }
 
+        if (g_config.native_pcl_enabled && g_config.osd_show_native_pcl) {
+            const NativePclSnapshot native_pcl = NativePcl_GetSnapshot();
+            const bool total_available = native_pcl.available &&
+                std::isfinite(native_pcl.total_us);
+
+            ImVec4 native_pcl_color = ColLatency();
+            if (!native_pcl.reliable) {
+                const float brightness = g_config.osd_text_brightness;
+                if (total_available) {
+                    native_pcl_color = ImVec4(
+                        0.9f * brightness,
+                        0.7f * brightness,
+                        0.2f * brightness,
+                        1.0f);
+                }
+                else {
+                    const bool waiting =
+                        native_pcl.status == NativePclStatus::Disabled ||
+                        native_pcl.status == NativePclStatus::Starting ||
+                        native_pcl.status == NativePclStatus::Warming ||
+                        native_pcl.status == NativePclStatus::Stopped;
+                    native_pcl_color = waiting
+                        ? ImVec4(0.6f * brightness, 0.6f * brightness, 0.6f * brightness, 1.0f)
+                        : ImVec4(0.9f * brightness, 0.3f * brightness, 0.3f * brightness, 1.0f);
+                }
+            }
+
+            char native_pcl_text[96];
+            if (total_available) {
+                snprintf(
+                    native_pcl_text,
+                    sizeof(native_pcl_text),
+                    "PC Latency: %.1f ms (%s)",
+                    native_pcl.total_us / 1000.0,
+                    NativePcl_StatusText(native_pcl.status));
+            }
+            else {
+                snprintf(
+                    native_pcl_text,
+                    sizeof(native_pcl_text),
+                    "PC Latency: N/A (%s)",
+                    NativePcl_StatusText(native_pcl.status));
+            }
+            OSDTextColored(native_pcl_color, native_pcl_text);
+
+            if (g_config.osd_show_native_pcl_breakdown) {
+                const bool breakdown_available = total_available &&
+                    std::isfinite(native_pcl.input_to_frame_start_us) &&
+                    std::isfinite(native_pcl.frame_start_to_present_us) &&
+                    std::isfinite(native_pcl.present_to_display_us);
+                char breakdown_text[96];
+                if (breakdown_available) {
+                    snprintf(
+                        breakdown_text,
+                        sizeof(breakdown_text),
+                        " I2FS / FS2P / P2D: %.1f / %.1f / %.1f ms",
+                        native_pcl.input_to_frame_start_us / 1000.0,
+                        native_pcl.frame_start_to_present_us / 1000.0,
+                        native_pcl.present_to_display_us / 1000.0);
+                }
+                else {
+                    snprintf(
+                        breakdown_text,
+                        sizeof(breakdown_text),
+                        " I2FS / FS2P / P2D: N/A (%s)",
+                        NativePcl_StatusText(native_pcl.status));
+                }
+                OSDTextColored(native_pcl_color, breakdown_text);
+            }
+        }
+
         if (g_config.osd_show_gpu_render_time) {
-            double gpu_us = g_reflex_gpu_active_us.load(std::memory_order_relaxed);
+            double gpu_us = active_us;
             if (gpu_us > 0.0) {
                 char buf[32];
                 snprintf(buf, sizeof(buf), "GPU: %.1f ms", gpu_us / 1000.0);
@@ -2325,7 +2348,7 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
         }
 
         if (g_config.osd_show_fg_time) {
-            double fg_us = g_reflex_ai_frame_time_us.load(std::memory_order_relaxed);
+            double fg_us = ai_us;
             if (fg_us > 0.0) {
                 char buf[32];
                 snprintf(buf, sizeof(buf), "FG: %.1f ms", fg_us / 1000.0);
@@ -2335,53 +2358,26 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
 
         // ═══════════════════════════════════
         // QUALITY (green/yellow/red)
-        // — hidden during DMFG passthrough (scheduler isn't pacing, scores are meaningless)
         // ═══════════════════════════════════
-        PQIScores pqi = {};
-        if (!IsDmfgActive() && (g_config.osd_show_pqi || g_config.osd_show_pqi_breakdown))
-            pqi = PQI_GetRolling();
+        const PacingTelemetrySnapshot* pacing_snapshot =
+            g_config.osd_show_jitter || g_config.osd_show_pacing_quality ? ReadFreshPacingSnapshot() : nullptr;
+        if (g_config.osd_show_jitter)
+            DrawJitter(pacing_snapshot);
 
-        if (!IsDmfgActive() && g_config.osd_show_pqi) {
-            ImVec4 pqi_color = PQIColor(pqi.pqi / 100.0);
-            char buf[32];
-            snprintf(buf, sizeof(buf), "PQI: %.0f%%", pqi.pqi);
-            OSDTextColored(pqi_color, buf);
-        }
-
-        if (!IsDmfgActive() && g_config.osd_show_pqi && g_config.osd_show_pqi_breakdown) {
-            char buf[64];
-            snprintf(buf, sizeof(buf), " Cadence: %.0f%%", pqi.cadence * 100.0);
-            OSDTextColored(PQIColor(pqi.cadence), buf);
-            snprintf(buf, sizeof(buf), " Stutter: %.0f%%", pqi.stutter * 100.0);
-            OSDTextColored(PQIColor(pqi.stutter), buf);
-            snprintf(buf, sizeof(buf), " Deadline: %.0f%%", pqi.deadline * 100.0);
-            OSDTextColored(PQIColor(pqi.deadline), buf);
-        }
-
-        if (g_config.osd_show_smoothness) {
-            double smooth = g_smoothness_us.load(std::memory_order_relaxed);
-            if (smooth > 0.0) {
-                char buf[32];
-                snprintf(buf, sizeof(buf), "Smoothness: %.2f ms", smooth / 1000.0);
-                // Color: green < 0.5ms, yellow < 1.5ms, red >= 1.5ms
-                ImVec4 col;
-                float b = g_config.osd_text_brightness;
-                if (smooth < 500.0)       col = ImVec4(0.2f*b, 0.9f*b, 0.2f*b, 1.0f);
-                else if (smooth < 1500.0) col = ImVec4(0.9f*b, 0.9f*b, 0.2f*b, 1.0f);
-                else                      col = ImVec4(0.9f*b, 0.2f*b, 0.2f*b, 1.0f);
-                OSDTextColored(col, buf);
-            }
-        }
+        // Measured frame pacing: displayed frames (ETW, DXGI or the flip gate) or the real frames entering
+        // frame generation.
+        if (g_config.osd_show_pacing_quality)
+            DrawFramePacing(pacing_snapshot);
 
         // ═══════════════════════════════════
         // PIPELINE (light blue)
         // ═══════════════════════════════════
 #ifdef _WIN64
-        if (g_config.osd_show_fg && (IsFGDllLoaded() || IsNvSmoothMotionActive())) {
+        if (g_config.osd_show_fg) {
             char buf[48];
-            if (IsNvSmoothMotionActive()) {
+            if (smooth_motion) {
                 snprintf(buf, sizeof(buf), "FG: Smooth Motion");
-            } else if (IsDmfgActive()) {
+            } else if (dmfg) {
                 // For DMFG, infer the real-time multiplier from output/render ratio.
                 // This shows what the driver is actually doing right now (fluctuates with load).
                 int display_mult = 0;
@@ -2392,14 +2388,12 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
                 }
                 // Fallback to DRS configured max if inference not ready
                 if (display_mult < 2) {
-                    DLSSPresets presets_dmfg = DLSSPresets_Get();
-                    if (presets_dmfg.available && presets_dmfg.mfg_generation_factor > 0)
-                        display_mult = presets_dmfg.mfg_generation_factor + 1;
+                    if (presets.available && presets.mfg_generation_factor > 0)
+                        display_mult = presets.mfg_generation_factor + 1;
                 }
 
                 // Show DRS target FPS on OSD when set
-                DLSSPresets presets_osd = DLSSPresets_Get();
-                int drs_target = presets_osd.mfg_dynamic_target_fps;
+                int drs_target = presets.mfg_dynamic_target_fps;
                 int display_cap = 0;
                 if (drs_target == 0x01000000) {
                     double ceil = g_ceiling_hz.load(std::memory_order_relaxed);
@@ -2422,37 +2416,30 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
             OSDTextColored(ColPipeline(), buf);
         }
 
-        if (g_config.osd_show_limiter && !IsDmfgActive()) {
+        if (g_config.osd_show_limiter && !dmfg) {
+            // Limiter-added latency: only the gate hold adds to input-to-photon
+            // latency. own_sleep happens at SIMULATION_START (before input
+            // sampling with Reflex), so it's frame pacing, not added latency.
+            // gate_sleep holds the present after rendering, which genuinely
+            // delays display.
+            const double limiter_added_ms =
+                g_last_gate_sleep_us.load(std::memory_order_relaxed) / 1000.0;
             char buf[48];
-            snprintf(buf, sizeof(buf), "Limiter: +%.1f ms  T%d", limiter_added_ms, tier);
+            snprintf(buf, sizeof(buf), "Limiter: +%.1f ms", limiter_added_ms);
             OSDTextColored(ColPipeline(), buf);
         }
 
-        if (g_config.osd_show_adaptive_smoothing && g_config.adaptive_smoothing && !IsDmfgActive()) {
-            double offset = g_smoothing_offset_us.load(std::memory_order_relaxed);
-            double p99 = g_smoothing_p99_us.load(std::memory_order_relaxed);
-            if (g_adaptive_smoothing.IsWarm()) {
-                const char* mode = g_adaptive_smoothing.dual_mode ? "Dual" : "Med";
-                double pct = g_adaptive_smoothing.target_percentile * 100.0;
-                char buf[96];
-                snprintf(buf, sizeof(buf), "Adaptive: +%.0f us (P%.0f: %.1f ms) [%s]",
-                         offset, pct, p99 / 1000.0, mode);
-                float b = g_config.osd_text_brightness;
-                ImVec4 col = (offset < 100.0)
-                    ? ImVec4(0.2f*b, 0.9f*b, 0.2f*b, 1.0f)
-                    : ImVec4(0.9f*b, 0.9f*b, 0.2f*b, 1.0f);
-                OSDTextColored(col, buf);
-            }
-        }
-#endif // _WIN64 (Pipeline section: FG, Limiter, Adaptive Smoothing)
+#endif // _WIN64 (Pipeline section: FG, Limiter)
 
         // ═══════════════════════════════════
         // DLSS (green — NGX feature info)
         // ═══════════════════════════════════
-        {
-            NGXDLSSInfo dlss = NGXHooks_GetInfo();
-            DLSSPresets_Poll();
-            DLSSPresets presets = DLSSPresets_Get();
+        // Once requested, the profile also feeds the pacer's MFG divisor and mode.
+        DLSSPresets_EnsureStarted();
+        if (g_config.osd_show_dlss_quality || g_config.osd_show_dlss_features ||
+            g_config.osd_show_dlss_resolution || g_config.osd_show_dlss_presets || g_config.osd_show_dlss_versions) {
+            if (!panel_frame) s_panel.dlss = NGXHooks_GetInfo(g_config.osd_show_dlss_versions);
+            const auto& dlss = s_panel.dlss;
 
             // Quality level
             if (g_config.osd_show_dlss_quality && dlss.available) {
@@ -2607,8 +2594,8 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
         // ═══════════════════════════════════
         // SYSTEM (grey — hardware sensors)
         // ═══════════════════════════════════
-        {
-            const HWMonitorData& hw = HWMonitor_GetData();
+        if (s_sensor_mask) {
+            const HWMonitorData hw = HWMonitor_GetData();
 
             // GPU metrics
             if (g_config.osd_show_gpu_temp && hw.gpu_temp_c >= 0) {
@@ -2635,12 +2622,6 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
             if (g_config.osd_show_gpu_usage && hw.gpu_usage_pct >= 0) {
                 char buf[32];
                 snprintf(buf, sizeof(buf), "GPU Load: %d%%", hw.gpu_usage_pct);
-                OSDTextColored(ColSystem(), buf);
-            }
-
-            if (g_config.osd_show_gpu_power && hw.gpu_power_w >= 0) {
-                char buf[32];
-                snprintf(buf, sizeof(buf), "GPU Power: %dW", hw.gpu_power_w);
                 OSDTextColored(ColSystem(), buf);
             }
 
@@ -2686,61 +2667,47 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
         if (CSV_IsEnabled())
             OSDTextColored(ColStatus(), "REC");
 
-        if (Baseline_IsCapturing()) {
-            char buf[32];
-            snprintf(buf, sizeof(buf), "Baseline: %.0f%%", Baseline_GetProgress() * 100.0);
-            OSDTextColored(ColStatus(), buf);
-        } else if (Baseline_IsComparison()) {
-            char buf[32];
-            snprintf(buf, sizeof(buf), "Compare: %.0f%%", Baseline_GetProgress() * 100.0);
-            OSDTextColored(ColStatus(), buf);
-        }
-
         // ═══════════════════════════════════
         // FRAMETIME GRAPH
         // ═══════════════════════════════════
-        if (g_config.osd_show_frametime_graph) {
-            float ordered[FT_HISTORY_SIZE];
-            float data_max = 0.0f;
-            float data_min = 1e9f;
-            for (int i = 0; i < FT_HISTORY_SIZE; i++) {
-                float v = s_ft_history[(s_ft_history_idx + i) % FT_HISTORY_SIZE];
-                ordered[i] = v;
-                if (v > 0.0f) {
-                    if (v > data_max) data_max = v;
-                    if (v < data_min) data_min = v;
-                }
+        if (g_config.osd_show_frametime_graph && s_ft_history_count > 0) {
+            if (cadence.new_sample) {
+                // Every live sample is positive; the unfilled tail is excluded.
+                const auto bounds = std::minmax_element(s_ft_history, s_ft_history + s_ft_history_count);
+                const float data_min = *bounds.first;
+                const float data_max = *bounds.second;
+
+                const float current = static_cast<float>(ft_ms);
+                const float ideal_min = (std::max)(0.0f, current - 4.0f);
+                const float ideal_max = current + 4.0f;
+                const float needed_min = (std::max)(0.0f, (std::min)(ideal_min, data_min - 1.0f));
+                const float needed_max = (std::max)(ideal_max, data_max + 1.0f);
+                if (needed_min < s_graph_scale_min) s_graph_scale_min = needed_min;
+                if (needed_max > s_graph_scale_max) s_graph_scale_max = needed_max;
+
+                s_graph_scale_min += (ideal_min - s_graph_scale_min) * 0.02f;
+                s_graph_scale_max += (ideal_max - s_graph_scale_max) * 0.02f;
+                s_graph_scale_min = (std::max)(0.0f, s_graph_scale_min);
+                if (s_graph_scale_max < s_graph_scale_min + 2.0f)
+                    s_graph_scale_max = s_graph_scale_min + 2.0f;
             }
-
-            float current = static_cast<float>(ft_ms);
-            float ideal_min = (std::max)(0.0f, current - 4.0f);
-            float ideal_max = current + 4.0f;
-
-            float needed_min = (std::min)(ideal_min, data_min - 1.0f);
-            float needed_max = (std::max)(ideal_max, data_max + 1.0f);
-            needed_min = (std::max)(0.0f, needed_min);
-
-            if (needed_min < s_graph_scale_min) s_graph_scale_min = needed_min;
-            if (needed_max > s_graph_scale_max) s_graph_scale_max = needed_max;
-
-            s_graph_scale_min += (ideal_min - s_graph_scale_min) * 0.02f;
-            s_graph_scale_max += (ideal_max - s_graph_scale_max) * 0.02f;
-            s_graph_scale_min = (std::max)(0.0f, s_graph_scale_min);
-            if (s_graph_scale_max < s_graph_scale_min + 2.0f)
-                s_graph_scale_max = s_graph_scale_min + 2.0f;
 
             float scale_min = s_graph_scale_min;
             float scale_max = s_graph_scale_max;
-            float scale_mid = (scale_min + scale_max) * 0.5f;
 
             constexpr float GRAPH_W = 300.0f;
             constexpr float GRAPH_H = 80.0f;
             constexpr float LABEL_W = 40.0f;
 
-            char top_label[16], mid_label[16], bot_label[16];
-            snprintf(top_label, sizeof(top_label), "%.0f", scale_max);
-            snprintf(mid_label, sizeof(mid_label), "%.0f", scale_mid);
-            snprintf(bot_label, sizeof(bot_label), "%.0f", scale_min);
+            static char top_label[16], mid_label[16], bot_label[16];
+            static float last_min = -1.0f, last_max = -1.0f;
+            if (scale_min != last_min || scale_max != last_max) {
+                last_min = scale_min;
+                last_max = scale_max;
+                snprintf(top_label, sizeof(top_label), "%.0f", scale_max);
+                snprintf(mid_label, sizeof(mid_label), "%.0f", (scale_max + scale_min) * 0.5f);
+                snprintf(bot_label, sizeof(bot_label), "%.0f", scale_min);
+            }
 
             ImVec2 cursor = ImGui::GetCursorScreenPos();
 
@@ -2752,8 +2719,9 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
                 {cursor.x, cursor.y + GRAPH_H - 12.0f}, 0xFFCCCCCC, bot_label);
 
             ImGui::SetCursorScreenPos({cursor.x + LABEL_W, cursor.y});
-            ImGui::PlotLines("##ft_graph", ordered, FT_HISTORY_SIZE,
-                             0, nullptr, scale_min, scale_max,
+            const int first = s_ft_history_count == FT_HISTORY_SIZE ? s_ft_history_idx : 0;
+            ImGui::PlotLines("##ft_graph", [](void*, int index) { return s_ft_history[index]; },
+                             nullptr, s_ft_history_count, first, nullptr, scale_min, scale_max,
                              ImVec2(GRAPH_W, GRAPH_H));
 
             ImGui::SetCursorScreenPos({cursor.x, cursor.y + GRAPH_H + 4.0f});
@@ -2765,7 +2733,154 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
     ImGui::End();
 }
 
+static void DrawOSD(reshade::api::effect_runtime* runtime) {
+    RuntimeCallbackGuard callback;
+    if (callback.IsStopping()) return;
+    try {
+        ConfigOwnerLock owner;
+        if (RuntimeLifecycle_IsStopping()) return;
+        DrawOSDImpl(runtime);
+    }
+    catch (...) {
+        OutputDebugStringA("ReLimiter: OSD callback rejected an exception.\n");
+    }
+}
+
+// State transitions hold the config owner lock. Blackout and OLED Care draw
+// native windows on their own worker; neither needs a ReShade ImGui frame.
+static void UpdateOsdDemandLocked() {
+    const auto demand = osd_overlay_policy::Resolve(s_runtime_count, s_overlay_registered, g_config.osd_enabled);
+    s_registration_pending.store(demand.change_registration, std::memory_order_release);
+    const bool showing = demand.drawing;
+    if (showing != s_showing) {
+        s_showing = showing;
+        s_cadence_consumer.Reopen();
+        ResetCadenceHistory();
+    }
+    if (!g_config.osd_show_frametime_graph) {
+        s_ft_history_idx = s_ft_history_count = 0;
+        s_graph_scale_min = 0.0f;
+        s_graph_scale_max = 33.0f;
+    }
+    if (!g_config.osd_show_1pct_low && !g_config.osd_show_0_1pct_low) {
+        s_low_history_idx = s_low_history_count = s_low_recompute_counter = 0;
+        s_cached_1pct_low = s_cached_01pct_low = 0.0;
+    }
+    const bool readout = osd_overlay_policy::NeedsReadout(showing,
+        g_config.osd_show_jitter || g_config.osd_show_pacing_quality, s_details.Any());
+    if (s_readout != readout) {
+        s_readout = readout;
+        PacingTelemetry_SetOsdReadout(readout);
+    }
+    const unsigned sensors = showing ?
+        (g_config.osd_show_gpu_temp  ? HWSensorTemp : 0u) |
+        (g_config.osd_show_gpu_clock ? HWSensorClock : 0u) |
+        (g_config.osd_show_gpu_usage ? HWSensorGpuUsage : 0u) |
+        (g_config.osd_show_vram      ? HWSensorVram : 0u) |
+        (g_config.osd_show_cpu_usage ? HWSensorCpuUsage : 0u) |
+        (g_config.osd_show_ram       ? HWSensorRam : 0u) : 0u;
+    if (s_sensor_mask != sensors) {
+        s_sensor_mask = sensors;
+        HWMonitor_SetSensors(sensors);
+    }
+}
+
+static void UpdateOsdDemand() {
+    std::lock_guard<std::mutex> transition(s_transition_lock);
+    if (!RuntimeLifecycle_IsStopping()) UpdateOsdDemandLocked();
+}
+
+static void CancelKeyCapture() {
+    s_capturing_hotkey = HotkeySlot::Count;
+    s_binding_drawn = false;
+    s_capture_runtime.store(nullptr, std::memory_order_release);
+    Hotkeys_SetSuppressed(false);
+}
+
+static void OnRuntimeInit(reshade::api::effect_runtime*) {
+    RuntimeCallbackGuard callback;
+    if (callback.IsStopping()) return;
+    ConfigOwnerLock owner;
+    if (RuntimeLifecycle_IsStopping()) return;
+    ++s_runtime_count;
+    UpdateOsdDemand();
+}
+
+static void OnRuntimeDestroy(reshade::api::effect_runtime* runtime) {
+    RuntimeCallbackGuard callback;
+    if (callback.IsStopping()) return;
+    ConfigOwnerLock owner;
+    if (RuntimeLifecycle_IsStopping()) return;
+    if (s_capture_runtime.load(std::memory_order_relaxed) == runtime) CancelKeyCapture();
+    if (s_panel.runtime == runtime) s_panel.runtime = nullptr;
+    s_details.Close(runtime);
+    if (s_runtime_count > 0) --s_runtime_count;
+    UpdateOsdDemand();
+}
+
+static void OnOsdPresent(reshade::api::effect_runtime* runtime) {
+    RuntimeCallbackGuard callback;
+    if (callback.IsStopping()) return;
+    const bool close_details = s_details.MissedDraw(runtime);
+    if (!close_details && !Hotkeys_HasPending() && !s_poll_fallback.load(std::memory_order_acquire) &&
+        !s_registration_pending.load(std::memory_order_acquire) &&
+        s_capture_runtime.load(std::memory_order_acquire) != runtime) return;
+    try {
+        ConfigOwnerLock owner;
+        if (RuntimeLifecycle_IsStopping()) return;
+        if (close_details) {
+            s_details.Close(runtime);
+            UpdateOsdDemand();
+        }
+        if (s_capture_runtime.load(std::memory_order_relaxed) == runtime) {
+            if (!s_binding_drawn) CancelKeyCapture();
+            s_binding_drawn = false;
+        }
+        ApplyHotkeys();
+        // API 18 dispatches reshade_present AFTER draw_gui returns. Its event
+        // lists are global unsynchronized vectors: never mutate the overlay
+        // list from inside the overlay dispatch, or while another runtime can draw.
+        if (s_registration_pending.load(std::memory_order_relaxed)) {
+            std::lock_guard<std::mutex> transition(s_transition_lock);
+            if (RuntimeLifecycle_IsStopping()) return;
+            if (g_config.osd_enabled)
+                reshade::register_event<reshade::addon_event::reshade_overlay>(DrawOSD);
+            else
+                reshade::unregister_event<reshade::addon_event::reshade_overlay>(DrawOSD);
+            s_overlay_registered = g_config.osd_enabled;
+            UpdateOsdDemandLocked();
+        }
+    } catch (...) {
+        OutputDebugStringA("ReLimiter: OSD present callback rejected an exception.\n");
+    }
+}
+
 void RegisterOSD() {
+    ConfigOwnerLock owner;
+    // ReShade may reload the add-on before gameplay using its retained image.
+    s_panel.runtime = nullptr;
+    s_details.Reset();
+    s_runtime_count = 0;
+    s_sensor_mask = 0;
+    s_showing = s_readout = false;
+    Hotkeys_SetSuppressed(true); // reject prior-lifetime edges, including held keys
+    CancelKeyCapture();
+    PublishHotkeyBindings();
+    s_overlay_registered = g_config.osd_enabled;
+    if (s_overlay_registered) reshade::register_event<reshade::addon_event::reshade_overlay>(DrawOSD);
     reshade::register_overlay("ReLimiter", DrawSettings);
-    reshade::register_event<reshade::addon_event::reshade_overlay>(DrawOSD);
+    reshade::register_event<reshade::addon_event::init_effect_runtime>(OnRuntimeInit);
+    reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnRuntimeDestroy);
+    reshade::register_event<reshade::addon_event::reshade_present>(OnOsdPresent);
+}
+
+// BeginShutdown has closed all new admission. A callback that had already
+// entered must finish its short registration/demand transition before ReShade
+// removes callbacks or the workers are joined; its ImGui/driver work needn't finish here.
+void StopOSD() {
+    std::lock_guard<std::mutex> transition(s_transition_lock);
+    s_registration_pending.store(false, std::memory_order_release);
+    if (s_readout) PacingTelemetry_SetOsdReadout(false);
+    if (s_sensor_mask) HWMonitor_SetSensors(0);
+    Blackout_SetHotkeyDemand(false);
 }

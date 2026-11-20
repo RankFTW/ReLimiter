@@ -1,46 +1,84 @@
 #include "marker_log.h"
-#include <intrin.h>
+
+#include <Windows.h>
+#include <immintrin.h>
+
+static_assert(
+    MarkerLog::kSetCount != 0 &&
+    (MarkerLog::kSetCount & (MarkerLog::kSetCount - 1)) == 0,
+    "MarkerLog set count must be a power of two");
 
 MarkerLog g_marker_log;
 
-void MarkerLog::Record(uint32_t markerType, int64_t qpc, uint64_t frameID) {
-    Lock();
-    entries_[{frameID, markerType}] = {qpc};
-    Unlock();
+size_t MarkerLog::SetIndex(
+    uint64_t frame_id,
+    uint32_t marker_type) noexcept {
+    uint64_t hash = frame_id ^
+        (static_cast<uint64_t>(marker_type) * 0x9E3779B97F4A7C15ull);
+    hash ^= hash >> 33;
+    hash *= 0xFF51AFD7ED558CCDull;
+    hash ^= hash >> 33;
+    return static_cast<size_t>(hash) & (kSetCount - 1);
 }
 
-int64_t MarkerLog::Get(uint64_t frameID, uint32_t markerType) {
-    LARGE_INTEGER now;
+void MarkerLog::Lock() noexcept {
+    while (lock_.test_and_set(std::memory_order_acquire))
+        _mm_pause();
+}
+
+void MarkerLog::Unlock() noexcept {
+    lock_.clear(std::memory_order_release);
+}
+
+void MarkerLog::Record(
+    uint32_t marker_type,
+    int64_t qpc,
+    uint64_t frame_id) noexcept {
+    ScopedLock lock(this);
+    const size_t first = SetIndex(frame_id, marker_type) * kWayCount;
+    Entry* replacement = &entries_[first];
+
+    for (size_t way = 0; way < kWayCount; ++way) {
+        Entry& entry = entries_[first + way];
+        if (entry.occupied && entry.frame_id == frame_id &&
+            entry.marker_type == marker_type) {
+            entry.qpc = qpc;
+            return;
+        }
+        if (!entry.occupied) {
+            replacement = &entry;
+            break;
+        }
+        if (entry.qpc < replacement->qpc)
+            replacement = &entry;
+    }
+
+    *replacement = { frame_id, qpc, marker_type, true };
+}
+
+int64_t MarkerLog::Get(uint64_t frame_id, uint32_t marker_type) noexcept {
+    ScopedLock lock(this);
+    LARGE_INTEGER now{};
     QueryPerformanceCounter(&now);
-
-    Lock();
-    LazyPrune(now.QuadPart);
-
-    auto it = entries_.find({frameID, markerType});
-    int64_t result = (it != entries_.end()) ? it->second.qpc : 0;
-    Unlock();
-    return result;
-}
-
-void MarkerLog::LazyPrune(int64_t now_qpc) {
-    if (qpc_freq_ == 0) {
-        LARGE_INTEGER freq;
-        QueryPerformanceFrequency(&freq);
-        qpc_freq_ = freq.QuadPart;
+    if (qpc_frequency_ == 0) {
+        LARGE_INTEGER frequency{};
+        QueryPerformanceFrequency(&frequency);
+        qpc_frequency_ = frequency.QuadPart;
     }
 
-    // Only prune at most once per second
-    if (last_prune_qpc_ != 0 && (now_qpc - last_prune_qpc_) < qpc_freq_)
-        return;
-
-    last_prune_qpc_ = now_qpc;
-
-    // Drop entries older than 2 seconds
-    int64_t threshold = now_qpc - (qpc_freq_ * 2);
-    for (auto it = entries_.begin(); it != entries_.end(); ) {
-        if (it->second.qpc < threshold)
-            it = entries_.erase(it);
-        else
-            ++it;
+    const size_t first = SetIndex(frame_id, marker_type) * kWayCount;
+    for (size_t way = 0; way < kWayCount; ++way) {
+        Entry& entry = entries_[first + way];
+        if (!entry.occupied || entry.frame_id != frame_id ||
+            entry.marker_type != marker_type) {
+            continue;
+        }
+        if (qpc_frequency_ <= 0 || now.QuadPart < entry.qpc ||
+            now.QuadPart - entry.qpc > qpc_frequency_ * 2) {
+            entry.occupied = false;
+            return 0;
+        }
+        return entry.qpc;
     }
+    return 0;
 }

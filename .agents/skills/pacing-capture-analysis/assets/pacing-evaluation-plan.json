@@ -1,0 +1,486 @@
+{
+  "schema": "relimiter-pacing-evaluation/2",
+  "question": "Does the pacer, holding a frame rate cap, pace better than the game's own Reflex alone (which ignores ReLimiter's cap) and than the Reflex driver limiter at the same cap, and what do its latency and smooth preferences trade against the balanced default?",
+  "notes": [
+    "Copy this file next to the archived captures, fill build, scenes and each run's capture path (relative to this file), then run compare_pacing.py on it.",
+    "Choose thresholds before capturing; do not tune them after seeing results.",
+    "Every arm is captured twice per scene; the spread between its two runs is that arm's A/A noise floor.",
+    "Arms set only keys that exist in this build: pacing_test_mode (honoured with developer_settings), pacing_preference and the frame rate cap target_fps. Every arm states its target_fps: \"scene\" holds the scene's cap, a number overrides it (R0u: 0). compare_pacing.py --schedule derives every run's instruction from these settings (every setting to change from the previous run, the pacing owner and the cap included), so a run after R0, R0u or D is never taken under the wrong owner or cap; --write-ini writes common.ini, scene_<id>.ini (the scene's cap) and arm_<id>.ini. osd_controls only names the OSD control of a key for the schedule.",
+    "Reflex-only (R0, R0u) and the driver limiter (D) are test modes: reflex_only paces nothing and ignores ReLimiter's saved cap, driver_limiter lets the Reflex driver pace at the cap's interval (a 64-bit DirectX 12 game that calls the Reflex Sleep). They are comparison instruments, never a pacing path of the product.",
+    "The comparison target of every run is its scene's target_fps (1e6 / target_fps, the output rate with or without frame generation), taken from this plan and never from a capture: a reflex_only frame publishes no interval. A number is a capped scene; 0 is an uncapped scene, which decision.uncapped_primary_metrics decide without a target; null is not set yet (the schedule refuses it and the deviation metrics stay unavailable).",
+    "B against D holds one cap. B against R0 is the pacer at a cap against the game's own Reflex, not an equal-cap comparison, unless the game or the driver holds a cap outside ReLimiter that you record with the run.",
+    "R0u runs only where the scene has no cap to hold; its comparison with B states what the cap costs and gains."
+  ],
+  "build": {
+    "relimiter_build": null,
+    "relimiter_artifact_sha256": null,
+    "architecture": "x64",
+    "gpu": null,
+    "gpu_driver": null,
+    "display": null,
+    "refresh_hz": null,
+    "vrr": null
+  },
+  "common_settings": {
+    "config_version": "6",
+    "developer_settings": "true",
+    "native_pcl_enabled": "true",
+    "gpu_present_gate_probes": "true",
+    "log_level": "info"
+  },
+  "osd_controls": {
+    "pacing_test_mode": {
+      "control": "Advanced > Developer diagnostics > Pacing owner (test)",
+      "values": {
+        "off": "ReLimiter (default)",
+        "reflex_only": "Reflex only (ReLimiter paces nothing)",
+        "driver_limiter": "Reflex driver limiter"
+      }
+    },
+    "pacing_preference": {
+      "control": "Pacing preference",
+      "values": {
+        "latency": "Lower latency",
+        "balanced": "Balanced",
+        "smooth": "Smoother"
+      }
+    },
+    "target_fps": {
+      "control": "Target FPS",
+      "values": {
+        "0": "0 (off)"
+      }
+    }
+  },
+  "arms": {
+    "L": {
+      "label": "pacer, latency preference",
+      "settings": {
+        "pacing_test_mode": "off",
+        "pacing_preference": "latency",
+        "target_fps": "scene"
+      },
+      "expect": {
+        "reasons": [
+          "none",
+          "idle_cap",
+          "present_route",
+          "fixed_refresh",
+          "no_native_route",
+          "no_gpu_queue",
+          "fg_unqualified",
+          "fg_route_unsupported",
+          "fg_dynamic",
+          "architecture",
+          "api"
+        ]
+      }
+    },
+    "B": {
+      "label": "pacer, balanced preference (default)",
+      "settings": {
+        "pacing_test_mode": "off",
+        "pacing_preference": "balanced",
+        "target_fps": "scene"
+      },
+      "expect": {
+        "reasons": [
+          "none",
+          "idle_cap",
+          "present_route",
+          "fixed_refresh",
+          "no_native_route",
+          "no_gpu_queue",
+          "fg_unqualified",
+          "fg_route_unsupported",
+          "fg_dynamic",
+          "architecture",
+          "api"
+        ]
+      }
+    },
+    "S": {
+      "label": "pacer, smooth preference",
+      "settings": {
+        "pacing_test_mode": "off",
+        "pacing_preference": "smooth",
+        "target_fps": "scene"
+      },
+      "expect": {
+        "reasons": [
+          "none",
+          "idle_cap",
+          "present_route",
+          "fixed_refresh",
+          "no_native_route",
+          "no_gpu_queue",
+          "fg_unqualified",
+          "fg_route_unsupported",
+          "fg_dynamic",
+          "architecture",
+          "api"
+        ]
+      }
+    },
+    "R0": {
+      "label": "the game's own Reflex alone (test mode reflex_only)",
+      "settings": {
+        "pacing_test_mode": "reflex_only",
+        "target_fps": "scene"
+      },
+      "expect": {
+        "reasons": [
+          "passthrough"
+        ],
+        "placement": "none"
+      }
+    },
+    "R0u": {
+      "label": "the game's own Reflex alone, ReLimiter's cap off (test mode reflex_only, target_fps 0)",
+      "settings": {
+        "pacing_test_mode": "reflex_only",
+        "target_fps": "0"
+      },
+      "expect": {
+        "reasons": [
+          "passthrough"
+        ],
+        "placement": "none"
+      }
+    },
+    "D": {
+      "label": "the Reflex driver limiter at the cap's interval (test mode driver_limiter)",
+      "settings": {
+        "pacing_test_mode": "driver_limiter",
+        "target_fps": "scene"
+      },
+      "expect": {
+        "reasons": [
+          "override"
+        ],
+        "placement": "driver_limiter"
+      }
+    }
+  },
+  "scenes": [
+    {
+      "id": "rogue_core_light",
+      "class": "light",
+      "application": "Rogue Core",
+      "target_fps": 130,
+      "frame_generation": "off",
+      "description": "Light, steady scene at a 130 FPS cap without FG."
+    },
+    {
+      "id": "rogue_core_heavy",
+      "class": "heavy",
+      "application": "Rogue Core",
+      "target_fps": 130,
+      "frame_generation": "off",
+      "description": "GPU-heavy area, at the same cap as rogue_core_light."
+    },
+    {
+      "id": "gears_eday_fg2x",
+      "class": "heavy",
+      "application": "Gears of War: E-Day",
+      "target_fps": null,
+      "frame_generation": "2x",
+      "description": "Sustained heavy stretch with DLSS frame generation 2x. Set target_fps (the cap) before use."
+    },
+    {
+      "id": "present_route_light",
+      "class": "light",
+      "application": "a process without the NvAPI Reflex marker route",
+      "target_fps": 60,
+      "frame_generation": "off",
+      "description": "Light, steady scene in a game or process without the NvAPI Reflex markers (32-bit or non-DirectX 12): the present-only fallback paces (retained and unit-covered, not yet validated in a game), the reflex_only arm passes the game through, and the driver limiter is unavailable. A fallback-against-pass-through comparison, not a Reflex latency validation."
+    }
+  ],
+  "protocol": {
+    "run_order": [
+      "B",
+      "R0",
+      "D",
+      "S",
+      "L",
+      "B",
+      "R0",
+      "D",
+      "S",
+      "L"
+    ],
+    "settle_seconds": 15,
+    "capture_seconds": 180,
+    "warmup_seconds": 5,
+    "min_display_intervals": 10000
+  },
+  "analysis": {
+    "block_seconds": 5.0,
+    "bootstrap_iterations": 1000,
+    "seed": 20261003,
+    "confidence": 0.95,
+    "deviation_thresholds_us": [
+      1000,
+      2000
+    ],
+    "min_effect": {
+      "jitter_p50_us": 10,
+      "jitter_p90_us": 25,
+      "jitter_p99_us": 50,
+      "dev_share_over_1000us": 0.002,
+      "dev_share_over_2000us": 0.002,
+      "long_frame_share": 0.001,
+      "abs_animation_error_p99_us": 50,
+      "pc_latency_p50_us": 250,
+      "interval_spread_us": null,
+      "low_1pct_interval_us": null,
+      "hitch_share": null
+    }
+  },
+  "comparisons": [
+    {
+      "id": "pacer_vs_reflex_only",
+      "candidate": "B",
+      "baseline": "R0",
+      "question": "Does the balanced pacer at the scene's cap pace better than the game's own Reflex alone, which ignores that cap (not an equal-cap comparison unless a cap held outside ReLimiter is recorded)?"
+    },
+    {
+      "id": "pacer_vs_driver_limiter",
+      "candidate": "B",
+      "baseline": "D",
+      "question": "Does the balanced pacer beat NVIDIA's Reflex driver limiter at the same cap?"
+    },
+    {
+      "id": "smooth_vs_balanced",
+      "candidate": "S",
+      "baseline": "B",
+      "question": "Does the smooth preference even out the display beyond the balanced default, and what does it cost in latency?"
+    },
+    {
+      "id": "latency_vs_balanced",
+      "candidate": "L",
+      "baseline": "B",
+      "question": "Does the latency preference lower PC latency, and what does it cost in display jitter?"
+    },
+    {
+      "id": "pacer_vs_reflex_only_uncapped",
+      "candidate": "B",
+      "baseline": "R0u",
+      "question": "With frame generation, does the balanced pacer at the cap pace better than the game's own Reflex alone with ReLimiter's cap off, and what does it cost in latency?"
+    }
+  ],
+  "decision": {
+    "primary_metrics": [
+      "jitter_p99_us",
+      "dev_share_over_2000us"
+    ],
+    "uncapped_primary_metrics": [
+      "jitter_p99_us",
+      "interval_spread_us",
+      "low_1pct_interval_us",
+      "hitch_share"
+    ],
+    "latency_metric": "pc_latency_p50_us",
+    "judge": [
+      {
+        "id": "pacer_default",
+        "comparison": "pacer_vs_reflex_only",
+        "label": "pacer against Reflex alone"
+      }
+    ]
+  },
+  "runs": [
+    {
+      "scene": "rogue_core_light",
+      "arm": "B",
+      "order": 1,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_light",
+      "arm": "R0",
+      "order": 2,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_light",
+      "arm": "D",
+      "order": 3,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_light",
+      "arm": "S",
+      "order": 4,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_light",
+      "arm": "L",
+      "order": 5,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_light",
+      "arm": "B",
+      "order": 6,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_light",
+      "arm": "R0",
+      "order": 7,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_light",
+      "arm": "D",
+      "order": 8,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_light",
+      "arm": "S",
+      "order": 9,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_light",
+      "arm": "L",
+      "order": 10,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_heavy",
+      "arm": "B",
+      "order": 1,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_heavy",
+      "arm": "R0",
+      "order": 2,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_heavy",
+      "arm": "D",
+      "order": 3,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_heavy",
+      "arm": "S",
+      "order": 4,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_heavy",
+      "arm": "L",
+      "order": 5,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_heavy",
+      "arm": "B",
+      "order": 6,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_heavy",
+      "arm": "R0",
+      "order": 7,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_heavy",
+      "arm": "D",
+      "order": 8,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_heavy",
+      "arm": "S",
+      "order": 9,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_heavy",
+      "arm": "L",
+      "order": 10,
+      "capture": null
+    },
+    {
+      "scene": "gears_eday_fg2x",
+      "arm": "B",
+      "order": 1,
+      "capture": null
+    },
+    {
+      "scene": "gears_eday_fg2x",
+      "arm": "R0",
+      "order": 2,
+      "capture": null
+    },
+    {
+      "scene": "gears_eday_fg2x",
+      "arm": "D",
+      "order": 3,
+      "capture": null
+    },
+    {
+      "scene": "gears_eday_fg2x",
+      "arm": "R0u",
+      "order": 4,
+      "capture": null
+    },
+    {
+      "scene": "gears_eday_fg2x",
+      "arm": "B",
+      "order": 5,
+      "capture": null
+    },
+    {
+      "scene": "gears_eday_fg2x",
+      "arm": "R0",
+      "order": 6,
+      "capture": null
+    },
+    {
+      "scene": "gears_eday_fg2x",
+      "arm": "D",
+      "order": 7,
+      "capture": null
+    },
+    {
+      "scene": "gears_eday_fg2x",
+      "arm": "R0u",
+      "order": 8,
+      "capture": null
+    },
+    {
+      "scene": "present_route_light",
+      "arm": "B",
+      "order": 1,
+      "capture": null
+    },
+    {
+      "scene": "present_route_light",
+      "arm": "R0",
+      "order": 2,
+      "capture": null
+    },
+    {
+      "scene": "present_route_light",
+      "arm": "B",
+      "order": 3,
+      "capture": null
+    },
+    {
+      "scene": "present_route_light",
+      "arm": "R0",
+      "order": 4,
+      "capture": null
+    }
+  ]
+}

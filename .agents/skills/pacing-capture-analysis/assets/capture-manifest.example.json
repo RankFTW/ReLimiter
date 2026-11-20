@@ -1,0 +1,107 @@
+{
+  "schema_version": 3,
+  "run_id": "2026-07-18-example-a1",
+  "pair_id": "example-a",
+  "variant": "baseline",
+  "capture_selection": {
+    "mode": "Newest",
+    "newest_order": "numeric session FILETIME, then epoch; never file mtime",
+    "discovered_ids": [],
+    "excluded_ids": []
+  },
+  "capture_groups": [
+    {
+      "capture_id": null,
+      "process_id": null,
+      "session_filetime": null,
+      "capture_epoch": null
+    }
+  ],
+  "captured_at_utc": null,
+  "archived_at_utc": null,
+  "scenario": {
+    "application": null,
+    "executable": null,
+    "game_version": null,
+    "description": null,
+    "route_or_scene": null,
+    "warmup_seconds": null,
+    "capture_seconds": null,
+    "run_order": null,
+    "annotations": []
+  },
+  "software": {
+    "relimiter_version": null,
+    "relimiter_build": null,
+    "relimiter_architecture": "x64",
+    "relimiter_artifact_sha256": null,
+    "reshade_version": null,
+    "os_version": null,
+    "gpu": null,
+    "gpu_driver": null,
+    "cpu": null,
+    "frameview_version": null
+  },
+  "display": {
+    "model": null,
+    "resolution": null,
+    "refresh_hz": null,
+    "vrr_enabled": null,
+    "vrr_floor_hz": null,
+    "vrr_ceiling_hz": null,
+    "window_mode": null,
+    "present_mode": null,
+    "vsync_mode": null,
+    "tearing_allowed": null
+  },
+  "runtime": {
+    "configured_values_source": null,
+    "api": null,
+    "enforcement_path": null,
+    "marker_source": null,
+    "reflex_state": null,
+    "target_fps": null,
+    "pacing_preference": null,
+    "pacing_test_mode": null,
+    "wake_guard_us": null,
+    "background_fps": null,
+    "fg_off_fps": null,
+    "fg_type": null,
+    "fg_configured_multiplier": null,
+    "fg_detected_multiplier": null,
+    "dmfg_mode": null,
+    "dmfg_driver_target_fps": null,
+    "developer_settings": null,
+    "config_version": null,
+    "gpu_present_gate_probes": null,
+    "gpu_queue_probe": null,
+    "flip_metering_off": null,
+    "native_pcl_enabled": null,
+    "native_pcl_status": null
+  },
+  "files": [
+    {
+      "kind": "relimiter_pacing",
+      "capture_id": null,
+      "expected_name": null,
+      "present": null,
+      "path": null,
+      "size_bytes": null,
+      "sha256": null,
+      "ordered_header_sha256": null,
+      "row_count": null
+    },
+    {
+      "kind": "relimiter_pacing_events",
+      "capture_id": null,
+      "expected_name": null,
+      "present": null,
+      "path": null,
+      "size_bytes": null,
+      "sha256": null,
+      "ordered_header_sha256": null,
+      "row_count": null
+    }
+  ],
+  "integrity_notes": []
+}

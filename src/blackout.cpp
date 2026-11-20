@@ -1,10 +1,13 @@
 #include "blackout.h"
+#include "oled_care_policy.h"
 #include "swapchain_manager.h"
-#include "config.h"
 #include "logger.h"
+#include "hotkey_poller.h"
 #include <Windows.h>
 #include <Xinput.h>
 #include <atomic>
+#include <new>
+#include <vector>
 
 // ── State ──
 static std::atomic<bool> s_active{false};
@@ -13,6 +16,29 @@ static std::atomic<bool> s_request_hide{false};
 static std::atomic<bool> s_thread_running{false};
 static std::atomic<bool> s_user_enabled{false};  // user wants blackout on (persists across alt-tab)
 static HANDLE s_thread = nullptr;
+static HANDLE s_stop_event = nullptr; // Retained with the thread on a failed join.
+static std::atomic<bool> s_hotkeys_bound{false};
+static std::atomic<uint32_t> s_work_epoch{0};
+
+static void NotifyService() noexcept {
+    s_work_epoch.fetch_add(1, std::memory_order_release);
+    WakeByAddressSingle(&s_work_epoch);
+}
+
+void Blackout_SetHotkeyDemand(bool bound) {
+    if (s_hotkeys_bound.exchange(bound, std::memory_order_relaxed) != bound) NotifyService();
+}
+
+// Only atomic value snapshots cross the config/UI -> worker boundary.
+static std::atomic<unsigned int> s_oled_config{1}; // (minutes << 1) | all_monitors
+static std::atomic<OLEDCareCommand> s_oled_command{OLEDCareCommand::None};
+static std::atomic<bool> s_oled_active{false};
+// Window/cursor state is exclusively owned by BlackoutThread.
+static std::vector<HWND> s_oled_hwnds;
+static bool s_oled_layout_dirty = false;
+static int s_cursor_decrements = 0;
+static HCURSOR s_previous_cursor = nullptr;
+static const int OLED_WINDOW_TAG = 1;
 
 // Blackout windows — one per non-game monitor
 static constexpr int MAX_BLACKOUT_WINDOWS = 8;
@@ -26,6 +52,21 @@ static bool s_class_registered = false;
 // ── Window procedure ──
 static LRESULT CALLBACK BlackoutWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+    case WM_NCCREATE:
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA,
+            reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams));
+        break;
+    case WM_DISPLAYCHANGE:
+        s_oled_layout_dirty = true;
+        break;
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    case WM_SETCURSOR:
+        if (GetWindowLongPtrW(hwnd, GWLP_USERDATA) == OLED_WINDOW_TAG) {
+            SetCursor(nullptr);
+            return TRUE;
+        }
+        break;
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
@@ -41,11 +82,10 @@ static LRESULT CALLBACK BlackoutWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         // Don't allow closing via Alt+F4 etc — only our code destroys these
         return 0;
     case WM_NCHITTEST:
-        return HTTRANSPARENT;  // click-through
-    case WM_SETCURSOR:
-        // Hide cursor over all blackout windows (including OLED Care)
-        SetCursor(nullptr);
-        return TRUE;
+        // OLED surfaces own cursor handling without activating the window.
+        // Ordinary secondary blackout keeps its existing click-through behavior.
+        return GetWindowLongPtrW(hwnd, GWLP_USERDATA) == OLED_WINDOW_TAG
+            ? HTCLIENT : HTTRANSPARENT;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -122,109 +162,204 @@ static void DestroyBlackoutWindows() {
     s_blackout_count = 0;
 }
 
-// ═══════════════════════════════════════════════════════════════
-// OLED Care — state and helpers (must be before BlackoutThread)
-// ═══════════════════════════════════════════════════════════════
-
-static std::atomic<bool> s_oled_care_active{false};
-static std::atomic<bool> s_oled_care_request_show{false};
-static std::atomic<bool> s_oled_care_request_hide{false};
-
-static HWND s_oled_care_hwnds[MAX_BLACKOUT_WINDOWS] = {};
-static int  s_oled_care_count = 0;
-
-static void CreateOLEDCareWindows() {
-    // Find which monitor the game is on
-    HWND game_hwnd = SwapMgr_GetHWND();
-    s_game_monitor = game_hwnd
-        ? MonitorFromWindow(game_hwnd, MONITOR_DEFAULTTONEAREST)
-        : MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
-
-    s_monitor_count = 0;
-    EnumDisplayMonitors(nullptr, nullptr, BlackoutEnumProc, 0);
-
-    s_oled_care_count = 0;
-    for (int i = 0; i < s_monitor_count && s_oled_care_count < MAX_BLACKOUT_WINDOWS; i++) {
-        // If not all-monitors mode, only black out the game's monitor
-        if (!g_config.oled_care_all_monitors && !s_monitors[i].is_game)
-            continue;
-
-        RECT& rc = s_monitors[i].rc;
-        int w = rc.right - rc.left;
-        int h = rc.bottom - rc.top;
-
-        HWND hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            BLACKOUT_CLASS,
-            L"",
-            WS_POPUP | WS_VISIBLE,
-            rc.left, rc.top, w, h,
-            nullptr, nullptr, nullptr, nullptr);
-
-        if (hwnd) {
-            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-            s_oled_care_hwnds[s_oled_care_count++] = hwnd;
-        }
+// ── OLED windows and cursor (worker only) ──
+static void DestroyOLEDWindows() {
+    for (HWND hwnd : s_oled_hwnds) DestroyWindow(hwnd);
+    s_oled_hwnds.clear();
+    // Restore the captured shape only if ours is still installed. This does
+    // not change visibility or overwrite a newer non-null cursor from the game.
+    if (s_cursor_decrements > 0 && GetCursor() == nullptr)
+        SetCursor(s_previous_cursor);
+    s_previous_cursor = nullptr;
+    // Undo only our own decrements, even if another component changed its
+    // counter in the meantime. Never force a process-wide visible count.
+    while (s_cursor_decrements > 0) {
+        ShowCursor(TRUE);
+        --s_cursor_decrements;
     }
-
-    if (s_oled_care_count > 0) {
-        LOG_INFO("OLED Care: %d monitor(s) blacked out (all=%d)",
-                 s_oled_care_count, g_config.oled_care_all_monitors ? 1 : 0);
-        // Hide cursor system-wide while OLED Care is active
-        while (ShowCursor(FALSE) >= 0) {}  // decrement until hidden (counter may be > 0)
-    }
+    s_oled_active.store(false, std::memory_order_relaxed);
 }
 
-static void DestroyOLEDCareWindows() {
-    for (int i = 0; i < s_oled_care_count; i++) {
-        if (s_oled_care_hwnds[i]) {
-            DestroyWindow(s_oled_care_hwnds[i]);
-            s_oled_care_hwnds[i] = nullptr;
-        }
+struct OLEDMonitorRequest {
+    bool all_monitors;
+    HMONITOR game_monitor;
+    bool failed = false;
+};
+
+static BOOL CALLBACK OLEDEnumProc(HMONITOR monitor, HDC, LPRECT rect, LPARAM data) {
+    auto& request = *reinterpret_cast<OLEDMonitorRequest*>(data);
+    if (!request.all_monitors && monitor != request.game_monitor) return TRUE;
+    HWND hwnd = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        BLACKOUT_CLASS, L"", WS_POPUP | WS_VISIBLE,
+        rect->left, rect->top, rect->right - rect->left, rect->bottom - rect->top,
+        nullptr, nullptr, nullptr, reinterpret_cast<void*>(static_cast<INT_PTR>(OLED_WINDOW_TAG)));
+    if (!hwnd) {
+        request.failed = true;
+        return FALSE;
     }
-    if (s_oled_care_count > 0) {
-        LOG_INFO("OLED Care: %d window(s) destroyed", s_oled_care_count);
-        // Restore cursor visibility
-        while (ShowCursor(TRUE) < 0) {}  // increment until visible
+    try {
+        s_oled_hwnds.push_back(hwnd);
+    } catch (const std::bad_alloc&) {
+        // Do not lose ownership or let allocation failure cross a Win32 callback.
+        DestroyWindow(hwnd);
+        request.failed = true;
+        return FALSE;
     }
-    s_oled_care_count = 0;
+    return TRUE;
 }
+
+static bool CreateOLEDWindows(bool all_monitors, HMONITOR game_monitor) {
+    s_previous_cursor = GetCursor();
+    // Bounded even for a game with an unusually positive cursor counter.
+    // Take ownership before CreateWindow can dispatch WM_SETCURSOR. Partial
+    // failure uses the same balanced cleanup as dismissal and shutdown.
+    for (int i = 0; i < 32; ++i) {
+        ++s_cursor_decrements;
+        if (ShowCursor(FALSE) < 0) break;
+    }
+    OLEDMonitorRequest request{all_monitors, game_monitor};
+    if (!EnumDisplayMonitors(nullptr, nullptr, OLEDEnumProc,
+                            reinterpret_cast<LPARAM>(&request)) || request.failed || s_oled_hwnds.empty()) {
+        // A partial cover is not a successful activation. Keep the policy's
+        // intent pending for a later retry, but never publish a false active bit.
+        DestroyOLEDWindows();
+        return false;
+    }
+    // WM_SETCURSOR also hides over our surfaces if the counter bound was hit.
+    SetCursor(nullptr);
+    s_oled_active.store(true, std::memory_order_relaxed);
+    LOG_INFO("OLED Care: covering %u monitor(s)", static_cast<unsigned int>(s_oled_hwnds.size()));
+    return true;
+}
+
+// ── Input polling (worker only; never register raw input) ──
+class OLEDInputPoller {
+public:
+    ~OLEDInputPoller() {
+        if (module_) FreeLibrary(module_);
+    }
+
+    bool Poll() {
+        if (!resolved_) {
+            resolved_ = true;
+            // Resolve only on this worker, outside loader-lock initialization.
+            // System32-only lookup also avoids loading game-local proxy DLLs.
+            for (const wchar_t* name : {L"xinput1_4.dll", L"xinput1_3.dll", L"xinput9_1_0.dll"}) {
+                module_ = LoadLibraryExW(name, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+                if (!module_) continue;
+                get_state_ = reinterpret_cast<GetState>(GetProcAddress(module_, "XInputGetState"));
+                if (get_state_) break;
+                FreeLibrary(module_);
+                module_ = nullptr;
+            }
+            if (!get_state_)
+                LOG_WARN("OLED Care: system XInput unavailable; keyboard/mouse idle detection only");
+        }
+
+        OLEDCareInputSample sample;
+        // High bit only: pressed edges, not GetAsyncKeyState's shared low bit.
+        // This includes L/R/M/X mouse buttons and all normal keyboard VKs.
+        for (int key = 1; key < 255; ++key)
+            sample.pressed[static_cast<std::size_t>(key)] = (GetAsyncKeyState(key) & 0x8000) != 0;
+        POINT cursor{};
+        sample.cursor_valid = GetCursorPos(&cursor) != FALSE;
+        sample.cursor_x = cursor.x;
+        sample.cursor_y = cursor.y;
+        if (get_state_) {
+            for (DWORD slot = 0; slot < XUSER_MAX_COUNT; ++slot) {
+                XINPUT_STATE state{};
+                sample.controllers[slot].connected = get_state_(slot, &state) == ERROR_SUCCESS;
+                sample.controllers[slot].packet = state.dwPacketNumber;
+            }
+        }
+        return tracker_.Observe(sample);
+    }
+
+private:
+    using GetState = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
+    HMODULE module_ = nullptr;
+    GetState get_state_ = nullptr;
+    bool resolved_ = false;
+    OLEDCareInputTracker tracker_;
+};
 
 // ── Background thread ──
 // Blackout windows need a message pump. This thread creates/destroys
-// them and pumps messages while they're alive.
-static DWORD s_last_raw_input_tick = 0;  // Updated on physical HID input via WM_INPUT
+// them and pumps messages while they're alive. It is also the hotkey poller
+// (hotkey_poller.h) while any key is bound. With no bound keys, ordinary
+// blackout, or OLED session/idle deadline, it parks until a request or shutdown.
+// One wake: a high-resolution waitable timer when there is one (the global timer
+// resolution can be the default 15.6 ms), else the stop event's timeout. Shutdown's
+// SetEvent wakes it at once.
+static void WaitForNextTick(HANDLE timer, DWORD period_ms = kHotkeyPollPeriodMs) {
+    LARGE_INTEGER due;
+    due.QuadPart = -static_cast<LONGLONG>(period_ms) * 10000;
+    if (!timer || !SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+        WaitForSingleObject(s_stop_event, period_ms);
+        return;
+    }
+    const HANDLE waits[] = { s_stop_event, timer };
+    WaitForMultipleObjects(2, waits, FALSE, 1000);
+}
 
 static DWORD WINAPI BlackoutThread(LPVOID) {
+    HANDLE tick_timer = CreateWaitableTimerExW(
+        nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     // Register window class on this thread
     if (!s_class_registered) {
         WNDCLASSEXW wc = {};
         wc.cbSize = sizeof(wc);
         wc.lpfnWndProc = BlackoutWndProc;
         wc.hInstance = nullptr;
-        wc.hCursor = nullptr;  // WM_SETCURSOR handler hides cursor over blackout windows
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
         wc.lpszClassName = BLACKOUT_CLASS;
         if (RegisterClassExW(&wc))
             s_class_registered = true;
+        else {
+            LOG_ERROR("Blackout: window class registration failed (%lu)", GetLastError());
+            // No window can be made, but the hotkeys still need their poller.
+            for (;;) {
+                uint32_t epoch = s_work_epoch.load(std::memory_order_acquire);
+                if (!s_thread_running.load(std::memory_order_relaxed)) break;
+                if (!s_hotkeys_bound.load(std::memory_order_relaxed)) {
+                    WaitOnAddress(&s_work_epoch, &epoch, sizeof(epoch), INFINITE);
+                    continue;
+                }
+                Hotkeys_Poll();
+                WaitForNextTick(tick_timer);
+            }
+            if (tick_timer) CloseHandle(tick_timer);
+            s_thread_running.store(false, std::memory_order_relaxed);
+            return 0;
+        }
     }
 
-    // Create a hidden message-only window to receive Raw Input events.
-    // Raw Input comes from the kernel HID stack and reflects actual physical
-    // device activity — unlike GetLastInputInfo which counts synthetic events
-    // (e.g. SetCursorPos from games). We use this for the OLED Care idle timer.
-    HWND h_rawinput_wnd = CreateWindowExW(0, L"STATIC", nullptr, 0,
-        0, 0, 0, 0, HWND_MESSAGE, nullptr, nullptr, nullptr);
-
-    if (h_rawinput_wnd) {
-        // Gamepad raw input registration removed for diagnostic testing.
-        // Keyboard and mouse idle detection still works via GetAsyncKeyState and GetCursorPos.
-        s_last_raw_input_tick = GetTickCount();
-    }
-
+    unsigned wake = 0;
+    uint32_t serviced_epoch = s_work_epoch.load(std::memory_order_relaxed) - 1;
     bool was_focused = true;
+    OLEDCarePolicy oled_policy(GetTickCount64());
+    OLEDInputPoller oled_input;
+    HMONITOR oled_game_monitor = nullptr;
+    uint64_t oled_retry_ms = 0;
+    bool oled_creation_failed = false;
 
-    while (s_thread_running.load(std::memory_order_relaxed)) {
+    for (;;) {
+        uint32_t epoch = s_work_epoch.load(std::memory_order_acquire);
+        if (!s_thread_running.load(std::memory_order_relaxed)) break;
+        const bool keys = s_hotkeys_bound.load(std::memory_order_relaxed);
+        if (keys) Hotkeys_Poll();
+        if (serviced_epoch == epoch && !s_user_enabled.load(std::memory_order_relaxed) &&
+            !oled_policy.WantsWindows() && oled_policy.IdleMinutes() == 0) {
+            if (keys) WaitForNextTick(tick_timer);
+            else WaitOnAddress(&s_work_epoch, &epoch, sizeof(epoch), INFINITE);
+            continue;
+        }
+        if (keys && (wake++ & 1u) != 0 && serviced_epoch == epoch) {
+            WaitForNextTick(tick_timer);
+            continue;
+        }
+        serviced_epoch = epoch;
         // Check for show/hide requests
         if (s_request_show.exchange(false, std::memory_order_relaxed)) {
             s_user_enabled.store(true, std::memory_order_relaxed);
@@ -258,146 +393,72 @@ static DWORD WINAPI BlackoutThread(LPVOID) {
             was_focused = focused;
         }
 
-        // ── OLED Care: show/hide requests ──
-        if (s_oled_care_request_show.exchange(false, std::memory_order_relaxed)) {
-            DestroyOLEDCareWindows();
-            CreateOLEDCareWindows();
-            s_oled_care_active.store(s_oled_care_count > 0, std::memory_order_relaxed);
+        // OLED intent is independent of ordinary blackout/focus. No render or
+        // Present callback is needed for idle activation, input, or re-raising.
+        const uint64_t now_ms = GetTickCount64();
+        const unsigned int config = s_oled_config.load(std::memory_order_relaxed);
+        const OLEDCareSession previous_session = oled_policy.Session();
+        const bool previous_all_monitors = oled_policy.AllMonitors();
+        if (oled_policy.Configure((config & 1U) != 0, static_cast<int>(config >> 1), now_ms)) {
+            if (previous_all_monitors != oled_policy.AllMonitors()) s_oled_layout_dirty = true;
+            oled_retry_ms = 0;
+        }
+        oled_policy.ApplyCommand(s_oled_command.exchange(OLEDCareCommand::None,
+                                                        std::memory_order_relaxed), now_ms);
+        oled_policy.Poll(now_ms, oled_policy.IdleMinutes() > 0 && oled_input.Poll());
+        if (oled_policy.Session() != previous_session) {
+            oled_retry_ms = 0;
+            LOG_INFO("OLED Care: session %s", oled_policy.Session() == OLEDCareSession::Manual
+                ? "manual" : (oled_policy.Session() == OLEDCareSession::Automatic ? "automatic" : "off"));
         }
 
-        if (s_oled_care_request_hide.exchange(false, std::memory_order_relaxed)) {
-            DestroyOLEDCareWindows();
-            s_oled_care_active.store(false, std::memory_order_relaxed);
-        }
-
-        // ── OLED Care: idle timer auto-activate / deactivate ──
-        {
-            static bool s_idle_activated = false;  // true if we auto-activated (not user keybind)
-            int idle_minutes = g_config.oled_care_idle_minutes;
-            if (idle_minutes > 0) {
-                // Use our own raw input timestamp — immune to synthetic SetCursorPos from games.
-                // s_last_raw_input_tick is updated by WM_INPUT (physical HID only).
-                DWORD idle_ms = GetTickCount() - s_last_raw_input_tick;
-                DWORD threshold_ms = static_cast<DWORD>(idle_minutes) * 60000;
-
-                bool oled_on = s_oled_care_active.load(std::memory_order_relaxed);
-
-                if (!oled_on && !s_idle_activated && idle_ms >= threshold_ms) {
-                    // Idle threshold reached — auto-activate
-                    DestroyOLEDCareWindows();
-                    CreateOLEDCareWindows();
-                    s_oled_care_active.store(s_oled_care_count > 0, std::memory_order_relaxed);
-                    s_idle_activated = true;
-                    LOG_INFO("OLED Care: auto-activated after %d min idle", idle_minutes);
-                } else if (oled_on && s_idle_activated && idle_ms < 1000) {
-                    // Input detected — auto-deactivate (only if we auto-activated)
-                    DestroyOLEDCareWindows();
-                    s_oled_care_active.store(false, std::memory_order_relaxed);
-                    s_idle_activated = false;
-                    LOG_INFO("OLED Care: auto-deactivated on input");
-                } else if (!oled_on) {
-                    // If user manually dismissed it, clear the flag so timer can fire again
-                    s_idle_activated = false;
+        if (!oled_policy.WantsWindows()) {
+            if (!s_oled_hwnds.empty()) DestroyOLEDWindows();
+            oled_creation_failed = false;
+        } else {
+            HWND game_hwnd = SwapMgr_GetHWND();
+            HMONITOR game_monitor = game_hwnd
+                ? MonitorFromWindow(game_hwnd, MONITOR_DEFAULTTONEAREST)
+                : MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
+            if (s_oled_layout_dirty ||
+                (!oled_policy.AllMonitors() && game_monitor != oled_game_monitor)) {
+                DestroyOLEDWindows();
+                oled_retry_ms = 0;
+            }
+            s_oled_layout_dirty = false;
+            oled_game_monitor = game_monitor;
+            if (s_oled_hwnds.empty() && now_ms >= oled_retry_ms) {
+                if (!CreateOLEDWindows(oled_policy.AllMonitors(), game_monitor)) {
+                    if (!oled_creation_failed)
+                        LOG_WARN("OLED Care: window creation failed; retrying on worker");
+                    oled_creation_failed = true;
+                    oled_retry_ms = now_ms + 1000;
+                } else {
+                    oled_creation_failed = false;
                 }
             }
-        }
-
-        // OLED Care: re-raise windows periodically to stay above game
-        if (s_oled_care_active.load(std::memory_order_relaxed)) {
-            for (int i = 0; i < s_oled_care_count; i++) {
-                if (s_oled_care_hwnds[i])
-                    SetWindowPos(s_oled_care_hwnds[i], HWND_TOPMOST, 0, 0, 0, 0,
-                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            for (HWND hwnd : s_oled_hwnds) {
+                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
             }
         }
 
-        // Pump messages for the blackout windows and raw input window
+        // Pump messages for the blackout windows
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_INPUT) {
-                // Physical input from kernel HID stack — update our own idle timestamp.
-                s_last_raw_input_tick = GetTickCount();
-                DefWindowProcW(msg.hwnd, msg.message, msg.wParam, msg.lParam);
-                continue;
-            }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
 
-        // Mouse and keyboard idle detection via polling — doesn't interfere with games.
-        // GetCursorPos: works for mouse movement even with exclusive capture.
-        // GetAsyncKeyState: scan common keys for any press transition.
-        // WM_INPUT (gamepad only): handles controller input.
-        {
-            // Mouse buttons
-            static SHORT s_prev_lb = 0, s_prev_rb = 0, s_prev_mb = 0;
-            SHORT lb = GetAsyncKeyState(VK_LBUTTON);
-            SHORT rb = GetAsyncKeyState(VK_RBUTTON);
-            SHORT mb = GetAsyncKeyState(VK_MBUTTON);
-            if ((lb & 0x8000) && !(s_prev_lb & 0x8000)) s_last_raw_input_tick = GetTickCount();
-            if ((rb & 0x8000) && !(s_prev_rb & 0x8000)) s_last_raw_input_tick = GetTickCount();
-            if ((mb & 0x8000) && !(s_prev_mb & 0x8000)) s_last_raw_input_tick = GetTickCount();
-            s_prev_lb = lb; s_prev_rb = rb; s_prev_mb = mb;
-
-            // Common keys: all letters, digits, function keys, navigation, modifiers
-            static const BYTE s_watch_keys[] = {
-                // Letters A-Z
-                'A','B','C','D','E','F','G','H','I','J','K','L','M',
-                'N','O','P','Q','R','S','T','U','V','W','X','Y','Z',
-                // Digits 0-9
-                '0','1','2','3','4','5','6','7','8','9',
-                // Common function/nav keys
-                VK_ESCAPE, VK_RETURN, VK_SPACE, VK_TAB, VK_BACK,
-                VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN,
-                VK_F1, VK_F2, VK_F3, VK_F4, VK_F5,
-                VK_SHIFT, VK_CONTROL, VK_MENU,
-                VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5,
-                VK_OEM_6, VK_OEM_7, VK_OEM_PERIOD, VK_OEM_COMMA
-            };
-            static constexpr int k_num_keys = sizeof(s_watch_keys);
-            static SHORT s_prev_keys[k_num_keys] = {};
-            for (int i = 0; i < k_num_keys; i++) {
-                SHORT k = GetAsyncKeyState(s_watch_keys[i]);
-                if ((k & 0x8000) && !(s_prev_keys[i] & 0x8000))
-                    s_last_raw_input_tick = GetTickCount();
-                s_prev_keys[i] = k;
-            }
-
-            // Mouse movement via cursor position delta
-            static POINT s_prev_cursor = { -1, -1 };
-            POINT cur = {};
-            if (GetCursorPos(&cur)) {
-                if (s_prev_cursor.x != -1 &&
-                    (cur.x != s_prev_cursor.x || cur.y != s_prev_cursor.y))
-                    s_last_raw_input_tick = GetTickCount();
-                s_prev_cursor = cur;
-            }
-
-            // Gamepad via XInput — doesn't register a raw input device so can't
-            // conflict with games that use exclusive raw input (e.g. Thumper).
-            // Poll all 4 slots; any button/trigger/stick activity resets the timer.
-            {
-                static DWORD s_prev_packet[4] = {};
-                for (DWORD i = 0; i < 4; i++) {
-                    XINPUT_STATE xs = {};
-                    if (XInputGetState(i, &xs) == ERROR_SUCCESS) {
-                        if (xs.dwPacketNumber != s_prev_packet[i]) {
-                            s_last_raw_input_tick = GetTickCount();
-                            s_prev_packet[i] = xs.dwPacketNumber;
-                        }
-                    }
-                }
-            }
-        }
-
-        Sleep(16);  // ~60Hz message pump
+        WaitForNextTick(tick_timer, keys ? kHotkeyPollPeriodMs : 2 * kHotkeyPollPeriodMs);
     }
+    if (tick_timer) CloseHandle(tick_timer);
 
     // Cleanup on thread exit
+    DestroyOLEDWindows();
     DestroyBlackoutWindows();
-    DestroyOLEDCareWindows();
     s_active.store(false, std::memory_order_relaxed);
-    s_oled_care_active.store(false, std::memory_order_relaxed);
+    s_user_enabled.store(false, std::memory_order_relaxed);
 
     if (s_class_registered) {
         UnregisterClassW(BLACKOUT_CLASS, nullptr);
@@ -409,21 +470,66 @@ static DWORD WINAPI BlackoutThread(LPVOID) {
 
 // ── Public API ──
 
-void Blackout_Init() {
-    if (s_thread) return;
-    s_thread_running.store(true, std::memory_order_relaxed);
-    s_thread = CreateThread(nullptr, 0, BlackoutThread, nullptr, 0, nullptr);
-    if (s_thread)
-        LOG_INFO("Blackout: thread started");
+// If the service thread cannot exist, the non-ImGui present callback polls
+// the keys instead; this fallback is never active alongside the worker.
+// One line per transition into that state (Blackout_Init runs once per addon load).
+static void LogHotkeyFallback() {
+    Hotkeys_SetServiceThreadPolling(false);
+    LOG_WARN("Hotkeys: the service thread could not be created; hotkeys are polled by the present callback instead");
 }
 
-void Blackout_Shutdown() {
-    if (!s_thread) return;
+void Blackout_Init() {
+    if (s_thread) return;
+    s_active.store(false, std::memory_order_relaxed);
+    s_oled_active.store(false, std::memory_order_relaxed);
+    s_user_enabled.store(false, std::memory_order_relaxed);
+    s_request_show.store(false, std::memory_order_relaxed);
+    s_request_hide.store(false, std::memory_order_relaxed);
+    s_oled_command.store(OLEDCareCommand::None, std::memory_order_relaxed);
+    s_oled_layout_dirty = false;
+    s_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!s_stop_event) {
+        LOG_ERROR("Blackout: stop event creation failed (%lu)", GetLastError());
+        LogHotkeyFallback();
+        return;
+    }
+    s_thread_running.store(true, std::memory_order_relaxed);
+    s_thread = CreateThread(nullptr, 0, BlackoutThread, nullptr, 0, nullptr);
+    if (s_thread) {
+        Hotkeys_SetServiceThreadPolling(true);
+        LOG_INFO("Blackout: thread started");
+    } else {
+        s_thread_running.store(false, std::memory_order_relaxed);
+        CloseHandle(s_stop_event);
+        s_stop_event = nullptr;
+        LOG_ERROR("Blackout: thread creation failed");
+        LogHotkeyFallback();
+    }
+}
+
+bool Blackout_Shutdown() {
+    if (!s_thread) return true;
     s_thread_running.store(false, std::memory_order_relaxed);
-    WaitForSingleObject(s_thread, 3000);
+    NotifyService();
+    SetEvent(s_stop_event);
+    if (WaitForSingleObject(s_thread, 2500) != WAIT_OBJECT_0) {
+        OutputDebugStringA(
+            "ReLimiter: blackout worker did not stop; state retained.\n");
+        return false;
+    }
     CloseHandle(s_thread);
     s_thread = nullptr;
+    CloseHandle(s_stop_event);
+    s_stop_event = nullptr;
+    Hotkeys_SetServiceThreadPolling(false);
+    s_active.store(false, std::memory_order_relaxed);
+    s_oled_active.store(false, std::memory_order_relaxed);
+    s_user_enabled.store(false, std::memory_order_relaxed);
+    s_request_show.store(false, std::memory_order_relaxed);
+    s_request_hide.store(false, std::memory_order_relaxed);
+    s_oled_command.store(OLEDCareCommand::None, std::memory_order_relaxed);
     LOG_INFO("Blackout: shutdown");
+    return true;
 }
 
 void Blackout_Toggle() {
@@ -431,33 +537,43 @@ void Blackout_Toggle() {
         s_request_hide.store(true, std::memory_order_relaxed);
     else
         s_request_show.store(true, std::memory_order_relaxed);
+    NotifyService();
 }
 
 void Blackout_SetActive(bool active) {
-    if (active && !s_active.load(std::memory_order_relaxed))
-        s_request_show.store(true, std::memory_order_relaxed);
-    else if (!active && s_active.load(std::memory_order_relaxed))
-        s_request_hide.store(true, std::memory_order_relaxed);
+    if (active == s_active.load(std::memory_order_relaxed)) return;
+    (active ? s_request_show : s_request_hide).store(true, std::memory_order_relaxed);
+    NotifyService();
 }
 
 bool Blackout_IsActive() {
     return s_active.load(std::memory_order_relaxed);
 }
 
-// ── OLED Care public API ──
-
-void OLEDCare_Toggle() {
-    if (s_oled_care_active.load(std::memory_order_relaxed))
-        s_oled_care_request_hide.store(true, std::memory_order_relaxed);
-    else
-        s_oled_care_request_show.store(true, std::memory_order_relaxed);
+static void PostOLEDCommand(OLEDCareCommand command) {
+    if (!s_thread_running.load(std::memory_order_relaxed)) return;
+    OLEDCareCommand pending = s_oled_command.load(std::memory_order_relaxed);
+    while (!s_oled_command.compare_exchange_weak(pending,
+        OLEDCare_ComposeCommand(pending, command), std::memory_order_relaxed)) {}
+    NotifyService();
 }
 
-void OLEDCare_Deactivate() {
-    if (s_oled_care_active.load(std::memory_order_relaxed))
-        s_oled_care_request_hide.store(true, std::memory_order_relaxed);
+void OLEDCare_Toggle() {
+    PostOLEDCommand(OLEDCareCommand::Toggle);
+}
+
+void OLEDCare_SetActive(bool active) {
+    PostOLEDCommand(active ? OLEDCareCommand::Activate : OLEDCareCommand::Dismiss);
 }
 
 bool OLEDCare_IsActive() {
-    return s_oled_care_active.load(std::memory_order_relaxed);
+    return s_oled_active.load(std::memory_order_relaxed);
+}
+
+void OLEDCare_SetConfig(bool all_monitors, int idle_minutes) {
+    const int clamped_minutes = OLEDCarePolicy::ClampIdleMinutes(idle_minutes);
+    if (clamped_minutes != idle_minutes)
+        LOG_WARN("OLED Care: idle minutes %d clamped to %d", idle_minutes, clamped_minutes);
+    const unsigned config = (static_cast<unsigned>(clamped_minutes) << 1) | (all_monitors ? 1u : 0u);
+    if (s_oled_config.exchange(config, std::memory_order_relaxed) != config) NotifyService();
 }

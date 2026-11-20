@@ -9,5 +9,9 @@
 void VkEnforce_Init();
 void VkEnforce_Shutdown();
 
-// Called before each present via ReShade present event.
-void VkEnforce_OnPresent(int64_t now_qpc);
+// Called before each present via ReShade present event. force_marker_fallback
+// bypasses source-presence guards only when the dispatcher proved that the
+// selected marker path has no usable enforcement marker.
+void VkEnforce_OnPresent(
+    int64_t now_qpc,
+    bool force_marker_fallback = false);

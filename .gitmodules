@@ -7,3 +7,6 @@
 [submodule "deps/vulkan-headers"]
 	path = deps/vulkan-headers
 	url = https://github.com/KhronosGroup/Vulkan-Headers.git
+[submodule "deps/presentmon"]
+	path = deps/presentmon
+	url = https://github.com/GameTechDev/PresentMon.git

@@ -7,12 +7,16 @@
 #include "streamline_hooks.h"
 #include "swapchain_manager.h"
 #include "flush.h"
+#include "runtime_lifecycle.h"
 #include "logger.h"
 #include <Windows.h>
 #include <MinHook.h>
+#include <array>
 #include <atomic>
-#include <cstring>
 #include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <new>
 
 // ── NGX types ──
 
@@ -75,17 +79,11 @@ static std::atomic<int>      s_rr_preset{-1};
 // revokes g_fg_presenting (numFramesActuallyPresented=1 during the first
 // frame after creation), causing a toggle-on/toggle-off cycle every frame
 // that floods the log and prevents the scheduler from converging.
-static int64_t s_fg_create_qpc = 0;           // QPC timestamp of last FG CreateFeature
+static std::atomic<int64_t> s_fg_create_qpc{0}; // QPC timestamp of last FG CreateFeature
 static constexpr double FG_CREATE_COOLDOWN_US = 3000000.0;  // 3 seconds
 
 // Handle tracking — only process EvaluateFeature for the SR handle
-static void* s_dlss_sr_handle = nullptr;
-
-// Hook tracking
-static constexpr int kMaxHookTargets = 16;
-static void* s_hook_targets[kMaxHookTargets] = {};
-static int s_hook_count = 0;
-static bool s_hooks_installed = false;
+static std::atomic<void*> s_dlss_sr_handle{nullptr};
 
 // ── Common parameter extraction ──
 
@@ -97,7 +95,7 @@ static void ExtractDlssParams(void* params, unsigned int feature_id) {
         // Don't read resolution from RR params — they contain stale data.
         // Resolution updates come from EvaluateFeature or SR CreateFeature.
         // But do clear the SR handle so EvaluateFeature can re-adopt.
-        s_dlss_sr_handle = nullptr;
+        s_dlss_sr_handle.store(nullptr, std::memory_order_release);
         LOG_INFO("NGX: DLSS Ray Reconstruction created (feature=%u)", feature_id);
         return;
     }
@@ -110,13 +108,13 @@ static void ExtractDlssParams(void* params, unsigned int feature_id) {
         // g_fg_presenting immediately after CreateFeature sets it.
         LARGE_INTEGER qpc_now;
         QueryPerformanceCounter(&qpc_now);
-        s_fg_create_qpc = qpc_now.QuadPart;
+        s_fg_create_qpc.store(qpc_now.QuadPart, std::memory_order_release);
 
         // Don't set fg_presenting immediately from CreateFeature — doing so
         // before the FG pipeline has initialized can interfere with pacing and
         // prevent FG from ever starting (LEGO Batman, Clair Obscur Steam).
         // Instead, let the deferred inference in streamline_hooks.cpp handle it
-        // (CheckDeferredFGInference promotes after a timeout if GetState never
+        // (the deferred inference promotes after a timeout if GetState never
         // confirms). This preserves Horizon Remastered support (which never
         // calls GetState) while not breaking games that need time to init FG.
         static bool s_fg_first_create = true;
@@ -250,7 +248,8 @@ static void UpdateDlssParamsFromEval(void* params, void* handle) {
     // If we have a known SR handle, only process calls for that handle.
     // Don't clear on mismatch — RR and FG also call EvaluateFeature
     // with their own handles.
-    if (s_dlss_sr_handle && handle != s_dlss_sr_handle) return;
+    void* dlss_sr_handle = s_dlss_sr_handle.load(std::memory_order_acquire);
+    if (dlss_sr_handle && handle != dlss_sr_handle) return;
 
     unsigned int w = 0, h = 0, ow = 0, oh = 0;
     int quality = -1;
@@ -284,14 +283,18 @@ static void UpdateDlssParamsFromEval(void* params, void* handle) {
         return;
     }
 
-    // Late adoption: if we missed CreateFeature, adopt this handle
-    if (!s_dlss_sr_handle) {
-        if (quality >= 0 && quality <= 5) {
-            s_dlss_sr_handle = handle;
+    // Late adoption: if we missed CreateFeature, adopt this handle.
+    if (!dlss_sr_handle && quality >= 0 && quality <= 5) {
+        void* expected = nullptr;
+        if (s_dlss_sr_handle.compare_exchange_strong(
+                expected,
+                handle,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
             LOG_INFO("NGX: DLSS SR handle adopted from EvaluateFeature (late hook)");
         }
-        // Even without valid quality (RR-only mode), update resolution
-        // The first EvaluateFeature after RR CreateFeature has the correct resolution
+        // Even without valid quality (RR-only mode), update resolution.
+        // The first EvaluateFeature after RR CreateFeature has the correct resolution.
     }
 
     // Only update if something changed
@@ -364,26 +367,65 @@ using NGX_D3D12_CreateFeature_fn = NVSDK_NGX_Result(__cdecl*)(
 using NGX_D3D12_EvaluateFeature_fn = NVSDK_NGX_Result(__cdecl*)(
     void* cmd_list, void* handle, void* params, void* callback);
 
-static NGX_D3D12_CreateFeature_fn s_orig_d3d12_create = nullptr;
-static NGX_D3D12_EvaluateFeature_fn s_orig_d3d12_eval = nullptr;
+static std::atomic<NGX_D3D12_CreateFeature_fn> s_orig_d3d12_create{nullptr};
+static std::atomic<NGX_D3D12_EvaluateFeature_fn> s_orig_d3d12_eval{nullptr};
+
+static NVSDK_NGX_Result InvokeD3D12Create(
+    NGX_D3D12_CreateFeature_fn original,
+    void* command_list,
+    unsigned int feature,
+    void* params,
+    NVSDK_NGX_Handle** handle) noexcept
+{
+    __try { return original(command_list, feature, params, handle); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return 0xBAD00000; }
+}
+
+static NVSDK_NGX_Result InvokeD3D12Evaluate(
+    NGX_D3D12_EvaluateFeature_fn original,
+    void* command_list,
+    void* handle,
+    void* params,
+    void* callback) noexcept
+{
+    __try { return original(command_list, handle, params, callback); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return 0xBAD00000; }
+}
 
 static NVSDK_NGX_Result __cdecl Hook_D3D12_CreateFeature(
     void* cmd_list, unsigned int feature, void* params, NVSDK_NGX_Handle** handle)
 {
+    RuntimeCallbackGuard callback;
+    const NGX_D3D12_CreateFeature_fn original =
+        s_orig_d3d12_create.load(std::memory_order_acquire);
+    if (!original) return 0xBAD00000;
+    if (callback.IsStopping())
+        return InvokeD3D12Create(original, cmd_list, feature, params, handle);
+
     ExtractDlssParams(params, feature);
-    NVSDK_NGX_Result res = s_orig_d3d12_create(cmd_list, feature, params, handle);
+    NVSDK_NGX_Result res =
+        InvokeD3D12Create(original, cmd_list, feature, params, handle);
     if (NGX_SUCCEED(res) && handle && *handle &&
         (feature == NGX_Feature_SuperSampling)) {
-        s_dlss_sr_handle = *handle;
+        s_dlss_sr_handle.store(*handle, std::memory_order_release);
     }
     return res;
 }
 
 static NVSDK_NGX_Result __cdecl Hook_D3D12_EvaluateFeature(
-    void* cmd_list, void* handle, void* params, void* callback)
+    void* cmd_list, void* handle, void* params, void* callback_context)
 {
+    RuntimeCallbackGuard callback;
+    const NGX_D3D12_EvaluateFeature_fn original =
+        s_orig_d3d12_eval.load(std::memory_order_acquire);
+    if (!original) return 0xBAD00000;
+    if (callback.IsStopping())
+        return InvokeD3D12Evaluate(
+            original, cmd_list, handle, params, callback_context);
+
     UpdateDlssParamsFromEval(params, handle);
-    return s_orig_d3d12_eval(cmd_list, handle, params, callback);
+    return InvokeD3D12Evaluate(
+        original, cmd_list, handle, params, callback_context);
 }
 
 // ── D3D11 hooks ──
@@ -393,168 +435,567 @@ using NGX_D3D11_CreateFeature_fn = NVSDK_NGX_Result(__cdecl*)(
 using NGX_D3D11_EvaluateFeature_fn = NVSDK_NGX_Result(__cdecl*)(
     void* dev_ctx, void* handle, void* params, void* callback);
 
-static NGX_D3D11_CreateFeature_fn s_orig_d3d11_create = nullptr;
-static NGX_D3D11_EvaluateFeature_fn s_orig_d3d11_eval = nullptr;
+static std::atomic<NGX_D3D11_CreateFeature_fn> s_orig_d3d11_create{nullptr};
+static std::atomic<NGX_D3D11_EvaluateFeature_fn> s_orig_d3d11_eval{nullptr};
+
+static NVSDK_NGX_Result InvokeD3D11Create(
+    NGX_D3D11_CreateFeature_fn original,
+    void* device_context,
+    unsigned int feature,
+    void* params,
+    NVSDK_NGX_Handle** handle) noexcept
+{
+    __try { return original(device_context, feature, params, handle); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return 0xBAD00000; }
+}
+
+static NVSDK_NGX_Result InvokeD3D11Evaluate(
+    NGX_D3D11_EvaluateFeature_fn original,
+    void* device_context,
+    void* handle,
+    void* params,
+    void* callback) noexcept
+{
+    __try { return original(device_context, handle, params, callback); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return 0xBAD00000; }
+}
 
 static NVSDK_NGX_Result __cdecl Hook_D3D11_CreateFeature(
     void* dev_ctx, unsigned int feature, void* params, NVSDK_NGX_Handle** handle)
 {
+    RuntimeCallbackGuard callback;
+    const NGX_D3D11_CreateFeature_fn original =
+        s_orig_d3d11_create.load(std::memory_order_acquire);
+    if (!original) return 0xBAD00000;
+    if (callback.IsStopping())
+        return InvokeD3D11Create(original, dev_ctx, feature, params, handle);
+
     ExtractDlssParams(params, feature);
-    NVSDK_NGX_Result res = s_orig_d3d11_create(dev_ctx, feature, params, handle);
+    NVSDK_NGX_Result res =
+        InvokeD3D11Create(original, dev_ctx, feature, params, handle);
     if (NGX_SUCCEED(res) && handle && *handle &&
         (feature == NGX_Feature_SuperSampling)) {
-        s_dlss_sr_handle = *handle;
+        s_dlss_sr_handle.store(*handle, std::memory_order_release);
     }
     return res;
 }
 
 static NVSDK_NGX_Result __cdecl Hook_D3D11_EvaluateFeature(
-    void* dev_ctx, void* handle, void* params, void* callback)
+    void* dev_ctx, void* handle, void* params, void* callback_context)
 {
+    RuntimeCallbackGuard callback;
+    const NGX_D3D11_EvaluateFeature_fn original =
+        s_orig_d3d11_eval.load(std::memory_order_acquire);
+    if (!original) return 0xBAD00000;
+    if (callback.IsStopping())
+        return InvokeD3D11Evaluate(
+            original, dev_ctx, handle, params, callback_context);
+
     UpdateDlssParamsFromEval(params, handle);
-    return s_orig_d3d11_eval(dev_ctx, handle, params, callback);
+    return InvokeD3D11Evaluate(
+        original, dev_ctx, handle, params, callback_context);
 }
 
-// ── Hook installation per DLL ──
+// ── Hook lifecycle ──
 
-static bool TryHookModule(const wchar_t* dll_name) {
-    HMODULE mod = GetModuleHandleW(dll_name);
-    if (!mod) return false;
+enum class NGXHookSlot : uint8_t {
+    D3D12Create,
+    D3D12Evaluate,
+    D3D11Create,
+    D3D11Evaluate,
+};
 
-    bool hooked_any = false;
+enum class NGXHookState : uint8_t {
+    Uninstalled,
+    Installing,
+    Installed,
+    Stopping,
+    CleanupRequired,
+};
 
-    // D3D12 CreateFeature
-    auto d3d12_fn = reinterpret_cast<void*>(
-        GetProcAddress(mod, "NVSDK_NGX_D3D12_CreateFeature"));
-    if (d3d12_fn) {
-        NGX_D3D12_CreateFeature_fn trampoline = nullptr;
-        MH_STATUS st = MH_CreateHook(d3d12_fn, (void*)&Hook_D3D12_CreateFeature, (void**)&trampoline);
-        if (st == MH_OK) {
-            st = MH_EnableHook(d3d12_fn);
-            if (st == MH_OK) {
-                s_orig_d3d12_create = trampoline;
-                if (s_hook_count < kMaxHookTargets) s_hook_targets[s_hook_count++] = d3d12_fn;
-                LOG_INFO("NGX: D3D12_CreateFeature hooked from %ls", dll_name);
-                hooked_any = true;
-            } else { MH_RemoveHook(d3d12_fn); }
+struct NGXHookRecord {
+    void* target = nullptr;
+    NGXHookSlot slot = NGXHookSlot::D3D12Create;
+};
+
+struct NGXHookPlan {
+    void* target = nullptr;
+    void* detour = nullptr;
+    void* trampoline = nullptr;
+    const wchar_t* module_name = nullptr;
+    NGXHookSlot slot = NGXHookSlot::D3D12Create;
+    bool created = false;
+    bool enabled = false;
+};
+
+static constexpr size_t kMaxHookTargets = 16;
+static constexpr size_t kMaxHookPlans = 4;
+static SRWLOCK s_hook_lifecycle_lock = SRWLOCK_INIT;
+static NGXHookState s_hook_state = NGXHookState::Uninstalled;
+static std::atomic<bool> s_installed{false};
+static std::array<NGXHookRecord, kMaxHookTargets> s_hook_records{};
+static size_t s_hook_count = 0;
+static std::atomic<bool> s_version_start_allowed{true};
+
+static bool StopVersionThread();
+static void ClearVersionSnapshot();
+
+static const char* HookSlotName(NGXHookSlot slot) noexcept {
+    switch (slot) {
+        case NGXHookSlot::D3D12Create:   return "D3D12_CreateFeature";
+        case NGXHookSlot::D3D12Evaluate: return "D3D12_EvaluateFeature";
+        case NGXHookSlot::D3D11Create:   return "D3D11_CreateFeature";
+        case NGXHookSlot::D3D11Evaluate: return "D3D11_EvaluateFeature";
+        default:                         return "Unknown";
+    }
+}
+
+static bool OriginalPublished(NGXHookSlot slot) noexcept {
+    switch (slot) {
+        case NGXHookSlot::D3D12Create:
+            return s_orig_d3d12_create.load(std::memory_order_acquire) != nullptr;
+        case NGXHookSlot::D3D12Evaluate:
+            return s_orig_d3d12_eval.load(std::memory_order_acquire) != nullptr;
+        case NGXHookSlot::D3D11Create:
+            return s_orig_d3d11_create.load(std::memory_order_acquire) != nullptr;
+        case NGXHookSlot::D3D11Evaluate:
+            return s_orig_d3d11_eval.load(std::memory_order_acquire) != nullptr;
+        default:
+            return false;
+    }
+}
+
+static void PublishOriginal(NGXHookSlot slot, void* trampoline) noexcept {
+    switch (slot) {
+        case NGXHookSlot::D3D12Create:
+            s_orig_d3d12_create.store(
+                reinterpret_cast<NGX_D3D12_CreateFeature_fn>(trampoline),
+                std::memory_order_release);
+            break;
+        case NGXHookSlot::D3D12Evaluate:
+            s_orig_d3d12_eval.store(
+                reinterpret_cast<NGX_D3D12_EvaluateFeature_fn>(trampoline),
+                std::memory_order_release);
+            break;
+        case NGXHookSlot::D3D11Create:
+            s_orig_d3d11_create.store(
+                reinterpret_cast<NGX_D3D11_CreateFeature_fn>(trampoline),
+                std::memory_order_release);
+            break;
+        case NGXHookSlot::D3D11Evaluate:
+            s_orig_d3d11_eval.store(
+                reinterpret_cast<NGX_D3D11_EvaluateFeature_fn>(trampoline),
+                std::memory_order_release);
+            break;
+    }
+}
+
+static void ClearOriginal(NGXHookSlot slot) noexcept {
+    PublishOriginal(slot, nullptr);
+}
+
+static bool PlanContainsSlot(
+    const std::array<NGXHookPlan, kMaxHookPlans>& plans,
+    size_t plan_count,
+    NGXHookSlot slot) noexcept {
+    for (size_t i = 0; i < plan_count; ++i) {
+        if (plans[i].slot == slot) return true;
+    }
+    return false;
+}
+
+static bool PlanContainsTarget(
+    const std::array<NGXHookPlan, kMaxHookPlans>& plans,
+    size_t plan_count,
+    void* target) noexcept {
+    for (size_t i = 0; i < plan_count; ++i) {
+        if (plans[i].target == target) return true;
+    }
+    return false;
+}
+
+static void AddHookPlan(
+    std::array<NGXHookPlan, kMaxHookPlans>& plans,
+    size_t* plan_count,
+    HMODULE module,
+    const wchar_t* module_name,
+    const char* function_name,
+    void* detour,
+    NGXHookSlot slot) {
+    if (*plan_count >= plans.size() || OriginalPublished(slot) ||
+        PlanContainsSlot(plans, *plan_count, slot)) {
+        return;
+    }
+
+    void* target = reinterpret_cast<void*>(GetProcAddress(module, function_name));
+    if (!target) return;
+    // module is referenced by AddModulePlans while this address is resolved.
+    // Retain its actual image before dropping that temporary module reference.
+    if (!Hooks_PinTargetModule(target)) return;
+    if (PlanContainsTarget(plans, *plan_count, target)) {
+        LOG_WARN("NGX: duplicate target %p for %s from %ls ignored",
+                 target, function_name, module_name);
+        return;
+    }
+
+    plans[*plan_count] = {
+        target,
+        detour,
+        nullptr,
+        module_name,
+        slot,
+        false,
+        false,
+    };
+    ++*plan_count;
+}
+
+static size_t AddModulePlans(
+    const wchar_t* module_name,
+    std::array<NGXHookPlan, kMaxHookPlans>& plans,
+    size_t* plan_count) {
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(0, module_name, &module)) return 0;
+
+    const size_t count_before = *plan_count;
+    AddHookPlan(
+        plans, plan_count, module, module_name,
+        "NVSDK_NGX_D3D12_CreateFeature",
+        reinterpret_cast<void*>(&Hook_D3D12_CreateFeature),
+        NGXHookSlot::D3D12Create);
+    AddHookPlan(
+        plans, plan_count, module, module_name,
+        "NVSDK_NGX_D3D12_EvaluateFeature",
+        reinterpret_cast<void*>(&Hook_D3D12_EvaluateFeature),
+        NGXHookSlot::D3D12Evaluate);
+    AddHookPlan(
+        plans, plan_count, module, module_name,
+        "NVSDK_NGX_D3D11_CreateFeature",
+        reinterpret_cast<void*>(&Hook_D3D11_CreateFeature),
+        NGXHookSlot::D3D11Create);
+    AddHookPlan(
+        plans, plan_count, module, module_name,
+        "NVSDK_NGX_D3D11_EvaluateFeature",
+        reinterpret_cast<void*>(&Hook_D3D11_EvaluateFeature),
+        NGXHookSlot::D3D11Evaluate);
+    FreeLibrary(module);
+    return *plan_count - count_before;
+}
+
+static void RetainHookPlan(const NGXHookPlan& plan) noexcept {
+    if (s_hook_count < s_hook_records.size()) {
+        s_hook_records[s_hook_count++] = { plan.target, plan.slot };
+    }
+}
+
+// MH_DisableHook freezes, so it goes through the hook installer (hooks.h). A MinHook left unusable by the death of
+// that thread is not a disabled hook: the status then is a failure IsDisableSuccess does not accept.
+static MH_STATUS DisableTarget(void* target) noexcept {
+    if (Hooks_MinHookUnusable()) return MH_ERROR_NOT_INITIALIZED;
+    const MH_STATUS status = Hooks_DisableHook(target);
+    return Hooks_MinHookUnusable() ? MH_ERROR_NOT_INITIALIZED : status;
+}
+
+static bool IsDisableSuccess(MH_STATUS status) noexcept {
+    return status == MH_OK || status == MH_ERROR_DISABLED ||
+        status == MH_ERROR_NOT_CREATED;
+}
+
+static bool IsRemoveSuccess(MH_STATUS status) noexcept {
+    return status == MH_OK || status == MH_ERROR_NOT_CREATED;
+}
+
+static bool CleanupInstallPlans(
+    std::array<NGXHookPlan, kMaxHookPlans>& plans,
+    size_t plan_count,
+    bool originals_published) {
+    const size_t previous_hook_count = s_hook_count;
+    bool any_enabled = false;
+    for (size_t index = 0; index < plan_count; ++index)
+        any_enabled = any_enabled || plans[index].enabled;
+    if (any_enabled) {
+        // Once any target was enabled, a detour may already be executing.
+        // Retain every created plan and its trampoline until the process-wide
+        // shutdown barrier; immediate rollback removal is not a safe rundown.
+        for (size_t index = 0; index < plan_count; ++index) {
+            NGXHookPlan& plan = plans[index];
+            if (!plan.created) continue;
+            if (!originals_published)
+                PublishOriginal(plan.slot, plan.trampoline);
+            RetainHookPlan(plan);
+        }
+        LOG_ERROR("NGX: partial enabled transaction retained until shutdown");
+        return false;
+    }
+
+    for (size_t reverse_index = plan_count; reverse_index > 0; --reverse_index) {
+        NGXHookPlan& plan = plans[reverse_index - 1];
+        if (!plan.created) continue;
+
+        bool removable = true;
+        MH_STATUS cleanup_status = MH_OK;
+        if (plan.enabled) {
+            cleanup_status = DisableTarget(plan.target);
+            removable = IsDisableSuccess(cleanup_status);
+        }
+        if (removable && cleanup_status != MH_ERROR_NOT_CREATED) {
+            cleanup_status = Hooks_RemoveHook(plan.target);
+            removable = IsRemoveSuccess(cleanup_status);
+        }
+        if (removable) {
+            Hooks_ForgetTarget(plan.target);
+            if (originals_published) ClearOriginal(plan.slot);
+            continue;
+        }
+
+        if (!originals_published) PublishOriginal(plan.slot, plan.trampoline);
+        RetainHookPlan(plan);
+        LOG_ERROR("NGX: rollback retained %s target %p for shutdown retry (status=%d)",
+                  HookSlotName(plan.slot), plan.target, cleanup_status);
+    }
+    return s_hook_count == previous_hook_count;
+}
+
+enum class InstallTransactionResult : uint8_t {
+    NoTargets,
+    Success,
+    CleanFailure,
+    CleanupRequired,
+};
+
+static InstallTransactionResult InstallHookTransaction() {
+    std::array<NGXHookPlan, kMaxHookPlans> plans{};
+    size_t plan_count = 0;
+
+    const wchar_t* base_modules[] = {
+        L"_nvngx.dll",
+        L"nvngx.dll",
+        L"nvngx_dlss.dll",
+        L"_nvngx_dlss.dll",
+    };
+    for (const wchar_t* module_name : base_modules) {
+        if (AddModulePlans(module_name, plans, &plan_count) != 0) break;
+    }
+
+    if (!PlanContainsSlot(plans, plan_count, NGXHookSlot::D3D12Create) &&
+        !PlanContainsSlot(plans, plan_count, NGXHookSlot::D3D11Create)) {
+        const wchar_t* rr_modules[] = {
+            L"nvngx_dlssd.dll",
+            L"_nvngx_dlssd.dll",
+        };
+        for (const wchar_t* module_name : rr_modules) {
+            if (AddModulePlans(module_name, plans, &plan_count) != 0) break;
         }
     }
 
-    // D3D12 EvaluateFeature
-    auto d3d12_eval = reinterpret_cast<void*>(
-        GetProcAddress(mod, "NVSDK_NGX_D3D12_EvaluateFeature"));
-    if (d3d12_eval) {
-        NGX_D3D12_EvaluateFeature_fn trampoline = nullptr;
-        MH_STATUS st = MH_CreateHook(d3d12_eval, (void*)&Hook_D3D12_EvaluateFeature, (void**)&trampoline);
-        if (st == MH_OK) {
-            st = MH_EnableHook(d3d12_eval);
-            if (st == MH_OK) {
-                s_orig_d3d12_eval = trampoline;
-                if (s_hook_count < kMaxHookTargets) s_hook_targets[s_hook_count++] = d3d12_eval;
-                LOG_INFO("NGX: D3D12_EvaluateFeature hooked from %ls", dll_name);
-                hooked_any = true;
-            } else { MH_RemoveHook(d3d12_eval); }
-        }
+    if (plan_count == 0) return InstallTransactionResult::NoTargets;
+    if (plan_count > s_hook_records.size() - s_hook_count) {
+        LOG_ERROR("NGX: insufficient hook tracking capacity (%zu > %zu)",
+                  plan_count, s_hook_records.size() - s_hook_count);
+        return InstallTransactionResult::CleanFailure;
     }
 
-    // D3D11 CreateFeature
-    auto d3d11_fn = reinterpret_cast<void*>(
-        GetProcAddress(mod, "NVSDK_NGX_D3D11_CreateFeature"));
-    if (d3d11_fn) {
-        NGX_D3D11_CreateFeature_fn trampoline = nullptr;
-        MH_STATUS st = MH_CreateHook(d3d11_fn, (void*)&Hook_D3D11_CreateFeature, (void**)&trampoline);
-        if (st == MH_OK) {
-            st = MH_EnableHook(d3d11_fn);
-            if (st == MH_OK) {
-                s_orig_d3d11_create = trampoline;
-                if (s_hook_count < kMaxHookTargets) s_hook_targets[s_hook_count++] = d3d11_fn;
-                LOG_INFO("NGX: D3D11_CreateFeature hooked from %ls", dll_name);
-                hooked_any = true;
-            } else { MH_RemoveHook(d3d11_fn); }
+    for (size_t i = 0; i < plan_count; ++i) {
+        NGXHookPlan& plan = plans[i];
+        if (!Hooks_PinTargetModule(plan.target)) {
+            LOG_WARN("NGX: failed to pin %s target module from %ls",
+                     HookSlotName(plan.slot), plan.module_name);
+            return CleanupInstallPlans(plans, plan_count, false)
+                ? InstallTransactionResult::CleanFailure
+                : InstallTransactionResult::CleanupRequired;
         }
+        const MH_STATUS status = Hooks_CreateHook(
+            plan.target, plan.detour, &plan.trampoline);
+        if (status != MH_OK) {
+            LOG_WARN("NGX: failed to create %s hook from %ls (status=%d)",
+                     HookSlotName(plan.slot), plan.module_name, status);
+            return CleanupInstallPlans(plans, plan_count, false)
+                ? InstallTransactionResult::CleanFailure
+                : InstallTransactionResult::CleanupRequired;
+        }
+        plan.created = true;
     }
 
-    // D3D11 EvaluateFeature
-    auto d3d11_eval = reinterpret_cast<void*>(
-        GetProcAddress(mod, "NVSDK_NGX_D3D11_EvaluateFeature"));
-    if (d3d11_eval) {
-        NGX_D3D11_EvaluateFeature_fn trampoline = nullptr;
-        MH_STATUS st = MH_CreateHook(d3d11_eval, (void*)&Hook_D3D11_EvaluateFeature, (void**)&trampoline);
-        if (st == MH_OK) {
-            st = MH_EnableHook(d3d11_eval);
-            if (st == MH_OK) {
-                s_orig_d3d11_eval = trampoline;
-                if (s_hook_count < kMaxHookTargets) s_hook_targets[s_hook_count++] = d3d11_eval;
-                LOG_INFO("NGX: D3D11_EvaluateFeature hooked from %ls", dll_name);
-                hooked_any = true;
-            } else { MH_RemoveHook(d3d11_eval); }
-        }
+    // Publish every exact typed trampoline before any target can enter a detour.
+    for (size_t i = 0; i < plan_count; ++i) {
+        PublishOriginal(plans[i].slot, plans[i].trampoline);
     }
 
-    return hooked_any;
+    // Queue every target in the install batch (NGXHooks_TryInstall opens it, or runs inside the caller's). The
+    // transaction cannot retain or roll back before it knows what was enabled, so it applies the batch here and
+    // reads each target's result from Hooks_TargetEnabled. A target that could not even be queued stops the
+    // queueing; the ones queued before it are applied and settled the same way (nothing stays queued), as the
+    // targets enabled before a failing one were.
+    bool all_enabled = true;
+    for (size_t i = 0; i < plan_count; ++i) {
+        NGXHookPlan& plan = plans[i];
+        const MH_STATUS status = Hooks_EnableOrQueue(plan.target);
+        if (status != MH_OK && status != MH_ERROR_ENABLED) {
+            LOG_WARN("NGX: failed to queue %s hook from %ls (status=%d)",
+                     HookSlotName(plan.slot), plan.module_name, status);
+            all_enabled = false;
+            break;
+        }
+    }
+    Hooks_FlushBatch();
+    for (size_t i = 0; i < plan_count; ++i) {
+        NGXHookPlan& plan = plans[i];
+        plan.enabled = Hooks_TargetEnabled(plan.target);
+        if (plan.enabled || !all_enabled) continue;
+        all_enabled = false;
+        LOG_WARN("NGX: failed to enable %s hook from %ls",
+                 HookSlotName(plan.slot), plan.module_name);
+    }
+    if (!all_enabled) {
+        return CleanupInstallPlans(plans, plan_count, true)
+            ? InstallTransactionResult::CleanFailure
+            : InstallTransactionResult::CleanupRequired;
+    }
+
+    for (size_t i = 0; i < plan_count; ++i) {
+        RetainHookPlan(plans[i]);
+        LOG_INFO("NGX: %s hooked from %ls at %p",
+                 HookSlotName(plans[i].slot),
+                 plans[i].module_name,
+                 plans[i].target);
+    }
+    return InstallTransactionResult::Success;
+}
+
+static bool RemoveOwnedHooksAfterRundown() {
+    std::array<NGXHookRecord, kMaxHookTargets> retained{};
+    size_t retained_count = 0;
+
+    for (size_t i = 0; i < s_hook_count; ++i) {
+        const NGXHookRecord record = s_hook_records[i];
+        const MH_STATUS disable_status = DisableTarget(record.target);
+        if (!IsDisableSuccess(disable_status)) {
+            retained[retained_count++] = record;
+            LOG_ERROR("NGX: failed to disable %s target %p (status=%d)",
+                      HookSlotName(record.slot), record.target, disable_status);
+            continue;
+        }
+
+        const MH_STATUS remove_status = disable_status == MH_ERROR_NOT_CREATED
+            ? MH_ERROR_NOT_CREATED
+            : Hooks_RemoveHook(record.target);
+        if (!IsRemoveSuccess(remove_status)) {
+            retained[retained_count++] = record;
+            LOG_ERROR("NGX: failed to remove %s target %p (status=%d)",
+                      HookSlotName(record.slot), record.target, remove_status);
+            continue;
+        }
+
+        Hooks_ForgetTarget(record.target);
+        ClearOriginal(record.slot);
+    }
+
+    s_hook_records = retained;
+    s_hook_count = retained_count;
+    return retained_count == 0;
+}
+
+static void LogLoadedNGXModulesOnce() {
+    static bool s_logged = false;
+    if (s_logged) return;
+    s_logged = true;
+
+    auto check = [](const wchar_t* name) {
+        if (GetModuleHandleW(name)) LOG_INFO("NGX: %ls loaded", name);
+    };
+    check(L"_nvngx.dll"); check(L"nvngx.dll");
+    check(L"nvngx_dlss.dll"); check(L"_nvngx_dlss.dll");
+    check(L"nvngx_dlssd.dll"); check(L"_nvngx_dlssd.dll");
+    check(L"nvngx_dlssg.dll"); check(L"_nvngx_dlssg.dll");
+    check(L"sl.dlss.dll"); check(L"sl.dlss_g.dll"); check(L"sl.common.dll");
 }
 
 // ── Public API ──
 
 void NGXHooks_TryInstall() {
-    if (s_hooks_installed) return;
-
-    bool ok = TryHookModule(L"_nvngx.dll");
-    if (!ok) ok = TryHookModule(L"nvngx.dll");
-
-    // Streamline games may call CreateFeature on the feature DLL directly.
-    // Only hook feature DLLs if we didn't already hook _nvngx.dll / nvngx.dll,
-    // to avoid the double-hook chain that crashed Crimson Desert.
-    if (!ok) {
-        ok = TryHookModule(L"nvngx_dlss.dll");
-        if (!ok) ok = TryHookModule(L"_nvngx_dlss.dll");
+    // The transaction creates hooks itself, so it holds the install lock for its whole run (taken before the
+    // lifecycle lock, as ever). The batch is the caller's when there is one (the init batch, a loader scan),
+    // otherwise its own; the transaction applies it before it retains or rolls back (InstallHookTransaction).
+    HookInstallGuard install_lock;
+    if (!install_lock) return;
+    HookBatch hook_install(HookBatchSite::LoaderScan);
+    if (!hook_install) return;
+    AcquireSRWLockExclusive(&s_hook_lifecycle_lock);
+    if (s_hook_state != NGXHookState::Uninstalled &&
+        s_hook_state != NGXHookState::Installed) {
+        ReleaseSRWLockExclusive(&s_hook_lifecycle_lock);
+        return;
     }
 
-    // Ray Reconstruction DLL — same fallback logic
-    if (!s_orig_d3d12_create && !s_orig_d3d11_create) {
-        TryHookModule(L"nvngx_dlssd.dll");
-        if (!s_orig_d3d12_create && !s_orig_d3d11_create)
-            TryHookModule(L"_nvngx_dlssd.dll");
+    const NGXHookState previous_state = s_hook_state;
+    s_hook_state = NGXHookState::Installing;
+    const InstallTransactionResult result = InstallHookTransaction();
+    switch (result) {
+        case InstallTransactionResult::Success:
+            s_hook_state = NGXHookState::Installed;
+            s_installed.store(true, std::memory_order_release);
+            break;
+        case InstallTransactionResult::CleanupRequired:
+            s_hook_state = NGXHookState::CleanupRequired;
+            s_version_start_allowed.store(false, std::memory_order_release);
+            break;
+        case InstallTransactionResult::NoTargets:
+        case InstallTransactionResult::CleanFailure:
+        default:
+            s_hook_state = previous_state;
+            break;
     }
+    LogLoadedNGXModulesOnce();
+    ReleaseSRWLockExclusive(&s_hook_lifecycle_lock);
+}
 
-    // Log which NGX DLLs are loaded
-    static bool s_logged = false;
-    if (!s_logged) {
-        s_logged = true;
-        auto check = [](const wchar_t* name) {
-            if (GetModuleHandleW(name)) LOG_INFO("NGX: %ls loaded", name);
-        };
-        check(L"_nvngx.dll"); check(L"nvngx.dll");
-        check(L"nvngx_dlss.dll"); check(L"_nvngx_dlss.dll");
-        check(L"nvngx_dlssd.dll"); check(L"_nvngx_dlssd.dll");
-        check(L"nvngx_dlssg.dll"); check(L"_nvngx_dlssg.dll");
-        check(L"sl.dlss.dll"); check(L"sl.dlss_g.dll"); check(L"sl.common.dll");
-    }
-
-    if (ok || s_orig_d3d12_create || s_orig_d3d11_create)
-        s_hooks_installed = true;
+bool NGXHooks_HasInstalled() {
+    return s_installed.load(std::memory_order_acquire);
 }
 
 void NGXHooks_Init() {
+    AcquireSRWLockExclusive(&s_hook_lifecycle_lock);
+    if (s_hook_state == NGXHookState::Stopping) {
+        s_hook_state = s_hook_count > 0
+            ? NGXHookState::Installed
+            : NGXHookState::Uninstalled;
+    }
+    if (s_hook_state == NGXHookState::Uninstalled ||
+        s_hook_state == NGXHookState::Installed) {
+        s_version_start_allowed.store(true, std::memory_order_release);
+    }
+    ReleaseSRWLockExclusive(&s_hook_lifecycle_lock);
     NGXHooks_TryInstall();
 }
 
-void NGXHooks_Shutdown() {
-    if (!s_hooks_installed) return;
-    for (int i = 0; i < s_hook_count; i++) {
-        if (s_hook_targets[i]) {
-            MH_DisableHook(s_hook_targets[i]);
-            MH_RemoveHook(s_hook_targets[i]);
-            s_hook_targets[i] = nullptr;
-        }
+bool NGXHooks_BeginShutdown() {
+    AcquireSRWLockExclusive(&s_hook_lifecycle_lock);
+    const bool hooks_reusable =
+        s_hook_state != NGXHookState::CleanupRequired;
+    if (hooks_reusable) s_hook_state = NGXHookState::Stopping;
+    s_version_start_allowed.store(false, std::memory_order_release);
+    ReleaseSRWLockExclusive(&s_hook_lifecycle_lock);
+
+    return StopVersionThread() && hooks_reusable;
+}
+
+bool NGXHooks_Shutdown() {
+    // PRECONDITION: the caller has already disabled new hook entry and drained
+    // all callbacks. Removal here can free MinHook trampoline storage.
+    if (!NGXHooks_BeginShutdown()) return false;
+
+    AcquireSRWLockExclusive(&s_hook_lifecycle_lock);
+    const bool removed_all = RemoveOwnedHooksAfterRundown();
+    if (removed_all) {
+        s_hook_state = NGXHookState::Uninstalled;
+        s_installed.store(false, std::memory_order_release);
+        s_dlss_sr_handle.store(nullptr, std::memory_order_release);
+        ClearVersionSnapshot();
+    } else {
+        s_hook_state = NGXHookState::CleanupRequired;
     }
-    s_hook_count = 0;
-    s_orig_d3d12_create = nullptr;
-    s_orig_d3d12_eval = nullptr;
-    s_orig_d3d11_create = nullptr;
-    s_orig_d3d11_eval = nullptr;
-    s_dlss_sr_handle = nullptr;
-    s_hooks_installed = false;
+    ReleaseSRWLockExclusive(&s_hook_lifecycle_lock);
+    return removed_all;
 }
 
 bool NGXHooks_IsFGCreated() {
@@ -566,25 +1007,42 @@ void NGXHooks_ClearFGCreated() {
 }
 
 bool NGXHooks_InFGCreateCooldown() {
-    if (s_fg_create_qpc == 0) return false;
+    const int64_t fg_create_qpc =
+        s_fg_create_qpc.load(std::memory_order_acquire);
+    if (fg_create_qpc == 0) return false;
     LARGE_INTEGER now, freq;
     QueryPerformanceCounter(&now);
     QueryPerformanceFrequency(&freq);
-    double elapsed_us = static_cast<double>(now.QuadPart - s_fg_create_qpc) *
+    double elapsed_us = static_cast<double>(now.QuadPart - fg_create_qpc) *
                         1000000.0 / static_cast<double>(freq.QuadPart);
     return elapsed_us < FG_CREATE_COOLDOWN_US;
 }
 
 // ── DLL version reading ──
-// Reads file version from loaded DLLs on a background thread.
-// Zero render thread impact — versions appear on OSD once ready.
+// Reads file versions on an owned, interruptible worker. Snapshot publication
+// is synchronized and contains no file I/O on the reader thread.
 
-static std::atomic<bool> s_versions_read{false};
-static char s_sr_ver[24] = {};
-static char s_rr_ver[24] = {};
-static char s_fg_ver[24] = {};
-static char s_sl_ver[24] = {};
-static std::atomic<bool> s_version_thread_started{false};
+struct NGXVersionSnapshot {
+    char sr[24] = {};
+    char rr[24] = {};
+    char fg[24] = {};
+    char sl[24] = {};
+};
+
+// A published field is immutable until post-rundown cleanup. Readers only
+// copy fields whose release-published bit they observed; no render-thread lock.
+enum : unsigned { VersionSR = 1, VersionRR = 2, VersionFG = 4, VersionSL = 8 };
+static std::atomic<unsigned> s_version_ready{0};
+static NGXVersionSnapshot s_version_snapshot;
+static std::mutex s_version_lifecycle_mutex;
+static constexpr unsigned kStopVersions = ~0u;
+static std::atomic<unsigned> s_requested_features{0};
+static HANDLE s_version_thread = nullptr;
+
+static void ClearVersionSnapshot() {
+    s_version_snapshot = {};
+    s_version_ready.store(0, std::memory_order_release);
+}
 
 // Function pointer types for version.dll (loaded dynamically to avoid import table bloat)
 using pGetFileVersionInfoSizeW = DWORD(WINAPI*)(LPCWSTR, LPDWORD);
@@ -623,69 +1081,97 @@ static bool ReadDllVersionBG(pGetFileVersionInfoSizeW fnSize,
     return ok;
 }
 
-static DWORD WINAPI VersionPollThread(LPVOID) {
-    // Load version.dll dynamically — keeps it out of our import table
-    HMODULE hVer = LoadLibraryW(L"version.dll");
-    if (!hVer) { s_versions_read.store(true); return 0; }
+static void VersionPollThreadImpl() {
+    HMODULE version_module = LoadLibraryW(L"version.dll");
+    if (!version_module) return;
 
-    auto fnSize = reinterpret_cast<pGetFileVersionInfoSizeW>(GetProcAddress(hVer, "GetFileVersionInfoSizeW"));
-    auto fnInfo = reinterpret_cast<pGetFileVersionInfoW>(GetProcAddress(hVer, "GetFileVersionInfoW"));
-    auto fnQuery = reinterpret_cast<pVerQueryValueW>(GetProcAddress(hVer, "VerQueryValueW"));
-    if (!fnSize || !fnInfo || !fnQuery) { s_versions_read.store(true); return 0; }
-
-    // Poll every 2 seconds for up to 30 seconds waiting for DLLs to load.
-    for (int attempt = 0; attempt < 15; attempt++) {
-        Sleep(2000);
-        bool found_any = false;
-
-        if (!s_sr_ver[0]) {
-            if (ReadDllVersionBG(fnSize, fnInfo, fnQuery, L"nvngx_dlss.dll", s_sr_ver, sizeof(s_sr_ver)) ||
-                ReadDllVersionBG(fnSize, fnInfo, fnQuery, L"_nvngx_dlss.dll", s_sr_ver, sizeof(s_sr_ver)))
-                found_any = true;
-        }
-        if (!s_rr_ver[0]) {
-            if (ReadDllVersionBG(fnSize, fnInfo, fnQuery, L"nvngx_dlssd.dll", s_rr_ver, sizeof(s_rr_ver)) ||
-                ReadDllVersionBG(fnSize, fnInfo, fnQuery, L"_nvngx_dlssd.dll", s_rr_ver, sizeof(s_rr_ver)))
-                found_any = true;
-        }
-        if (!s_fg_ver[0]) {
-            if (ReadDllVersionBG(fnSize, fnInfo, fnQuery, L"nvngx_dlssg.dll", s_fg_ver, sizeof(s_fg_ver)) ||
-                ReadDllVersionBG(fnSize, fnInfo, fnQuery, L"_nvngx_dlssg.dll", s_fg_ver, sizeof(s_fg_ver)))
-                found_any = true;
-        }
-        if (!s_sl_ver[0]) {
-            if (ReadDllVersionBG(fnSize, fnInfo, fnQuery, L"sl.interposer.dll", s_sl_ver, sizeof(s_sl_ver)) ||
-                ReadDllVersionBG(fnSize, fnInfo, fnQuery, L"sl.common.dll", s_sl_ver, sizeof(s_sl_ver)))
-                found_any = true;
-        }
-
-        if (found_any) {
-            s_versions_read.store(true, std::memory_order_release);
-            LOG_INFO("NGX versions: SR=%s RR=%s FG=%s SL=%s",
-                     s_sr_ver[0] ? s_sr_ver : "-",
-                     s_rr_ver[0] ? s_rr_ver : "-",
-                     s_fg_ver[0] ? s_fg_ver : "-",
-                     s_sl_ver[0] ? s_sl_ver : "-");
-            if ((s_sr_ver[0] || s_rr_ver[0]) && s_sl_ver[0])
-                return 0;
-        }
+    auto fnSize = reinterpret_cast<pGetFileVersionInfoSizeW>(
+        GetProcAddress(version_module, "GetFileVersionInfoSizeW"));
+    auto fnInfo = reinterpret_cast<pGetFileVersionInfoW>(
+        GetProcAddress(version_module, "GetFileVersionInfoW"));
+    auto fnQuery = reinterpret_cast<pVerQueryValueW>(
+        GetProcAddress(version_module, "VerQueryValueW"));
+    if (!fnSize || !fnInfo || !fnQuery) {
+        FreeLibrary(version_module);
+        return;
     }
 
-    s_versions_read.store(true, std::memory_order_release);
+    unsigned processed = 0;
+    for (;;) {
+        unsigned requested = s_requested_features.load(std::memory_order_acquire);
+        if (requested == kStopVersions) break;
+        if (requested == processed) {
+            WaitOnAddress(&s_requested_features, &requested, sizeof(requested), INFINITE);
+            continue;
+        }
+        processed = requested;
+        const unsigned previous = s_version_ready.load(std::memory_order_relaxed);
+        unsigned ready = previous;
+        auto discover = [&](unsigned bit, char (&out)[24], const wchar_t* first, const wchar_t* second) {
+            if (!(ready & bit) && (ReadDllVersionBG(fnSize, fnInfo, fnQuery, first, out, sizeof(out)) ||
+                                  ReadDllVersionBG(fnSize, fnInfo, fnQuery, second, out, sizeof(out))))
+                ready |= bit;
+        };
+        auto& v = s_version_snapshot;
+        discover(VersionSR, v.sr, L"nvngx_dlss.dll", L"_nvngx_dlss.dll");
+        discover(VersionRR, v.rr, L"nvngx_dlssd.dll", L"_nvngx_dlssd.dll");
+        discover(VersionFG, v.fg, L"nvngx_dlssg.dll", L"_nvngx_dlssg.dll");
+        discover(VersionSL, v.sl, L"sl.interposer.dll", L"sl.common.dll");
+        if (ready != previous) {
+            s_version_ready.store(ready, std::memory_order_release);
+            LOG_INFO("NGX versions: SR=%s RR=%s FG=%s SL=%s", v.sr[0] ? v.sr : "-",
+                     v.rr[0] ? v.rr : "-", v.fg[0] ? v.fg : "-", v.sl[0] ? v.sl : "-");
+        }
+        if (ready == (VersionSR | VersionRR | VersionFG | VersionSL)) break;
+    }
+
+    FreeLibrary(version_module);
+}
+
+static DWORD WINAPI VersionPollThread(LPVOID) noexcept {
+    try {
+        VersionPollThreadImpl();
+    }
+    catch (...) {
+        OutputDebugStringA("ReLimiter: NGX version worker rejected an exception.\n");
+    }
     return 0;
 }
 
-static void StartVersionThread() {
-    bool expected = false;
-    if (!s_version_thread_started.compare_exchange_strong(expected, true))
-        return;
-    CloseHandle(CreateThread(nullptr, 0, VersionPollThread, nullptr, 0, nullptr));
+static void RequestVersions(unsigned features) {
+    if (s_requested_features.load(std::memory_order_relaxed) == features ||
+        !s_version_start_allowed.load(std::memory_order_acquire)) return;
+    std::lock_guard<std::mutex> lifecycle_lock(s_version_lifecycle_mutex);
+    if (!s_version_start_allowed.load(std::memory_order_acquire) ||
+        s_requested_features.load(std::memory_order_relaxed) == features) return;
+    s_requested_features.store(features, std::memory_order_release);
+    if (s_version_thread) {
+        WakeByAddressSingle(&s_requested_features);
+    } else {
+        s_version_thread = CreateThread(nullptr, 0, VersionPollThread, nullptr, 0, nullptr);
+        if (!s_version_thread)
+            LOG_ERROR("NGX: failed to start version worker (%lu)", GetLastError());
+    }
 }
 
-NGXDLSSInfo NGXHooks_GetInfo() {
-    // Start version poll thread on first call (runs in background, zero render impact)
-    StartVersionThread();
+static bool StopVersionThread() {
+    std::lock_guard<std::mutex> lifecycle_lock(s_version_lifecycle_mutex);
+    s_requested_features.store(kStopVersions, std::memory_order_release);
+    WakeByAddressSingle(&s_requested_features);
+    if (s_version_thread) {
+        if (WaitForSingleObject(s_version_thread, 2500) != WAIT_OBJECT_0) {
+            OutputDebugStringA(
+                "ReLimiter: NGX version worker did not stop; state retained.\n");
+            return false;
+        }
+        CloseHandle(s_version_thread);
+        s_version_thread = nullptr;
+    }
+    s_requested_features.store(0, std::memory_order_release);
+    return true;
+}
 
+NGXDLSSInfo NGXHooks_GetInfo(bool include_versions) {
     NGXDLSSInfo info = {};
     info.render_width  = s_render_w.load(std::memory_order_relaxed);
     info.render_height = s_render_h.load(std::memory_order_relaxed);
@@ -697,13 +1183,20 @@ NGXDLSSInfo NGXHooks_GetInfo() {
     info.sr_active     = s_has_data.load(std::memory_order_relaxed);
     info.rr_active     = s_ray_reconstruction.load(std::memory_order_relaxed);
     info.fg_active     = s_fg_created.load(std::memory_order_relaxed);
-    info.available     = s_has_data.load(std::memory_order_relaxed);
+    info.available     = info.sr_active;
 
-    // Copy version strings (populated by background thread)
-    memcpy(info.sr_version, s_sr_ver, sizeof(info.sr_version));
-    memcpy(info.rr_version, s_rr_ver, sizeof(info.rr_version));
-    memcpy(info.fg_version, s_fg_ver, sizeof(info.fg_version));
-    memcpy(info.sl_version, s_sl_ver, sizeof(info.sl_version));
+    if (include_versions && info.available) {
+        const unsigned ready = s_version_ready.load(std::memory_order_acquire);
+        if (ready != (VersionSR | VersionRR | VersionFG | VersionSL)) {
+            // One scan on first demand, then on feature changes (e.g. enabling
+            // FG loads another DLL). No scans/timers while the UI is hidden.
+            RequestVersions(VersionSR | (info.rr_active ? VersionRR : 0u) | (info.fg_active ? VersionFG : 0u));
+        }
+        if (ready & VersionSR) memcpy(info.sr_version, s_version_snapshot.sr, sizeof(info.sr_version));
+        if (ready & VersionRR) memcpy(info.rr_version, s_version_snapshot.rr, sizeof(info.rr_version));
+        if (ready & VersionFG) memcpy(info.fg_version, s_version_snapshot.fg, sizeof(info.fg_version));
+        if (ready & VersionSL) memcpy(info.sl_version, s_version_snapshot.sl, sizeof(info.sl_version));
+    }
 
     // Output resolution fallback: if CreateFeature was missed (hooks installed
     // late) and EvaluateFeature doesn't provide OutWidth/OutHeight, use the

@@ -6,7 +6,7 @@
 #include "nvapi_types.h"
 
 // Display state: atomic values read by scheduler, written by poll thread.
-// All atomics use std::memory_order_relaxed per spec §IV.1.
+// All atomics use std::memory_order_relaxed.
 
 // ── Pacing mode ──
 enum class PacingMode { VRR, Fixed };
@@ -25,7 +25,12 @@ void QueryVRRCeiling();
 void QueryVRRFloor();
 void PollGSyncState();
 void OnGSyncStateChange(bool new_gsync_active);
-
-// Blackwell detection
-bool IsBlackwellOrNewer();
-void DetectGPUArchitecture();
+// The driver's answer about the game's own frames (NvAPI_D3D_GetSleepStatus: bFsVrr, taken while bFullscreenIFlip
+// says the swapchain is in independent flip), from the game's own calls and ReLimiter's read (nvapi_hooks.cpp). Once
+// known it decides G-Sync in both directions; the display's flags decide only until then. Any thread, cheap: a
+// changed answer wakes the display worker (display_worker.h), which applies it with DisplayState_ApplyGameVrr.
+void DisplayState_OnSleepStatus(bool fullscreen_vrr, bool fullscreen_iflip, bool own_read) noexcept;
+void DisplayState_ApplyGameVrr();
+// The resolver's swapchain teardown: runs `retire` (it clears the resolved display) and publishes no display to frame
+// splitting, under the lock of the G-Sync polls, so the display worker cannot publish the retired display after it.
+void DisplayState_RetireDisplay(void (*retire)());

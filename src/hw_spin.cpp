@@ -1,10 +1,12 @@
 #include "hw_spin.h"
 #include "tsc_cal.h"
 #include "wake_guard.h"
+#include "runtime_lifecycle.h"
 #include <Windows.h>
 #include <intrin.h>
 #include <immintrin.h>
 #include <algorithm>
+#include <cmath>
 
 static SpinMethod g_spin_method = SpinMethod::RDTSC;
 
@@ -51,9 +53,24 @@ const char* GetSpinMethodName() {
 // the startup calibration (AMD Zen boost-state dependent).
 
 void HWSpin(int64_t target_qpc) {
+    if (RuntimeLifecycle_IsStopping()) return;
+
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     if (now.QuadPart >= target_qpc) return;
+    const int64_t target_delta_qpc = target_qpc - now.QuadPart;
+    const double target_delta_us = qpc_to_us(target_delta_qpc);
+    if (!std::isfinite(target_delta_us) ||
+        target_delta_us <= 0.0 || target_delta_us > 500'000.0) return;
+    if (!std::isfinite(g_tsc_cal.tsc_per_qpc) ||
+        g_tsc_cal.tsc_per_qpc <= 0.0) {
+        while (!RuntimeLifecycle_IsStopping()) {
+            QueryPerformanceCounter(&now);
+            if (now.QuadPart >= target_qpc) break;
+            _mm_pause();
+        }
+        return;
+    }
 
     switch (g_spin_method) {
     case SpinMethod::TPAUSE:
@@ -70,17 +87,19 @@ void HWSpin(int64_t target_qpc) {
             {
                 double remaining_us = qpc_to_us(target_qpc - now.QuadPart);
                 if (remaining_us > 1.0) {
+                    remaining_us = (std::min)(remaining_us, 250.0);
                     uint64_t wake_tsc = __rdtsc() + static_cast<uint64_t>(remaining_us * tsc_per_us);
                     _tpause(0, wake_tsc);
                 }
             }
 
             // Validate + mop up any residual from TSC drift
-            while (true) {
+            while (!RuntimeLifecycle_IsStopping()) {
                 QueryPerformanceCounter(&now);
                 if (now.QuadPart >= target_qpc) break;
 
-                double remaining_us = qpc_to_us(target_qpc - now.QuadPart);
+                double remaining_us = (std::min)(
+                    qpc_to_us(target_qpc - now.QuadPart), 250.0);
                 uint64_t wake_tsc = __rdtsc() + static_cast<uint64_t>(remaining_us * tsc_per_us);
                 _tpause(0, wake_tsc);
             }
@@ -103,7 +122,7 @@ void HWSpin(int64_t target_qpc) {
             if (nap_ticks < 1000) nap_ticks = 1000;
             if (nap_ticks > 100000) nap_ticks = 100000;
 
-            while (true) {
+            while (!RuntimeLifecycle_IsStopping()) {
                 QueryPerformanceCounter(&now);
                 if (now.QuadPart >= target_qpc) break;
 
@@ -133,7 +152,7 @@ void HWSpin(int64_t target_qpc) {
             if (nap_ticks < 1000) nap_ticks = 1000;
             if (nap_ticks > 100000) nap_ticks = 100000;
 
-            while (true) {
+            while (!RuntimeLifecycle_IsStopping()) {
                 QueryPerformanceCounter(&now);
                 if (now.QuadPart >= target_qpc) break;
                 uint64_t tsc_gate = __rdtsc() + nap_ticks;

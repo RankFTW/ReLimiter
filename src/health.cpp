@@ -1,19 +1,14 @@
 #include "health.h"
-#include "correlator.h"
 #include "swapchain_manager.h"
 #include "wake_guard.h"
 #include <Windows.h>
 #include <atomic>
 
-// ── DXGI stats freshness ──
-static int s_frames_since_dxgi_update = 0;
-static bool s_dxgi_updated_this_frame = false;
-
 // ── Marker flow ──
-static int64_t s_last_enforcement_marker_qpc = 0;
+static std::atomic<int64_t> s_last_enforcement_marker_qpc{0};
+static std::atomic<int64_t> s_last_marker_trigger_qpc{0};
 
 // ── Swapchain validity ──
-extern IDXGISwapChain* g_swapchain;
 static std::atomic<bool> s_swapchain_invalid{false};
 static std::atomic<bool> s_device_lost{false};
 static std::atomic<bool> s_occluded{false};
@@ -21,37 +16,26 @@ static std::atomic<bool> s_occluded{false};
 // ── Vulkan swapchain validity ──
 static std::atomic<bool> s_vk_swapchain_valid{false};
 
-bool IsDXGIStatsFresh() {
-    // Vulkan/DX11 don't use DXGI stats — report as fresh to avoid Tier2a
-    ActiveAPI api = SwapMgr_GetActiveAPI();
-    if (api == ActiveAPI::Vulkan || api == ActiveAPI::DX11 || api == ActiveAPI::OpenGL)
-        return true;
-    return s_frames_since_dxgi_update < 10;
+static bool IsRecent(const std::atomic<int64_t>& timestamp_qpc) {
+    const int64_t last_qpc = timestamp_qpc.load(std::memory_order_relaxed);
+    if (last_qpc == 0) return false;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return qpc_to_us(now.QuadPart - last_qpc) < MARKER_FLOW_TIMEOUT_US;
+}
+
+static void RecordNow(std::atomic<int64_t>* timestamp_qpc) {
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    timestamp_qpc->store(now.QuadPart, std::memory_order_relaxed);
 }
 
 bool AreMarkersFlowing() {
-    if (s_last_enforcement_marker_qpc == 0) return false;
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    return qpc_to_us(now.QuadPart - s_last_enforcement_marker_qpc) < 500000.0;
+    return IsRecent(s_last_enforcement_marker_qpc);
 }
 
-bool IsCorrelatorValid() {
-    // Vulkan/DX11/OpenGL path doesn't use DXGI stats — report as valid
-    ActiveAPI api = SwapMgr_GetActiveAPI();
-    if (api == ActiveAPI::Vulkan || api == ActiveAPI::DX11 || api == ActiveAPI::OpenGL)
-        return true;
-    // DX12: check if DXGI stats source is responding
-    return g_correlator.IsStatsAvailable();
-}
-
-bool IsNvAPIAvailable() {
-#ifdef _WIN64
-    HMODULE nvapi = GetModuleHandleW(L"nvapi64.dll");
-#else
-    HMODULE nvapi = GetModuleHandleW(L"nvapi.dll");
-#endif
-    return nvapi != nullptr;
+bool AreMarkerTriggersFlowing() {
+    return IsRecent(s_last_marker_trigger_qpc);
 }
 
 bool IsSwapchainValid() {
@@ -65,8 +49,9 @@ bool IsSwapchainValid() {
     if (api == ActiveAPI::OpenGL || api == ActiveAPI::DX9)
         return SwapMgr_IsValid();
 
-    // DX12 and DX11 both use g_swapchain (set by OnInitSwapchain)
-    return g_swapchain != nullptr &&
+    // DX12 and DX11 use the SwapMgr lifetime flag; raw COM pointers are owned
+    // behind the correlator's synchronized snapshot API.
+    return SwapMgr_IsValid() &&
            !s_swapchain_invalid.load(std::memory_order_relaxed) &&
            !s_device_lost.load(std::memory_order_relaxed) &&
            !s_occluded.load(std::memory_order_relaxed);
@@ -77,38 +62,22 @@ void SetVkSwapchainValid(bool v) {
 }
 
 // ── NvAPI marker flow (game-originated markers only) ──
-static int64_t s_last_nvapi_marker_qpc = 0;
+static std::atomic<int64_t> s_last_nvapi_marker_qpc{0};
 
 void RecordEnforcementMarker() {
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    s_last_enforcement_marker_qpc = now.QuadPart;
+    RecordNow(&s_last_enforcement_marker_qpc);
+}
+
+void RecordMarkerTrigger() {
+    RecordNow(&s_last_marker_trigger_qpc);
 }
 
 void RecordNvAPIMarker() {
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    s_last_nvapi_marker_qpc = now.QuadPart;
+    RecordNow(&s_last_nvapi_marker_qpc);
 }
 
 bool AreNvAPIMarkersFlowing() {
-    if (s_last_nvapi_marker_qpc == 0) return false;
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    return qpc_to_us(now.QuadPart - s_last_nvapi_marker_qpc) < 500000.0;
-}
-
-void TickHealthFrame() {
-    if (s_dxgi_updated_this_frame) {
-        s_frames_since_dxgi_update = 0;
-        s_dxgi_updated_this_frame = false;
-    } else {
-        s_frames_since_dxgi_update++;
-    }
-}
-
-void RecordDXGIStatsUpdate() {
-    s_dxgi_updated_this_frame = true;
+    return IsRecent(s_last_nvapi_marker_qpc);
 }
 
 // ── Setters for external events ──

@@ -1,26 +1,135 @@
 #pragma once
 
+#include "lead_controller.h"
+#include "pacing_core_types.h"
+
 #include <cstdint>
 #include <atomic>
+#include <limits>
 
-// DrainCorrelator: every frame. Queries DXGI stats, feeds CadenceMeter
-// and stress detector. Replaces the old retirement-based feedback loop.
-void DrainCorrelator(bool overload_active, double effective_interval_us);
-
-// Reset CadenceMeter and feedback state (called on flush).
+// Reset feedback state (called on flush).
 void ResetFeedbackAccumulators();
 
-// Last presentation bias (for telemetry). Returns 0 if no samples.
-double GetLastScanoutErrorUs();
+// Invalidate the NvAPI report producer lifetime after a device replacement or
+// loss. Unlike a controller-policy reset, this clears report watermarks, AI
+// authority, release provenance, and delayed samples on the scheduler writer.
+void ResetFeedbackProducerLifecycle() noexcept;
 
-// Returns true if Reflex GetLatency has successfully fed cadence data.
-bool IsReflexCadenceActive();
+// Apply pending lifecycle resets on the scheduler writer before publishing
+// new release provenance. Other hook threads only request the reset.
+void ApplyFeedbackResetRequests() noexcept;
 
-// ── DMFG-only: Reflex GPU frame time scan ──
-// Lightweight Reflex ring scan that only extracts gpuFrameTimeUs for
-// DMFG multiplier detection. Does not feed cadence meter or pipeline
-// timing — safe to call from the DMFG path without affecting non-DMFG.
-void PollReflexGpuFrameTime();
+// Scheduler-owner refresh used before FG-off cap selection so delayed NvAPI
+// workload/AI evidence can recover a missed Streamline state. Returns true
+// only when the newly accepted report contained cadence data.
+bool PollReflexLatencyReport(double effective_interval_us);
+
+// Returns positive AI frame time only while its accepted report remains in the
+// exact current NvAPI producer epoch and bounded report-association horizon.
+double GetCurrentReflexAiFrameTimeUs() noexcept;
+void ResetReflexAiEvidence() noexcept;
+
+struct ReflexFrameTimeSample {
+	uint64_t sequence = 0;
+	uint32_t producer_epoch = 0;
+	uint64_t frame_id = 0;
+	double workload_demand_us = 0.0;
+	double cpu_active_us = 0.0;
+	double gpu_render_duration_us = 0.0;
+	double gpu_service_us = 0.0;
+	double owned_cpu_stage_us = 0.0;
+	double gpu_frame_time_us = 0.0;
+	double present_duration_us = 0.0;
+	double present_to_gpu_end_us = 0.0;
+	double owned_gate_hold_us = 0.0;
+	double queue_trend_us = 0.0;
+	uint32_t feedback_generation = 0;
+	bool gpu_execution_available = false; // FIFO-only authority: service came from driver active time, not elapsed fallback
+	double gpu_active_us = 0.0; // the report's gpuActiveRenderTimeUs; the lead controller's release headroom
+	double ai_frame_us = 0.0;   // the report's aiFrameTimeUs (frame generation time); unified owner's hold share bound
+	// The report's gpuRenderStartTime and gpuRenderEndTime as local QPC
+	// through the stable Reflex clock map (the lead controller's queue-order
+	// test and the render handoff GPU floor); 0 otherwise.
+	int64_t gpu_start_qpc = 0;
+	int64_t gpu_end_qpc = 0;
+	// Unified owner: the report's gpuRenderStartTime and osRenderQueueStartTime
+	// as the driver reported them (µs on the driver's clock, 0 = missing), copied raw. The
+	// scheduler derives the signed queue wait from them under the key.
+	uint64_t gpu_start_driver_us = 0;
+	uint64_t os_queue_start_driver_us = 0;
+	// presentEndTime → gpuRenderEndTime in µs on the driver's clock (the GPU
+	// floor's live bound); 0 when either is missing, the GPU end comes first,
+	// or it exceeds 3 I.
+	double present_end_to_gpu_end_us = 0.0;
+	// The later of the report's renderSubmitEndTime and presentStartTime as
+	// local QPC through the stable Reflex clock map: when the game's render
+	// thread finished the frame (the held floor's render coupling,
+	// lead_controller.h); 0 without renderSubmitEndTime or a stable map.
+	int64_t render_done_qpc = 0;
+	// The frame's first work (driverStartTime) reached the driver before the
+	// middle of its own render submission (HandoffFirstWorkStreams on its
+	// RENDERSUBMIT_START/END); false when any of them is missing. The lead
+	// sample behind the wait (lead_controller.h).
+	bool first_work_streamed = false;
+	// Its driverStartTime − renderSubmitStartTime in µs on the driver's clock
+	// when it streamed (the lead's spike floor, lead_controller.h); NaN
+	// otherwise.
+	double first_submission_delay_us = std::numeric_limits<double>::quiet_NaN();
+	// Render handoff report pair (lead_controller.h): this frame's and the
+	// previous frame's report times, in µs on the driver's clock from this
+	// frame's RENDERSUBMIT_START. Known only when both reports carry every
+	// timestamp and each lies within 3 I of that origin.
+	HandoffBackPressureSample back_pressure{};
+	bool back_pressure_known = false;
+};
+
+// Scheduler owner only: consume accepted NvAPI latency reports in source
+// order. Workload demand is the maximum stage-local CPU/GPU candidate, never
+// paced GPU cadence. Resets/epoch changes invalidate old entries.
+bool ConsumeReflexFrameTimeSample(ReflexFrameTimeSample* sample) noexcept;
+// Non-adapting scheduler paths explicitly discard observations at frame exit.
+void DiscardReflexFrameTimeSamples() noexcept;
+
+// Publish measured ReLimiter scheduler sleep and active enforcement marker
+// under the exact NvAPI producer lifetime and source-frame ID. The complete
+// marker-hook residence is published after OnMarker returns and supersedes the
+// sleep-only fallback for workload correction (zero when the marker reaches
+// the driver after the wait, marker_forward_order=after_wait). Exact gate hold is kept
+// separately so same-report release pressure can exclude controller-owned time.
+void PublishReflexOwnedSleep(
+	uint64_t frame_id,
+	uint32_t producer_epoch,
+	PacingSourceMarker marker,
+	double owned_sleep_us) noexcept;
+void PublishReflexControllerResidence(
+	uint64_t frame_id,
+	uint32_t producer_epoch,
+	double controller_residence_us) noexcept;
+void PublishReflexGateHold(
+	uint64_t frame_id,
+	uint32_t producer_epoch,
+	double gate_hold_us) noexcept;
+
+// ReLimiter's waits for one planned source frame in local QPC: its release,
+// the source wait and the pre-Sleep wait; 0 when there was none. A later
+// frame's waits inside a report's CPU stage are removed from its workload
+// demand when that frame was released before the report's Present start
+// (lockstep engines, lead_controller.h).
+struct ReflexOwnedWaits {
+	int64_t release_qpc = 0;
+	int64_t wait_start_qpc = 0;
+	int64_t wait_end_qpc = 0;
+	int64_t pre_wait_start_qpc = 0;
+	int64_t pre_wait_end_qpc = 0;
+	// When the game reached ReLimiter for the frame, before any wait of
+	// ReLimiter's own (the marker hook or the Reflex Sleep hook, whichever
+	// came first); 0 when unknown. Feeds the serial-frame detector.
+	int64_t arrival_qpc = 0;
+};
+void PublishReflexOwnedWaits(
+	uint64_t frame_id,
+	uint32_t producer_epoch,
+	const ReflexOwnedWaits& waits) noexcept;
 
 // ── Reflex pipeline timing (DX12 only) ──
 // Direct per-frame measurements from NvAPI GetLatency, replacing the
@@ -31,11 +140,10 @@ void PollReflexGpuFrameTime();
 // Present-to-GPU-render-end latency: how long after the present call
 // does the GPU finish rendering and the frame enter the flip queue.
 // Analogous to VK_PRESENT_STAGE_QUEUE_OPERATIONS_END → IMAGE_FIRST_PIXEL_OUT.
-extern std::atomic<double> g_reflex_pipeline_latency_us;
+extern std::atomic<double> g_reflex_present_to_gpu_end_us;
 
-// GPU queue depth trend: positive = queue growing (stutter imminent),
-// negative = queue draining, zero = stable. Measured from consecutive
-// gpuRenderEnd - gpuRenderStart deltas in the Reflex ring buffer.
+// Consecutive selected-workload delta. This is diagnostic workload movement,
+// not a queue-depth measurement and does not gate adaptation release.
 extern std::atomic<double> g_reflex_queue_trend_us;
 
 // ── Extended Reflex timing (DX12 only) ──
@@ -48,24 +156,20 @@ extern std::atomic<double> g_reflex_present_duration_us;
 // When much less than full render duration, indicates CPU submission bottleneck.
 extern std::atomic<double> g_reflex_gpu_active_us;
 
-// DLSS Frame Generation time. Non-zero only when FG is active.
-// Driver-authoritative FG detection signal.
+// DLSS Frame Generation time from the newest accepted report. Use
+// GetCurrentReflexAiFrameTimeUs for static-FG authority; this raw diagnostic
+// atomic can remain nonzero after its exact report ages out.
 extern std::atomic<double> g_reflex_ai_frame_time_us;
 
-// Full CPU latency: simStart → presentStart. Total CPU-side frame time.
+// Marker-aware stage-local CPU bottleneck corrected for exact controller
+// residence. The historical telemetry name remains stable.
 extern std::atomic<double> g_reflex_cpu_latency_us;
 
-// Total frame cost: simStart → gpuRenderEnd.
-// Includes sim + render submit + driver + GPU execution. Excludes our sleep,
-// gate hold, and present call overhead. This is the ground truth for how
-// long a frame actually costs, used by adaptive smoothing.
+// Total Reflex frame cost: simStart → gpuRenderEnd.
+// Diagnostic only. The period governor uses the paired stage-local workload
+// from delayed Reflex reports, not this overlapping end-to-end span.
 extern std::atomic<double> g_reflex_total_frame_cost_us;
 
-// Present-end QPC timestamp. Closest proxy for when the frame entered
-// the driver's flip queue. Used for scanout-anchored deadline.
+// Present-end driver-domain microsecond timestamp. The historical `_qpc`
+// symbol name is retained; do not convert this value with local QPC frequency.
 extern std::atomic<int64_t> g_reflex_present_end_qpc;
-
-// GPU frame time from Reflex ring buffer. Measures the real render cadence
-// (time between consecutive GPU frame completions) unaffected by output caps.
-// Used by DMFG to derive the true FG multiplier without uncap probes.
-extern std::atomic<double> g_reflex_gpu_frame_time_us;

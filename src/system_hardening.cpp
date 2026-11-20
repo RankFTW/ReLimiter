@@ -1,80 +1,70 @@
 #include "system_hardening.h"
-#include "hooks.h"
 #include "logger.h"
 #include <Windows.h>
 #include <dxgi.h>
-#include <MinHook.h>
 #include <atomic>
 
-// MMRESULT / TIMERR_NOERROR not available with WIN32_LEAN_AND_MEAN
-#ifndef TIMERR_NOERROR
-typedef UINT MMRESULT;
-#define TIMERR_NOERROR 0
-#endif
+// ReLimiter uses its own high-resolution waitable timers. Do not intercept
+// process-wide timeBeginPeriod/timeEndPeriod calls: games and middleware own
+// those balancing semantics, and faking success is a compatibility hazard.
+// ReLimiter makes its own balanced request instead (section 1).
 
-using timeBeginPeriod_fn = MMRESULT(WINAPI*)(UINT);
-using timeEndPeriod_fn   = MMRESULT(WINAPI*)(UINT);
+// ══════════════════════════════════════════════════════════════
+// 1. Timer resolution
+//    Request the finest kernel timer resolution (usually 0.5 ms) for the
+//    process lifetime, so ReLimiter's waitable timers (owner, pre-Sleep, GPU
+//    wait worker) expire on a 0.5 ms tick whatever the game requested. The
+//    request is ReLimiter's own (NtSetTimerResolution keeps a per-requester
+//    reference); it is released at shutdown and never touches the game's
+//    timeBeginPeriod calls. Since Windows 10 2004 it applies to this process
+//    only; section 2 keeps it while the window is minimized or occluded.
+// ══════════════════════════════════════════════════════════════
 
-static timeBeginPeriod_fn s_orig_timeBeginPeriod = nullptr;
-static timeEndPeriod_fn   s_orig_timeEndPeriod   = nullptr;
+using NtQueryTimerResolution_fn = LONG(NTAPI*)(PULONG, PULONG, PULONG);
+using NtSetTimerResolution_fn = LONG(NTAPI*)(ULONG, BOOLEAN, PULONG);
 
-// Our target resolution in ms (0.5ms = the max from ZwSetTimerResolution)
-static constexpr UINT TARGET_TIMER_RES_MS = 1;
+static std::atomic<bool> s_timer_resolution_requested{false};
+static ULONG s_timer_resolution_requested_100ns = 0;
 
-static MMRESULT WINAPI Hook_timeBeginPeriod(UINT uPeriod) {
-    // If caller wants a worse (higher) resolution than ours, block it.
-    if (uPeriod > TARGET_TIMER_RES_MS)
-        return TIMERR_NOERROR;
-    // Equal or better — pass through.
-    return s_orig_timeBeginPeriod ? s_orig_timeBeginPeriod(uPeriod) : TIMERR_NOERROR;
-}
-
-static MMRESULT WINAPI Hook_timeEndPeriod(UINT uPeriod) {
-    // Don't let anyone end a period that would degrade our resolution.
-    if (uPeriod > TARGET_TIMER_RES_MS)
-        return TIMERR_NOERROR;
-    return s_orig_timeEndPeriod ? s_orig_timeEndPeriod(uPeriod) : TIMERR_NOERROR;
-}
-
-static bool s_timer_period_hooked = false;
-
-static void InstallTimerPeriodHooks() {
-    HMODULE winmm = GetModuleHandleA("winmm.dll");
-    if (!winmm) winmm = LoadLibraryA("winmm.dll");
-    if (!winmm) return;
-
-    void* pBegin = reinterpret_cast<void*>(GetProcAddress(winmm, "timeBeginPeriod"));
-    void* pEnd   = reinterpret_cast<void*>(GetProcAddress(winmm, "timeEndPeriod"));
-    if (!pBegin || !pEnd) return;
-
-    MH_STATUS st = MH_CreateHook(pBegin, reinterpret_cast<void*>(Hook_timeBeginPeriod),
-                                  reinterpret_cast<void**>(&s_orig_timeBeginPeriod));
-    if (st != MH_OK) return;
-    if (MH_EnableHook(pBegin) != MH_OK) { MH_RemoveHook(pBegin); return; }
-
-    st = MH_CreateHook(pEnd, reinterpret_cast<void*>(Hook_timeEndPeriod),
-                        reinterpret_cast<void**>(&s_orig_timeEndPeriod));
-    if (st != MH_OK) { MH_DisableHook(pBegin); MH_RemoveHook(pBegin); return; }
-    if (MH_EnableHook(pEnd) != MH_OK) {
-        MH_RemoveHook(pEnd);
-        MH_DisableHook(pBegin); MH_RemoveHook(pBegin);
+static void RequestTimerResolution() {
+    if (s_timer_resolution_requested.load(std::memory_order_acquire)) return;
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll) return;
+    const auto query = reinterpret_cast<NtQueryTimerResolution_fn>(
+        GetProcAddress(ntdll, "NtQueryTimerResolution"));
+    const auto set = reinterpret_cast<NtSetTimerResolution_fn>(
+        GetProcAddress(ntdll, "NtSetTimerResolution"));
+    if (!query || !set) {
+        LOG_WARN("Hardening: timer resolution API unavailable");
         return;
     }
-
-    s_timer_period_hooked = true;
-    LOG_INFO("Hardening: timeBeginPeriod/timeEndPeriod hooks installed");
+    // Coarsest, finest and current period in 100 ns units (e.g. 156250, 5000).
+    ULONG coarsest = 0, finest = 0, current = 0;
+    if (query(&coarsest, &finest, &current) < 0 || finest == 0) {
+        LOG_WARN("Hardening: NtQueryTimerResolution failed");
+        return;
+    }
+    ULONG applied = 0;
+    const LONG status = set(finest, TRUE, &applied);
+    if (status < 0) {
+        LOG_WARN("Hardening: NtSetTimerResolution(%lu) failed status=0x%08lX (current %lu)",
+            finest, static_cast<unsigned long>(status), current);
+        return;
+    }
+    s_timer_resolution_requested_100ns = finest;
+    s_timer_resolution_requested.store(true, std::memory_order_release);
+    LOG_INFO("Hardening: timer resolution requested %.3f ms (was %.3f ms, now %.3f ms, range %.3f-%.3f ms)",
+        finest / 10000.0, current / 10000.0, applied / 10000.0, finest / 10000.0, coarsest / 10000.0);
 }
 
-static void RemoveTimerPeriodHooks() {
-    if (!s_timer_period_hooked) return;
-    HMODULE winmm = GetModuleHandleA("winmm.dll");
-    if (winmm) {
-        void* pBegin = reinterpret_cast<void*>(GetProcAddress(winmm, "timeBeginPeriod"));
-        void* pEnd   = reinterpret_cast<void*>(GetProcAddress(winmm, "timeEndPeriod"));
-        if (pBegin) { MH_DisableHook(pBegin); MH_RemoveHook(pBegin); }
-        if (pEnd)   { MH_DisableHook(pEnd);   MH_RemoveHook(pEnd); }
-    }
-    s_timer_period_hooked = false;
+static void ReleaseTimerResolution() {
+    if (!s_timer_resolution_requested.exchange(false, std::memory_order_acq_rel)) return;
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll) return;
+    const auto set = reinterpret_cast<NtSetTimerResolution_fn>(
+        GetProcAddress(ntdll, "NtSetTimerResolution"));
+    ULONG applied = 0;
+    if (set) set(s_timer_resolution_requested_100ns, FALSE, &applied);
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -290,14 +280,17 @@ static void UnregisterPresentThreadMMCSS() {
 // ══════════════════════════════════════════════════════════════
 
 void Hardening_Init() {
-    InstallTimerPeriodHooks();
+    RequestTimerResolution();
     ApplyPowerThrottlingBypass();
     ApplyDwmMMCSS();
     ApplyGPUSchedulingPriority();
 }
 
 void Hardening_OnDevice(void* dxgi_swapchain) {
-    ApplyGPUThreadPriority(dxgi_swapchain);
+    __try { ApplyGPUThreadPriority(dxgi_swapchain); }
+    __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_WARN("Hardening: GPU thread-priority path rejected a COM/driver fault");
+    }
 }
 
 void Hardening_OnFirstPresent() {
@@ -305,7 +298,7 @@ void Hardening_OnFirstPresent() {
 }
 
 void Hardening_Shutdown() {
-    RemoveTimerPeriodHooks();
+    ReleaseTimerResolution();
     RestoreGPUSchedulingPriority();
     UnregisterPresentThreadMMCSS();
     // GPU thread priority: restore if we still have a swapchain

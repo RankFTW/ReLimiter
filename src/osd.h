@@ -6,13 +6,9 @@
 #include <imgui.h>
 #include <reshade.hpp>
 
-// OSD rendering via ReShade + ImGui. Spec §III.5.
-void DrawSettings(reshade::api::effect_runtime* rt);
-void DrawOSD(reshade::api::effect_runtime* rt);
+// OSD rendering via ReShade + ImGui.
 void RegisterOSD();
+void StopOSD();
 
-// Reset the 1%/0.1% low rolling history (call on FG state changes, tier transitions).
-void OSD_ResetLowHistory();
-
-// Cycle OSD position through corners (clockwise: top-right → bottom-right → bottom-left → top-left).
+// Move clockwise to the next exact screen corner and persist the position.
 void OSD_CyclePosition();

@@ -1,12 +1,11 @@
 #include "vk_enforce.h"
 #include "scheduler.h"
-#include "predictor.h"
 #include "fg_divisor.h"
 #include "pcl_hooks.h"
 #include "health.h"
-#include "correlator.h"
 #include "swapchain_manager.h"
-#include "presentation_gate.h"
+#include "frame_timeline.h"
+#include "pacing_telemetry.h"
 #include "wake_guard.h"
 #include "reflex_inject.h"
 #include "vsync_control.h"
@@ -17,7 +16,7 @@
 // Vulkan doesn't have per-frame IDs from markers by default.
 // We use a monotonic counter as the frameID for the shared scheduler.
 static std::atomic<uint64_t> s_vk_frame_counter{1};
-static bool s_initialized = false;
+static std::atomic<bool> s_initialized{false};
 
 // ── FG present coalescing ──
 // With 3x FG, ReShade fires the present event 3 times per render frame:
@@ -30,28 +29,25 @@ static int64_t s_last_present_qpc = 0;
 // the shortest real render frame at 360fps (~2.8ms).
 static constexpr double FG_COALESCE_THRESHOLD_US = 3000.0;
 
-// ── Predictor feeding ──
-// Track the end of our last sleep to measure render time correctly.
-// Render time = present_timestamp - post_sleep_timestamp.
-// This mirrors the DX12 predictor which measures post-enforcement → PRESENT_START.
-static int64_t s_post_sleep_qpc = 0;
-
 void VkEnforce_Init() {
     // Do NOT reset s_vk_frame_counter — must be monotonically increasing.
     s_last_present_qpc = 0;
-    s_post_sleep_qpc = 0;
-    s_initialized = true;
+    s_initialized.store(true, std::memory_order_release);
     LOG_INFO("VkEnforce: initialized (frame_counter=%llu)",
              s_vk_frame_counter.load(std::memory_order_relaxed));
 }
 
 void VkEnforce_Shutdown() {
-    s_initialized = false;
+    s_initialized.store(false, std::memory_order_release);
     LOG_INFO("VkEnforce: shutdown");
 }
 
-void VkEnforce_OnPresent(int64_t now_qpc) {
-    if (!s_initialized) return;
+void VkEnforce_OnPresent(
+    int64_t now_qpc,
+    bool force_marker_fallback) {
+    if (!s_initialized.load(std::memory_order_acquire)) return;
+    SchedulerOwnerGuard scheduler_owner;
+    if (!scheduler_owner) return;
 
     // ── Deferred OpenGL VSync hook installation ──
     // wglGetProcAddress requires an active GL context on the calling thread.
@@ -62,6 +58,7 @@ void VkEnforce_OnPresent(int64_t now_qpc) {
             s_gl_vsync_attempted = true;
             LOG_INFO("VSync: OpenGL detected in VkEnforce_OnPresent, installing hooks...");
             VSync_InstallOpenGLHooks();
+            LOG_INFO("Hooks: MH_EnableHook(MH_ALL_HOOKS) after the OpenGL VSync hooks");
             EnableAllHooks();
             VSync_ApplyOpenGL();
         }
@@ -69,12 +66,12 @@ void VkEnforce_OnPresent(int64_t now_qpc) {
 
     // If PCL markers are flowing, enforcement happens at SIMULATION_START
     // via pcl_hooks.cpp — skip present-based enforcement entirely.
-    // Same for NvAPI markers (DX12 Reflex games) — enforcement is in
+    // Same for NvAPI markers (DX11/DX12 Reflex games) — enforcement is in
     // Hook_SetLatencyMarker. Present-based is only a fallback.
-    if (PCL_MarkersFlowing())
-        return;
-    if (AreNvAPIMarkersFlowing())
-        return;
+    if (!force_marker_fallback) {
+        if (PCL_MarkersFlowing()) return;
+        if (AreNvAPIMarkersFlowing()) return;
+    }
 
     int fg_raw = ComputeFGDivisorRaw();
 
@@ -92,27 +89,10 @@ void VkEnforce_OnPresent(int64_t now_qpc) {
     // ── Real render present ──
     uint64_t frameID = s_vk_frame_counter.fetch_add(1, std::memory_order_relaxed);
 
-    // ── Feed predictor directly ──
-    // When no PCL markers are available (non-Streamline Vulkan), measure
-    // render time as present_timestamp - post_sleep_timestamp.
-    // When PCL markers flow, the predictor is fed via OnMarker() in the
-    // PCL hook (SIM_START→PRESENT_START), so skip direct feeding here.
-    if (!PCL_MarkersFlowing() && s_post_sleep_qpc > 0) {
-        double render_time = qpc_to_us(now_qpc - s_post_sleep_qpc);
-        if (render_time > 0.0 && render_time < 200000.0)
-            g_predictor.frame_times_us.Push(render_time);
-    }
-
-    // ── DXGI present-based: feed correlator ──
-    // When DX12/DX11 runs without NvAPI markers, the correlator normally
-    // Call the shared scheduler enforcement point.
-    // Pass a fresh timestamp so the scheduler's `now` reflects the actual
-    // time at sleep decision, not the stale present-event time. The overhead
-    // between present event and here (predictor feed, correlator) is ~900us
-    // of real elapsed time. With a stale `now`, the scheduler's deadline
-    // math over-sleeps by that amount because it thinks less time has passed.
-    size_t pre_size = g_predictor.frame_times_us.Size();
-
+    // Call the shared source stage (present placement: the grid wakes the
+    // source with the fixed present lead). Pass a fresh timestamp so the
+    // scheduler's `now` reflects the time of the wait decision, not the
+    // stale present-event time.
     LARGE_INTEGER fresh_ts;
     QueryPerformanceCounter(&fresh_ts);
     int64_t scheduler_now = fresh_ts.QuadPart;
@@ -126,7 +106,10 @@ void VkEnforce_OnPresent(int64_t now_qpc) {
         ReflexInject_OnPreSleep(frameID, scheduler_now);
     }
 
-    OnMarker(frameID, scheduler_now);
+    OnMarker(
+        frameID,
+        scheduler_now,
+        SchedulerTrigger::PresentFallback);
 
     if (api_for_reflex != ActiveAPI::Vulkan && api_for_reflex != ActiveAPI::OpenGL && ReflexInject_IsActive()) {
         LARGE_INTEGER post_inject;
@@ -134,15 +117,13 @@ void VkEnforce_OnPresent(int64_t now_qpc) {
         ReflexInject_OnPostSleep(frameID, post_inject.QuadPart);
     }
 
-    size_t post_size = g_predictor.frame_times_us.Size();
-
-    // Record post-sleep timestamp for next frame's render time measurement.
-    LARGE_INTEGER post;
-    QueryPerformanceCounter(&post);
-    s_post_sleep_qpc = post.QuadPart;
-
-    // Detect predictor flush: if size decreased, a flush happened.
-    // Reset baseline so next frame doesn't use stale post-sleep timestamp.
-    if (post_size < pre_size)
-        s_post_sleep_qpc = 0;
+    // The ReShade present event precedes the native Present on this
+    // thread, so the DXGI Present hook (DX11/DX12 present-based path) can
+    // attribute it to this source frame. No presentation gate runs here.
+    PacingPresentAttribution attribution{};
+    attribution.key = {PacingIdentityDomain::SyntheticPresentFrame,
+        FrameTimeline_CurrentProducerEpoch(FrameIdentityDomain::SyntheticPresentFrame),
+        frameID};
+    attribution.marker_qpc = scheduler_now;
+    PacingTelemetry_SetPresentAttribution(attribution);
 }

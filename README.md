@@ -1,6 +1,8 @@
 # ReLimiter
 
-A ReShade addon for frame pacing and FPS limiting on NVIDIA G-Sync / VRR displays. Works with DX12, DX11, Vulkan, and OpenGL games.
+A ReShade addon for frame pacing and FPS limiting on NVIDIA G-Sync / VRR displays.
+
+64-bit DirectX 12 with NVIDIA Reflex is the supported and tested configuration; other APIs with Reflex run the same pacer untested; games without Reflex and all 32-bit games get a plain frame-rate cap.
 
 ## Installation
 
@@ -12,21 +14,17 @@ Install via [RHI (ReShade HDR Installer)](https://github.com/RankFTW/RHI) for th
 4. Click the ReLimiter install button on the game card.
 5. Launch the game. Open the ReShade overlay to access ReLimiter's settings panel.
 
-**Manual install:** Download `relimiter.addon64` from the [Releases](https://github.com/RankFTW/ReLimiter/releases) page and drop it next to the ReShade DLL in your game folder.
+**Manual install:** Download `relimiter.addon64` (or `relimiter.addon32` for a 32-bit game) from the [Releases](https://github.com/RankFTW/ReLimiter/releases) page and drop it next to the ReShade DLL in your game folder.
 
-📖 **[Full User Guide](docs/USER_GUIDE.md)** — comprehensive documentation covering every feature, setting, and INI option.
+📖 **[Full User Guide](docs/USER_GUIDE.md)** — documentation for every user-facing feature, setting, and INI key. Developer-only settings and diagnostics are in the [Developer Reference](docs/DEVELOPER_REFERENCE.md).
 
-## Adaptive Smoothing
+🔬 **[Frame Pacing](docs/FRAME_PACING.md)** — how the cadence grid, the lead and the output points work, with diagrams.
 
-Most frame limiters set a fixed target and hope every frame hits it. In practice, render times vary — a complex scene might take 9ms while a simple one takes 7ms. When a frame occasionally exceeds the target interval, you get a stutter.
+## Frame Pacing
 
-Adaptive Smoothing watches your actual render times and adjusts the FPS cap to a level your GPU can consistently maintain. For example, if your GPU can average 130 FPS but the slowest 1% of frames only manage 121, it sets the cap at 121 so every frame lands on time. When you move to an easier scene, it adapts back up. The result is fewer micro-stutters at the cost of a small FPS reduction you won't notice.
+ReLimiter paces every capped frame against one shared cadence. For each rendered frame it plans when the game is released and when the finished frame is passed on, and it chooses where the frame is held itself, from the game, API, display mode and frame-generation state: a GPU queue wait on 64-bit DX12 with native Reflex on VRR, a GPU wait on real frames with frame generation once that route qualifies, a CPU hold at the game's Present marker on other marker routes, or no hold on Present-based routes. In 64-bit Reflex games that call the Reflex Sleep, most of the wait happens inside that Sleep call, before the game reads input for the next frame, and ReLimiter's wait replaces the driver's Reflex Sleep while it paces the game. On the GPU queue wait, a release limit caps how far ahead of its target a frame is released: one frame interval plus a low quantile of the measured time to the next frame's heavy GPU work, minus a fixed 1 ms headroom (or, without NVIDIA Reflex latency reports, the time to the next Present call, minus a fixed 2.5 ms margin), so the frame's resume is less likely to queue behind that work. It needs measured samples and stands aside in games that run the next frame's GPU work behind the wait. Each frame is released early enough for 99% of recent frames plus 0.5 ms to reach their hold on time, trading a little latency for headroom against uneven frames. Late frames are never held, and after a stall the cadence restarts from the late frame instead of catching up with a burst.
 
-The percentile slider controls the tradeoff between smoothness and FPS. Higher values like P99 accommodate more of your worst-case frames, giving the smoothest result but a lower cap. Lower values like P50 set the cap closer to your average, keeping FPS higher but allowing more frames to miss their deadline. P99 is the default and recommended for most users.
-
-**Dual window mode** uses both a short (64-frame) and long (512-frame) sample window, taking the more conservative of the two. This means it reacts quickly to sudden performance drops (the short window catches them fast) but is slower to raise the cap back up (the long window holds the lower value until it's confident the improvement is sustained). Prevents the cap from bouncing up and down during scene transitions.
-
-DX12+Reflex only. Enable it in the Adaptive Smoothing section of the settings panel.
+The settings panel shows one plain pacing line and, under **Details**, the resolved mode, output point, reason, placement, lead and cadence epoch. **Pacing preference** (64-bit DX12) leans the pacer toward lower latency or more even frames; the default, **Balanced**, is the recommended behaviour.
 
 ## FPS Limiting
 
@@ -36,13 +34,13 @@ Set a target FPS in the settings panel. **VRR Cap** automatically calculates the
 
 ## VSync Override
 
-Force VSync off (recommended when using the frame limiter), force it on, or leave it at whatever the game sets. Works on DX11, DX12, and OpenGL.
+Force VSync off (recommended when using the frame limiter), force it on, or leave it at whatever the game sets. Applies to DX11, DX12 and OpenGL games.
 
 ## Frame Generation
 
 ReLimiter detects DLSS Frame Generation automatically and adjusts pacing to match. The OSD shows the current FG mode and multiplier.
 
-**Dynamic MFG** — For DLSS 4.5 Dynamic Multi-Frame Generation, enable DMFG Compatibility in the settings. ReLimiter hands pacing to the driver while continuing to provide OSD and telemetry. Use the Output Cap slider to limit display FPS to your VRR ceiling.
+**Dynamic MFG** — For DLSS 4.5 Dynamic Multi-Frame Generation, ReLimiter detects the driver profile and hands pacing to the driver (passthrough) while continuing to provide OSD and telemetry. Set the output target through RHI, the NVIDIA App or Profile Inspector. `dynamic_mfg_passthrough=true` in the INI forces passthrough if detection misses a game.
 
 **NVIDIA Smooth Motion** is also detected and handled automatically.
 
@@ -52,8 +50,8 @@ The OSD shows real-time stats organized by category:
 
 - **Performance** — FPS, 1% Low, 0.1% Low, Frametime, Frametime Graph
 - **Latency** — CPU Latency, GPU Render Time, Total Frame Cost, FG Time
-- **Quality** — PQI (Pacing Quality Index) with optional breakdown, Smoothness
-- **Pipeline** — Frame Generation status, Limiter tier, Adaptive Smoothing
+- **Quality** — Jitter (the average change from one frame interval to the next), Frame Pacing (frame time, jitter, hitches and animation error over the last 5 seconds, measured on displayed frames from ETW PC Latency timing, DXGI frame statistics or ReLimiter's flip gate, or on the real frames entering frame generation where hardware flip metering places the generated ones)
+- **Pipeline** — Frame Generation status, time added by the limiter
 - **System** — GPU Temp, GPU Clock, GPU Usage, VRAM, CPU Usage, RAM
 
 Toggle the OSD on/off with the keybind (default: PageUp). Every element can be individually enabled or disabled in the settings panel.
@@ -70,19 +68,21 @@ Move the game window between monitors, switch between windowed/borderless/fullsc
 
 ## Advanced
 
-- **Inject Reflex Markers** — Synthesizes NVIDIA Reflex markers for non-Reflex games, enabling driver-side pacing and GPU clock boost.
+- **Inject Reflex Markers** — Synthesizes NVIDIA Reflex markers for non-Reflex games (64-bit addon), enabling driver-side pacing and GPU clock boost.
 - **Flip Model Override** — Forces DX11 games from bitblt to flip model presentation for true VRR operation. May break some games. Requires restart.
-- **Telemetry Logging** — Records per-frame CSV data for analysis. Toggle in-game with the CSV hotkey (default: F11).
+- **Pacing diagnostics** — Developer controls for comparison captures, shown only with `developer_settings=true`: the pacing test mode (`reflex_only` paces nothing and leaves the game's own Reflex running; `driver_limiter` hands the cap to the Reflex driver limiter where it can apply, otherwise the game runs as it is), GPU Wait Probes and flip metering. Leave them at their defaults for normal play.
+- **Telemetry Logging** — Records a per-frame pacing CSV (`relimiter_pacing_*`) and a pacing event CSV (`relimiter_pacing_events_*`) for offline analysis, including each frame's plan, output point and display time. PC Latency is included when native PC Latency measurement is enabled.
 - **Advanced Logging** — Switches the log file to info-level for troubleshooting.
 
-## Supported APIs
+## Supported Configurations
 
-| API | Enforcement | Notes |
+| Game | What paces | Status |
 |---|---|---|
-| DX12 | Reflex markers | Full feature set including Adaptive Smoothing and Reflex timing |
-| DX11 | Present-based | Flip Model Override available |
-| Vulkan | Present-based or Streamline PCL | |
-| OpenGL | Present-based | VSync override may not work in all games |
+| 64-bit DirectX 12 with NVIDIA Reflex | The queue-based pacer: the Reflex Sleep wait, the GPU queue wait (VRR, no frame generation) or the FG input wait (static frame generation) once qualified | Supported and tested |
+| 64-bit, another API with Reflex markers (DX11 with Reflex, Vulkan with Streamline PCL markers) | The same pacer without the queue-based law; a CPU hold at the Present marker, nothing held with frame generation | Untested |
+| 64-bit without Reflex markers, and every 32-bit game (`relimiter.addon32`) | A plain frame-rate cap at the Present call; nothing is held after it | Fallback: retained and covered by unit tests, not yet validated in a game |
+
+Nothing validates DirectX 11, Vulkan, OpenGL, DirectX 9 or 32-bit pacing. The 32-bit addon paces at Present calls only: no Reflex hooks, frame generation or GPU waits.
 
 ## DLSS Info on OSD
 
@@ -98,22 +98,28 @@ Replacing the game's DLSS DLLs with newer versions (e.g. dropping an updated `nv
 ## Known Limitations
 
 - GPU hardware monitoring (temp, clock, usage, VRAM) is NVIDIA only
-- Adaptive Smoothing and Reflex timing metrics (GPU Render, Frame Cost, FG Time) require DX12 + Reflex
+- The GPU queue wait and FG input wait require the 64-bit addon, DX12 and native Reflex markers, and the GPU queue wait without frame generation also needs a VRR display; other games use a CPU marker hold or no output hold
+- Only 64-bit DX12 with Reflex has been tested live with the 4.0 pacing core. Not tested: the Present-based fallback (games without Reflex, all 32-bit games), DX11, Vulkan and OpenGL games, fixed-refresh (non-VRR) displays and Dynamic MFG
+- With frame generation on Vulkan, frames are not held after the cap's source wait (the FG input wait needs DX12)
 - Global DLSS DLL overrides (via NVCP/NVPI) may not be read correctly — replace DLLs in the game folder instead
 - Global DLSS preset overrides won't appear on the OSD — set presets per-game in the NVIDIA App or Profile Inspector
-- Some older Vulkan titles may not work
+- Telemetry Logging writes frame rows only in DXGI games (DX10, DX11, DX12)
 - OpenGL VSync override depends on how the game manages swap intervals
 
 ## Building From Source
 
-Requires Visual Studio 2022+, CMake 3.20+. Dependencies are included as git submodules.
+Requires Visual Studio 2022 or later (C++20) and CMake 3.20 or later. Dependencies are included as git submodules.
 
 ```
 git clone --recursive https://github.com/RankFTW/ReLimiter.git
-build.bat
+cd ReLimiter
+cmake -B build -A x64
+cmake --build build --config Release
+cmake -B build32 -A Win32
+cmake --build build32 --config Release
 ```
 
-Output: `build/bin/Release/relimiter.addon64`
+Output: `build/bin/Release/relimiter.addon64` and `build32/bin/Release/relimiter.addon32`. `build.bat` (`build.bat all` for both) runs the same steps with the CMake bundled with Visual Studio 2026.
 
 ## License
 

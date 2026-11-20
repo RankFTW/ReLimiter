@@ -1,6 +1,8 @@
 #include "fg_divisor.h"
+#include "fg_divisor_policy.h"
 #include "streamline_hooks.h"
 #include "dlss_presets.h"
+#include "feedback.h"
 #include "wake_guard.h"
 #include "logger.h"
 #include <Windows.h>
@@ -38,37 +40,30 @@ static double SmoothTransition(double current, double target) {
 }
 
 int ComputeFGDivisorRaw() {
-    // NVIDIA Smooth Motion: always 2x (one generated frame per rendered frame).
-    if (IsNvSmoothMotionActive())
-        return 2;
-
     bool presenting = g_fg_presenting.load(std::memory_order_relaxed);
     int mult = g_fg_multiplier.load(std::memory_order_relaxed);
     int actual = g_fg_actual_multiplier.load(std::memory_order_relaxed);
+    const bool streamline_has_mode_data = Streamline_HasModeData();
     int mode = g_fg_mode.load(std::memory_order_relaxed);
 
     // Driver-forced MFG override (from NVIDIA Profile Inspector / NVIDIA App).
     // DRS setting 0x104D6667: 0=app-controlled, 1=2x, 2=3x, 3=4x, 4=5x, 5=6x.
-    // When non-zero and FG is presenting, this overrides all other multiplier sources.
+    // When presenting, a higher nonzero profile multiplier overrides lower
+    // Streamline runtime/configured observations.
     DLSSPresets presets = DLSSPresets_Get();
-    if (presets.available && presets.mfg_generation_factor > 0 && presenting) {
-        int drs_mult = presets.mfg_generation_factor + 1;  // 1→2x, 4→5x
-        // Use DRS value when it exceeds what the API reports (driver override active)
-        if (drs_mult > actual && drs_mult > (mult + 1))
-            return drs_mult;
-    }
-
-    // Best signal: GetState confirms frames are actually being produced.
-    if (presenting && actual >= 2)
-        return actual;
-
-    // Proactive hook path: SetOptions provided multiplier AND mode is On.
-    // Only trust mult when mode confirms FG is active (avoids false positive
-    // where mult=1 but FG is off — Forza reports FG configured even when off).
-    if (presenting && mult > 0 && mode > 0)
-        return mult + 1;
-
-    return 1;
+    return FrameGeneration_SelectDivisor(
+        IsNvSmoothMotionActive(),
+        presenting,
+        mult,
+        actual,
+        presets.available,
+        presets.mfg_generation_factor,
+        streamline_has_mode_data,
+        mode,
+        GetCurrentReflexAiFrameTimeUs(),
+        // The published effective state came from Streamline's in-band statement: its multiplier decides.
+        Streamline_StatementAuthority(),
+        actual);
 }
 
 double ComputeFGDivisor() {

@@ -2,8 +2,7 @@
 #include "display_state.h"
 #include "swapchain_manager.h"
 #include "wake_guard.h"
-#include "pll.h"
-#include <thread>
+#include "runtime_lifecycle.h"
 
 // NTSTATUS not defined by default with WIN32_LEAN_AND_MEAN
 #ifndef _NTDEF_
@@ -51,8 +50,20 @@ static bool ResolveD3DKMT() {
 
 // ── Thread state ──
 static std::atomic<bool> s_vblank_running{false};
-static std::thread s_vblank_thread;
+static HANDLE s_vblank_thread = nullptr;
 static int64_t s_last_vblank_qpc = 0;
+static std::atomic<int64_t> s_latest_vblank_qpc{0};
+static SRWLOCK s_vblank_lifecycle_lock = SRWLOCK_INIT;
+
+class VBlankLifecycleLock {
+public:
+    VBlankLifecycleLock() noexcept {
+        AcquireSRWLockExclusive(&s_vblank_lifecycle_lock);
+    }
+    ~VBlankLifecycleLock() {
+        ReleaseSRWLockExclusive(&s_vblank_lifecycle_lock);
+    }
+};
 
 static void OnVBlank(int64_t ts) {
     if (s_last_vblank_qpc != 0) {
@@ -62,13 +73,12 @@ static void OnVBlank(int64_t ts) {
         g_estimated_refresh_us.store(current, std::memory_order_relaxed);
     }
     s_last_vblank_qpc = ts;
-
-    // Feed PLL in Fixed mode
-    if (g_pacing_mode.load(std::memory_order_relaxed) == PacingMode::Fixed)
-        g_pll.IngestVBlank(ts);
+    // The worker never mutates PLL state. The scheduler owner consumes this
+    // single-slot mailbox and performs all PLL updates.
+    s_latest_vblank_qpc.store(ts, std::memory_order_release);
 }
 
-static void VBlankThreadProc() {
+static void VBlankThreadImpl() {
     // Seed estimated_refresh_us from static ceiling before first vblank
     double ceiling = g_ceiling_interval_us.load(std::memory_order_relaxed);
     g_estimated_refresh_us.store(ceiling, std::memory_order_relaxed);
@@ -99,7 +109,7 @@ static void VBlankThreadProc() {
     wb.hDevice = 0;
     wb.VidPnSourceId = oa.VidPnSourceId;
 
-    // Set thread priority to TIME_CRITICAL per spec §IV.1
+    // Set thread priority to TIME_CRITICAL
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
     while (s_vblank_running.load(std::memory_order_relaxed)) {
@@ -143,21 +153,60 @@ static void VBlankThreadProc() {
         s_CloseAdapter(&oa.hAdapter);
 }
 
-void StartVBlankThread() {
-    if (s_vblank_running.load(std::memory_order_relaxed)) return; // already running
-    s_vblank_running.store(true, std::memory_order_relaxed);
-    s_vblank_thread = std::thread(VBlankThreadProc);
+static DWORD WINAPI VBlankThreadProc(LPVOID) noexcept {
+    __try { VBlankThreadImpl(); }
+    __except(EXCEPTION_EXECUTE_HANDLER) {
+        OutputDebugStringA("ReLimiter: vblank worker rejected a driver fault.\n");
+    }
+    s_vblank_running.store(false, std::memory_order_release);
+    return 0;
 }
 
-void StopVBlankThread() {
-    s_vblank_running.store(false, std::memory_order_relaxed);
-    if (s_vblank_thread.joinable())
-        s_vblank_thread.join();
+void StartVBlankThread() {
+    VBlankLifecycleLock lifecycle_lock;
+    if (RuntimeLifecycle_IsStopping() || !SwapMgr_GetHWND()) return;
+    if (s_vblank_thread) {
+        if (WaitForSingleObject(s_vblank_thread, 0) != WAIT_OBJECT_0) return;
+        CloseHandle(s_vblank_thread);
+        s_vblank_thread = nullptr;
+    }
+    bool expected = false;
+    if (!s_vblank_running.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) return;
+    s_vblank_thread = CreateThread(
+        nullptr, 0, VBlankThreadProc, nullptr, 0, nullptr);
+    if (!s_vblank_thread)
+        s_vblank_running.store(false, std::memory_order_release);
+}
+
+bool StopVBlankThread() {
+    VBlankLifecycleLock lifecycle_lock;
+    s_vblank_running.store(false, std::memory_order_release);
+    if (s_vblank_thread) {
+        if (WaitForSingleObject(s_vblank_thread, 2500) != WAIT_OBJECT_0) {
+            OutputDebugStringA(
+                "ReLimiter: vblank worker did not stop; state retained.\n");
+            return false;
+        }
+        CloseHandle(s_vblank_thread);
+        s_vblank_thread = nullptr;
+    }
     s_last_vblank_qpc = 0;
+    s_latest_vblank_qpc.store(0, std::memory_order_release);
+    return true;
 }
 
 bool IsVBlankThreadRunning() {
-    return s_vblank_running.load(std::memory_order_relaxed);
+    return s_vblank_running.load(std::memory_order_acquire);
+}
+
+bool VBlank_ConsumeLatest(int64_t* timestamp_qpc) noexcept {
+    if (!timestamp_qpc) return false;
+    const int64_t timestamp =
+        s_latest_vblank_qpc.exchange(0, std::memory_order_acq_rel);
+    if (timestamp <= 0) return false;
+    *timestamp_qpc = timestamp;
+    return true;
 }
 
 void UpdateVBlankThreadForMode(PacingMode mode) {
@@ -166,7 +215,8 @@ void UpdateVBlankThreadForMode(PacingMode mode) {
         if (!IsVBlankThreadRunning())
             StartVBlankThread();
     } else {
-        // VRR mode: CadenceMeter handles refresh estimation from DXGI stats.
+        // VRR mode: the grid needs no vblank reference and
+        // g_estimated_refresh_us keeps the display-state ceiling seed.
         // Stop the vblank thread to avoid redundant kernel-mode waits.
         if (IsVBlankThreadRunning())
             StopVBlankThread();

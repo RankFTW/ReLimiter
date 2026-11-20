@@ -1,11 +1,20 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+
+// One resolved FG state per frame:
+// the raw divisor the scheduler resolved for its newest frame (1 without
+// FG). The OSD and frame splitting read it instead of recomputing. Written
+// by the scheduler owner; any thread reads.
+inline std::atomic<int> g_resolved_fg_divisor{1};
 
 // FG divisor computation with smooth transition.
 // ComputeFGDivisorRaw: returns the effective FG multiplier (1 when inactive,
-// 2+ when FG is confirmed active). Multi-path priority: DRS driver override,
-// GetState actual multiplier, NV Smooth Motion detection.
+// 2+ when FG is confirmed active). Multi-path priority: NV Smooth Motion,
+// DRS driver override, GetState actual multiplier, configured Streamline
+// state, then conservative positive Reflex AI evidence when Streamline has not
+// explicitly reported FG off.
 // ComputeFGDivisor: applies SmoothTransition (linear ramp over 50ms wall-clock).
 
 #ifdef _WIN64

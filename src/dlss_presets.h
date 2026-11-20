@@ -1,7 +1,7 @@
 #pragma once
 
-// DLSS preset override query via NvAPI_NGX_GetNGXOverrideState.
-// Polls every 5 seconds. Returns preset letters for SR/RR/FG.
+// Driver profile overrides. Once first requested by the UI, the MFG mode
+// and factor also feed pacing and must stay current even if the UI closes.
 
 struct DLSSPresets {
     char sr[8];  // e.g. "M", "-", "A", "Auto"
@@ -11,12 +11,15 @@ struct DLSSPresets {
     int mfg_generation_factor;  // DRS 0x104D6667: 0=app-controlled, 1=2x, 2=3x, 3=4x, 4=5x, 5=6x
     int mfg_mode_override;      // DRS 0x10308298: 0=Off, 2=Fixed, 4=Dynamic
     int mfg_dynamic_target_fps; // DRS 0x10CF4125: 0=Off, 0x01000000=Max Refresh, or raw FPS
-    int gsync_requested_state;  // DRS 0x10A879AC: 0=Allow, 1=Force Off, 2=Disallow, 3=ULMB, 4=Fixed Refresh
 };
 
 #ifdef _WIN64
-void DLSSPresets_Init();
-void DLSSPresets_Poll();  // Call periodically (e.g. from OSD draw)
+void DLSSPresets_EnsureStarted();
+
+// Stop and join the worker. A later add-on lifetime may start it again.
+bool DLSSPresets_Shutdown();
+
+// Returns one coherent lock-free snapshot.
 DLSSPresets DLSSPresets_Get();
 
 // Write the Dynamic MFG Target FPS to the game's driver profile.
@@ -24,8 +27,8 @@ DLSSPresets DLSSPresets_Get();
 // Returns true on success.
 bool DLSSPresets_WriteDynamicTargetFPS(int fps);
 #else
-inline void DLSSPresets_Init() {}
-inline void DLSSPresets_Poll() {}
-inline DLSSPresets DLSSPresets_Get() { return {"", "", "", false, 0, 0, 0, 0}; }
+inline void DLSSPresets_EnsureStarted() {}
+inline bool DLSSPresets_Shutdown() { return true; }
+inline DLSSPresets DLSSPresets_Get() { return {"", "", "", false, 0, 0, 0}; }
 inline bool DLSSPresets_WriteDynamicTargetFPS(int) { return false; }
 #endif

@@ -1,236 +1,211 @@
 #include "correlator.h"
-#include "health.h"
-#include "wake_guard.h"
-#include "display_state.h"
+#include "swapchain_manager.h"
 #include "logger.h"
+
 #include <Windows.h>
 #include <dxgi.h>
 
+#include <array>
+#include <atomic>
+
 DXGIStatsSource g_correlator;
-IDXGISwapChain* g_stats_swapchain = nullptr;
-IDXGISwapChain* g_presenting_swapchain = nullptr;
-static bool s_stats_swapchain_is_unwrapped = false;
 
-// ── Streamline unwrap ──
-using slGetNativeInterface_pfn = int (*)(void* proxy, void** native);
+namespace
+{
+    std::atomic<uint64_t> s_legacy_swapchain{0};
+    std::atomic<uint64_t> s_presenting_swapchain{0};
+    std::atomic<uint64_t> s_publication_sequence{0};
+    std::atomic<uint32_t> s_publication_readers{0};
+    SRWLOCK s_publication_writer_lock = SRWLOCK_INIT;
 
-static IDXGISwapChain* TryStreamlineUnwrap(IDXGISwapChain* sc) {
-    // DISABLED: Streamline unwrap causes reference count inconsistency
-    // that prevents proper swapchain teardown, leading to E_ACCESSDENIED
-    // on swapchain recreation and Streamline crash in sl.common.dll.
-    // The old correlator never unwrapped — stats work fine without it.
-    return nullptr;
+    constexpr size_t kRetiredSwapchainCapacity = 256;
+    std::array<IUnknown*, kRetiredSwapchainCapacity> s_retired_swapchains{};
+    SRWLOCK s_retired_lock = SRWLOCK_INIT;
 
-    static HMODULE sl_mod = nullptr;
-    static slGetNativeInterface_pfn sl_func = nullptr;
-    static bool sl_checked = false;
-
-    if (!sl_checked) {
-        sl_checked = true;
-        sl_mod = GetModuleHandleW(L"sl.interposer.dll");
-        if (sl_mod) {
-            sl_func = reinterpret_cast<slGetNativeInterface_pfn>(
-                GetProcAddress(sl_mod, "slGetNativeInterface"));
-            if (sl_func)
-                LOG_INFO("Streamline unwrap function resolved");
-            else
-                LOG_INFO("Streamline loaded but slGetNativeInterface not found");
-        }
-    }
-
-    if (!sl_func) return nullptr;
-
-    void* native = nullptr;
-    if (sl_func(sc, &native) == 0 && native && native != sc) {
-        IDXGISwapChain* real_sc = nullptr;
-        IUnknown* unk = static_cast<IUnknown*>(native);
-        if (SUCCEEDED(unk->QueryInterface(__uuidof(IDXGISwapChain),
-                                           reinterpret_cast<void**>(&real_sc)))) {
-            LOG_INFO("Streamline unwrap: proxy=%p -> real=%p", sc, real_sc);
-            // Keep the AddRef from QueryInterface — caller's lifetime is
-            // tied to the swapchain. Released in OnSwapchainDestroyed.
-            return real_sc;
-        }
-    }
-
-    return nullptr;
-}
-
-// ── IDXGIOutput fallback ──
-static IDXGIOutput* TryGetOutput(IDXGISwapChain* sc) {
-    if (!sc) return nullptr;
-    IDXGIOutput* output = nullptr;
-    if (SUCCEEDED(sc->GetContainingOutput(&output)) && output)
-        return output;
-    return nullptr;
-}
-
-// ── Resolution: find a source that responds to GetFrameStatistics ──
-IDXGISwapChain* TryResolveStatsSwapchain() {
-    IDXGISwapChain* sc = g_presenting_swapchain ? g_presenting_swapchain : g_swapchain;
-    if (!sc) return nullptr;
-
-    // 1. Try the presenting swapchain directly
+    bool SafeAddRef(IUnknown* object) noexcept
     {
-        DXGI_FRAME_STATISTICS test = {};
-        HRESULT hr = sc->GetFrameStatistics(&test);
-        if (SUCCEEDED(hr)) {
-            LOG_INFO("Stats resolved: presenting swapchain %p works directly", sc);
-            g_stats_swapchain = sc;
-            s_stats_swapchain_is_unwrapped = false;
-            g_correlator.use_output_stats = false;
-            g_correlator.resolved = true;
-            return sc;
+        if (!object) return false;
+        __try {
+            object->AddRef();
+            return true;
         }
-        LOG_INFO("Presenting swapchain %p GetFrameStatistics failed hr=0x%08X, trying unwrap",
-                 sc, hr);
+        __except(EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
     }
 
-    // 2. Try Streamline unwrap
-    IDXGISwapChain* unwrapped = TryStreamlineUnwrap(sc);
-    if (unwrapped) {
-        DXGI_FRAME_STATISTICS test = {};
-        HRESULT hr = unwrapped->GetFrameStatistics(&test);
-        if (SUCCEEDED(hr)) {
-            LOG_INFO("Stats resolved: unwrapped swapchain %p works", unwrapped);
-            g_stats_swapchain = unwrapped;
-            s_stats_swapchain_is_unwrapped = true;
-            g_correlator.use_output_stats = false;
-            g_correlator.resolved = true;
-            return unwrapped;
-        }
-        LOG_INFO("Unwrapped swapchain %p GetFrameStatistics failed hr=0x%08X, trying output",
-                 unwrapped, hr);
+    void SafeRelease(IUnknown* object) noexcept
+    {
+        if (!object) return;
+        __try { object->Release(); }
+        __except(EXCEPTION_EXECUTE_HANDLER) { }
     }
 
-    // 3. Try IDXGIOutput::GetFrameStatistics (windowed flip-model fallback)
-    IDXGISwapChain* candidates[] = { unwrapped, sc };
-    for (auto* candidate : candidates) {
-        if (!candidate) continue;
-        IDXGIOutput* output = TryGetOutput(candidate);
-        if (output) {
-            DXGI_FRAME_STATISTICS test = {};
-            HRESULT hr = output->GetFrameStatistics(&test);
-            if (SUCCEEDED(hr)) {
-                LOG_INFO("Stats resolved: IDXGIOutput %p from swapchain %p works",
-                         output, candidate);
-                if (g_correlator.cached_output)
-                    g_correlator.cached_output->Release();
-                g_correlator.cached_output = output;
-                g_correlator.use_output_stats = true;
-                g_correlator.resolved = true;
-                g_stats_swapchain = candidate;
-                return candidate;
+    void TryDrainRetiredSwapchains() noexcept
+    {
+        if (s_publication_readers.load(std::memory_order_acquire) != 0) return;
+
+        std::array<IUnknown*, kRetiredSwapchainCapacity> retired{};
+        AcquireSRWLockExclusive(&s_retired_lock);
+        if (s_publication_readers.load(std::memory_order_acquire) == 0) {
+            retired = s_retired_swapchains;
+            s_retired_swapchains.fill(nullptr);
+        }
+        ReleaseSRWLockExclusive(&s_retired_lock);
+
+        // COM Release is intentionally outside every ReLimiter lock. A proxy
+        // may reenter swapchain lifecycle code from its final release.
+        for (IUnknown* object : retired) SafeRelease(object);
+    }
+
+    void RetireSwapchain(IUnknown* object) noexcept
+    {
+        if (!object) return;
+        bool retained = false;
+        AcquireSRWLockExclusive(&s_retired_lock);
+        for (IUnknown*& slot : s_retired_swapchains) {
+            if (!slot) {
+                slot = object;
+                retained = true;
+                break;
             }
-            output->Release();
         }
+        ReleaseSRWLockExclusive(&s_retired_lock);
+        if (!retained) {
+            // Do not release beneath an announced reader. The fixed queue is
+            // intentionally generous; overflow leaks one COM ref until process
+            // exit rather than risking a use-after-release.
+            OutputDebugStringA("ReLimiter: correlator retired-ref queue overflow.\n");
+            return;
+        }
+        TryDrainRetiredSwapchains();
     }
 
-    static int s_stats_fail_log_count = 0;
-    if (s_stats_fail_log_count < 3)
-        LOG_WARN("Stats resolution failed: no source responds to GetFrameStatistics");
-    else if (s_stats_fail_log_count == 3)
-        LOG_WARN("Stats resolution failed: suppressing further warnings");
-    s_stats_fail_log_count++;
-    // If we unwrapped but didn't store it, release the AddRef
-    if (unwrapped && unwrapped != g_stats_swapchain) {
-        unwrapped->Release();
+    bool PublishSwapchain(
+        std::atomic<uint64_t>* destination,
+        IDXGISwapChain* swapchain) noexcept
+    {
+        // Already published: no AddRef/Release, no writer lock, no sequence bump (this runs on every
+        // Present). The destination owns a reference to the published swapchain, so the object cannot
+        // have been destroyed and its address reused while it is published: an equal pointer is the
+        // same object, and the comparison is the result the locked path below reaches for it
+        // (previous == published, nothing to retire). A concurrent replacement or retirement is
+        // ordered after this call, as it would be behind the writer lock. A different or null
+        // pointer takes the locked path, where AddRef validates the incoming object.
+        if (swapchain &&
+            destination->load(std::memory_order_acquire) == reinterpret_cast<uint64_t>(swapchain))
+            return false;
+        IDXGISwapChain* published = swapchain;
+        if (published && !SafeAddRef(published)) published = nullptr;
+
+        AcquireSRWLockExclusive(&s_publication_writer_lock);
+        uint64_t sequence =
+            s_publication_sequence.load(std::memory_order_relaxed);
+        if ((sequence & 1u) != 0) ++sequence;
+        s_publication_sequence.store(sequence + 1, std::memory_order_release);
+        IDXGISwapChain* previous = reinterpret_cast<IDXGISwapChain*>(
+            destination->load(std::memory_order_relaxed));
+        if (previous == published) {
+            s_publication_sequence.store(sequence + 2, std::memory_order_release);
+            ReleaseSRWLockExclusive(&s_publication_writer_lock);
+            SafeRelease(published);
+            return false;
+        }
+        destination->store(
+            reinterpret_cast<uint64_t>(published),
+            std::memory_order_relaxed);
+        s_publication_sequence.store(sequence + 2, std::memory_order_release);
+        ReleaseSRWLockExclusive(&s_publication_writer_lock);
+
+        RetireSwapchain(previous);
+        return true;
+    }
+
+    HRESULT SafeQueryFrameStatistics(
+        IDXGISwapChain* swapchain,
+        DXGI_FRAME_STATISTICS* stats) noexcept
+    {
+        if (!swapchain || !stats) return E_INVALIDARG;
+        __try { return swapchain->GetFrameStatistics(stats); }
+        __except(EXCEPTION_EXECUTE_HANDLER) { return E_FAIL; }
+    }
+}
+
+void Correlator_SetLegacySwapchain(IDXGISwapChain* swapchain) noexcept
+{
+    PublishSwapchain(&s_legacy_swapchain, swapchain);
+    if (swapchain)
+        g_correlator.permanently_disabled.store(false, std::memory_order_release);
+}
+
+bool Correlator_SetPresentingSwapchain(IDXGISwapChain* swapchain) noexcept
+{
+    const bool changed = PublishSwapchain(&s_presenting_swapchain, swapchain);
+    if (swapchain)
+        g_correlator.permanently_disabled.store(false, std::memory_order_release);
+    if (changed) {
+        LOG_INFO(
+            "DXGIStatsSource: presenting swapchain changed to %p (stats local)",
+            swapchain);
+    }
+    return changed;
+}
+
+IDXGISwapChain* Correlator_AcquireSwapchain() noexcept
+{
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const uint64_t before =
+            s_publication_sequence.load(std::memory_order_acquire);
+        if ((before & 1u) != 0) continue;
+        s_publication_readers.fetch_add(1, std::memory_order_acq_rel);
+        if (before != s_publication_sequence.load(std::memory_order_acquire)) {
+            s_publication_readers.fetch_sub(1, std::memory_order_release);
+            TryDrainRetiredSwapchains();
+            continue;
+        }
+
+        IDXGISwapChain* swapchain = reinterpret_cast<IDXGISwapChain*>(
+            s_presenting_swapchain.load(std::memory_order_relaxed));
+        if (!swapchain) {
+            swapchain = reinterpret_cast<IDXGISwapChain*>(
+                s_legacy_swapchain.load(std::memory_order_relaxed));
+        }
+        if (swapchain && !SafeAddRef(swapchain)) swapchain = nullptr;
+        const uint64_t after =
+            s_publication_sequence.load(std::memory_order_acquire);
+        s_publication_readers.fetch_sub(1, std::memory_order_release);
+        TryDrainRetiredSwapchains();
+
+        if (swapchain && before == after && (after & 1u) == 0)
+            return swapchain;
+        SafeRelease(swapchain);
     }
     return nullptr;
 }
 
-// ── DXGIStatsSource methods ──
-
-HRESULT DXGIStatsSource::QueryFrameStatistics(DXGI_FRAME_STATISTICS& stats) {
-    if (permanently_disabled.load(std::memory_order_acquire))
-        return E_FAIL;
-
-    // Lazy resolution with backoff
-    if (!resolved) {
-        resolve_fail_count++;
-        if (resolve_fail_count >= 3) {
-            if (++resolve_backoff_counter < 60)
-                return E_FAIL;
-            resolve_backoff_counter = 0;
-        }
-        TryResolve();
-        if (!resolved) return E_FAIL;
-    }
-
-    __try {
-        // Re-check after capturing pointers — OnSwapchainDestroyed may have
-        // run between our first check and here, freeing the swapchain.
-        IDXGIOutput* output = cached_output;
-        if (use_output_stats && output) {
-            if (permanently_disabled.load(std::memory_order_acquire))
-                return E_FAIL;
-            return output->GetFrameStatistics(&stats);
-        }
-
-        IDXGISwapChain* sc = g_stats_swapchain;
-        if (!sc)
-            sc = g_presenting_swapchain ? g_presenting_swapchain : g_swapchain;
-        if (!sc) return E_FAIL;
-
-        if (permanently_disabled.load(std::memory_order_acquire))
-            return E_FAIL;
-
-        HRESULT hr = sc->GetFrameStatistics(&stats);
-        if (FAILED(hr)) {
-            resolved = false;
-            resolve_fail_count = 0;
-        }
-        return hr;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        LOG_WARN("DXGIStatsSource: SEH exception in QueryFrameStatistics (0x%08X), disabling",
-                 GetExceptionCode());
-        permanently_disabled.store(true, std::memory_order_relaxed);
+HRESULT Correlator_QuerySwapchainFrameStatistics(
+    DXGI_FRAME_STATISTICS* stats, uint64_t* native_swapchain) noexcept
+{
+    if (!stats || !native_swapchain) return E_INVALIDARG;
+    *native_swapchain = 0;
+    const ActiveAPI api = SwapMgr_GetActiveAPI();
+    if (g_correlator.permanently_disabled.load(std::memory_order_acquire) ||
+        !SwapMgr_IsValid() || (api != ActiveAPI::DX11 && api != ActiveAPI::DX12)) {
         return E_FAIL;
     }
+
+    IDXGISwapChain* swapchain = Correlator_AcquireSwapchain();
+    if (!swapchain) return E_FAIL;
+    *native_swapchain = reinterpret_cast<uint64_t>(swapchain);
+    const HRESULT result = SafeQueryFrameStatistics(swapchain, stats);
+    SafeRelease(swapchain);
+    return result;
 }
 
-bool DXGIStatsSource::IsStatsAvailable() {
-    DXGI_FRAME_STATISTICS test = {};
-    return SUCCEEDED(QueryFrameStatistics(test));
-}
-
-void DXGIStatsSource::TryResolve() {
-    TryResolveStatsSwapchain();
-}
-
-void DXGIStatsSource::OnPresentingSwapchainChanged() {
-    if (s_stats_swapchain_is_unwrapped && g_stats_swapchain) {
-        g_stats_swapchain->Release();
-        s_stats_swapchain_is_unwrapped = false;
-    }
-    g_stats_swapchain = nullptr;
-    use_output_stats = false;
-    if (cached_output) {
-        cached_output->Release();
-        cached_output = nullptr;
-    }
-    permanently_disabled.store(false, std::memory_order_relaxed);
-    resolved = false;
-    resolve_fail_count = 0;
-    resolve_backoff_counter = 0;
-
-    LOG_WARN("DXGIStatsSource: presenting swapchain changed to %p (stats deferred)",
-             g_presenting_swapchain);
-}
-
-void DXGIStatsSource::OnSwapchainDestroyed() {
+void DXGIStatsSource::OnSwapchainDestroyed()
+{
     permanently_disabled.store(true, std::memory_order_release);
-    if (s_stats_swapchain_is_unwrapped && g_stats_swapchain) {
-        g_stats_swapchain->Release();
-        s_stats_swapchain_is_unwrapped = false;
-    }
-    g_stats_swapchain = nullptr;
-    g_presenting_swapchain = nullptr;
-    use_output_stats = false;
-    if (cached_output) {
-        cached_output->Release();
-        cached_output = nullptr;
-    }
-    resolved = false;
-    LOG_INFO("DXGIStatsSource: swapchain destroyed, all DXGI pointers cleared");
+    PublishSwapchain(&s_presenting_swapchain, nullptr);
+    PublishSwapchain(&s_legacy_swapchain, nullptr);
+    LOG_INFO("DXGIStatsSource: swapchain destroyed, owned refs retired");
 }
