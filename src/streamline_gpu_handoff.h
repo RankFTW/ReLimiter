@@ -33,6 +33,8 @@ void StreamlineHandoff_Boundary(const StreamlineBoundaryEvidence&) noexcept;
 void StreamlineHandoff_Service(bool final = false) noexcept;
 bool StreamlineHandoff_ReleaseAfterRundown() noexcept;
 
+// The scope of one proxy Present. A Present with DXGI_PRESENT_TEST presents nothing: its scope only masks the calls
+// inside it, and takes no marker, claims nothing, records no admission and rejects no binding.
 class StreamlineInputScope {
 public:
     StreamlineInputScope(uint64_t proxy, UINT sync, UINT flags) noexcept;

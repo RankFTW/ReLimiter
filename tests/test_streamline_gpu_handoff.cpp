@@ -593,22 +593,65 @@ static void TestInbandFrameClaim() {
     Reset();
 
     // What already fails is not pending: object, interval, flags and policy answer as they did, here without a marker
-    // of the thread's own. A markerless nested Present ends its pending parent, once.
+    // of the thread's own. A test Present presents nothing and is not recorded at all. A markerless nested Present ends
+    // its pending parent, once.
     seen = Seen();
     { StreamlineInputScope scope(0,0,0); CHECK(!scope.pending && LastFailure("proxy_vtable_mismatch")); }
     { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),5,0); CHECK(!scope.pending && LastFailure("invalid_sync_interval")); }
-    { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,DXGI_PRESENT_TEST); CHECK(!scope.pending && LastFailure("special_present_flags")); }
     { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,DXGI_PRESENT_DO_NOT_WAIT); CHECK(!scope.pending && LastFailure("special_present_flags")); }
+    { const auto tests = h::test_presents.load();
+        StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,DXGI_PRESENT_TEST);
+        CHECK(!scope.pending && StreamlineInputScope::Current() == &scope && h::test_presents == tests + 1); }
     g_fg_mode = 3; { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,0); CHECK(!scope.pending && !scope.input.transaction); }
     g_fg_mode = 1;
-    CHECK(Seen() == seen + 5);
+    CHECK(Seen() == seen + 4);
     { StreamlineInputScope outer(reinterpret_cast<uint64_t>(&proxy),0,0);
         CHECK(outer.pending);
         StreamlineInputScope inner(reinterpret_cast<uint64_t>(&proxy),0,0);
         CHECK(outer.invalid && !outer.pending && !inner.pending && !inner.input.transaction);
         StreamlineHandoff_RecordInbandFrame(4,1);                    // the nested scope is current: nothing to claim
         CHECK(!outer.claimed_frame && !inner.claimed_frame); }
-    CHECK(Seen() == seen + 7);                                       // the nested Present and its parent, once each
+    CHECK(Seen() == seen + 6);                                       // the nested Present and its parent, once each
+    Reset();
+}
+
+// 007 First Light: the render thread sends PRESENT_START, asks a test Present (DXGI_PRESENT_TEST), then presents. The
+// test Present leaves the thread's marker to the Present that follows, claims nothing, is not recorded and rejects no
+// tracked binding, so the route stays qualified; a Present that claims its marker by in-band id is not disturbed either.
+static void TestTestPresentLeavesMarker() {
+    Warm();
+    const auto binding = h::epoch.load();
+    const auto prior_begins = begins;
+    const auto tests = h::test_presents.load();
+    for (unsigned i = 0; i < 2; ++i) {
+        Marker(); const auto value = frame;
+        const auto seen = Seen();
+        { StreamlineInputScope test(reinterpret_cast<uint64_t>(&proxy),source_sync,DXGI_PRESENT_TEST);
+            StreamlineHandoff_RecordInbandFrame(4,value);            // an id inside the test Present claims nothing
+            CHECK(!test.pending && !test.claimed_frame && !test.input.transaction);
+            test.Complete(S_OK); }
+        CHECK(Seen() == seen && h::marker.input.source == value && StreamlineHandoff_IsCurrent(binding));
+        { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),source_sync,0);
+            CHECK(!scope.pending && scope.claimed_frame == value && scope.input.source == value && scope.input.transaction);
+            CHECK(Fence(&a,&forward_fence,value,0x110,true) == S_OK);
+            CHECK(Fence(&a,&back_fence,value+10000,0x120,false) == S_OK);
+            scope.Complete(S_OK); }
+        std::thread worker([=]{Worker(value);}); worker.join();
+        StreamlineHandoff_Service();
+        CHECK(h::route.cycle.complete && StreamlineHandoff_IsCurrent(binding));
+    }
+    CHECK(begins == prior_begins + 2 && h::test_presents == tests + 2);
+    Reset();
+
+    const auto elsewhere = MarkerElsewhere(1);
+    { StreamlineInputScope test(reinterpret_cast<uint64_t>(&proxy),source_sync,DXGI_PRESENT_TEST);
+        StreamlineHandoff_RecordInbandFrame(4,elsewhere);
+        CHECK(!test.pending && !test.claimed_frame); }
+    const auto claims = h::inband_claims.load();
+    PresentFrame(elsewhere);
+    CHECK(h::inband_claims == claims + 1);
+    { std::thread worker([=]{Worker(elsewhere);}); worker.join(); }
+    StreamlineHandoff_Service();
     Reset();
 }
 
@@ -703,6 +746,7 @@ int main() {
     TestMaintenanceWorkerOverlap();
     TestMaintenanceInvalidationInFlight();
     TestInbandFrameClaim();
+    TestTestPresentLeavesMarker();
     // Diagnostic snapshots and opportunistic maintenance never revoke a healthy
     // binding merely because they cannot acquire its observation lock.
     Warm(); const auto stable_binding = h::epoch.load();
@@ -983,11 +1027,16 @@ int main() {
         StreamlineHandoff_Service(); CHECK(!h::route.epoch);
         source_sync = 1; Warm(); Reset();
     }
+    // DO_NOT_WAIT may present a frame without the route's input, so it revokes the binding. A test Present presents
+    // nothing: the binding stays and the frame's marker is left to the Present that follows (TestTestPresentLeavesMarker).
     for (const auto flags : {DXGI_PRESENT_TEST,DXGI_PRESENT_DO_NOT_WAIT}) {
         source_sync = 1; Warm(); const auto previous_begins = begins;
+        const bool test = flags == DXGI_PRESENT_TEST;
         Marker(); { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),1,flags);
-            CHECK(!scope.input.transaction && !h::authorized); scope.Complete(S_OK); }
-        CHECK(begins == previous_begins); Reset();
+            CHECK(!scope.input.transaction && (h::authorized != 0) == test); scope.Complete(S_OK); }
+        CHECK(begins == previous_begins && (h::marker.input.source == frame) == test);
+        h::marker = {};
+        Reset();
     }
     // Module/telemetry alone, missing/stale/foreign marker, dynamic mode, nested/special
     // Present, and wrong source site never authorize an insertion.

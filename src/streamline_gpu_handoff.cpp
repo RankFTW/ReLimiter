@@ -144,6 +144,9 @@ thread_local uint64_t marker_sequence = 0;
 // the same Present that equals the claimed frame or not (counters only: a claim is never changed by them).
 std::atomic<uint64_t> inband_claims{0}, inband_unknown{0}, inband_late{0}, inband_absent{0}, inband_match{0},
     inband_mismatch{0};
+// Proxy Presents with DXGI_PRESENT_TEST: they present nothing, so their scope takes no marker, records no admission and
+// rejects no binding (StreamlineInputScope). Counted for the admission report only.
+std::atomic<uint64_t> test_presents{0};
 unsigned long long Counted(const std::atomic<uint64_t>& counter) noexcept { return counter.load(std::memory_order_relaxed); }
 struct WorkerScope { uint64_t epoch = 0, transaction = 0; ID3D12CommandQueue* queue = nullptr; };
 thread_local WorkerScope worker_scope;
@@ -213,9 +216,9 @@ void ReportAdmission(bool final) noexcept {
              "queue_unready=%llu fg_queue_unready=%llu identity=%llu",
         route.seen, route.pending, route.invalid_input, route.stale_binding, route.queue_missing,
         route.queue_unready, route.fg_unready, route.identity);
-    LOG_INFO("Streamline GPU: in-band frame claims=%llu unknown=%llu late=%llu absent=%llu match=%llu mismatch=%llu",
+    LOG_INFO("Streamline GPU: in-band frame claims=%llu unknown=%llu late=%llu absent=%llu match=%llu mismatch=%llu test_presents=%llu",
         Counted(inband_claims), Counted(inband_unknown), Counted(inband_late), Counted(inband_absent),
-        Counted(inband_match), Counted(inband_mismatch));
+        Counted(inband_match), Counted(inband_mismatch), Counted(test_presents));
     const char* names[] = {"marker", "present", "fence_attribution"};
     AdmissionStage* stages[] = {&marker_admission, &present_admission, &fence_admission};
     for (unsigned i = 0; i < 3; ++i) {
@@ -861,6 +864,15 @@ StreamlineInputScope::StreamlineInputScope(uint64_t object, UINT sync, UINT flag
     using namespace streamline_handoff;
     const DWORD error = GetLastError();
     current_ = this; // invalid and nested calls mask, never inherit, the parent
+    // DXGI_PRESENT_TEST presents nothing. 007 First Light asks one on its render thread between a frame's PRESENT_START
+    // and that frame's Present: when it took the thread's marker, the Present that followed had none, the frame id its
+    // in-band PRESENT_START named was already consumed (every claim unknown) and the route never qualified. The scope
+    // stays current, so calls inside it are masked as before, but it takes neither marker, claims nothing, records no
+    // admission and rejects no binding: it leaves everything to the Present that presents.
+    if (flags & DXGI_PRESENT_TEST) {
+        test_presents.fetch_add(1, std::memory_order_relaxed);
+        SetLastError(error); return;
+    }
     auto source = marker; marker = {};
     if (g_gpu_queue_probe.load(std::memory_order_relaxed) && !previous_) {
         // The probe's input of this outermost proxy Present: this thread's own marker (claimed, so no
@@ -898,13 +910,13 @@ StreamlineInputScope::StreamlineInputScope(uint64_t object, UINT sync, UINT flag
     // that an in-band PRESENT_START states on this thread (StreamlineHandoff_RecordInbandFrame) and claims that
     // frame's marker by it; no id, no claim. It is judged when the id comes, at its first fence call that reaches the
     // handoff, or when it ends (BeforeFence, RejectQueueMethods, the destructor).
-    if (!source.input.source && object && sync <= 4 && !(flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_WAIT)) && !policy) {
+    if (!source.input.source && object && sync <= 4 && !(flags & DXGI_PRESENT_DO_NOT_WAIT) && !policy) {
         proxy = object; pending = true;
         SetLastError(error); return;
     }
-    if (!object || sync > 4 || (flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_WAIT)) || !source.input.source || policy) {
+    if (!object || sync > 4 || (flags & DXGI_PRESENT_DO_NOT_WAIT) || !source.input.source || policy) {
         present_admission.Record(!object ? "proxy_vtable_mismatch" : sync > 4 ? "invalid_sync_interval" :
-            (flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_WAIT)) ? "special_present_flags" :
+            (flags & DXGI_PRESENT_DO_NOT_WAIT) ? "special_present_flags" :
             !source.input.source ? "missing_same_thread_marker" : policy);
         if (tracking.load(std::memory_order_acquire)) Reject(nullptr, "ineligible_present");
         SetLastError(error); return;
