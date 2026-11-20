@@ -1,30 +1,8 @@
 build/
 .kiro/
 logs/
-ENFORCEMENT_FALLBACK_REPORT.md
-LOCAL_CHANGES_VS_OPTIMIZATION_PASS.md
-deferred-fixes-1-2.md
-v3.1.5-fps-cap-fixes.md
-ds2-crash-investigation.md
-DMFG-Branch-Report.md
-
-dlss-preset-override-plan.md
-
-deferred-changes-1-2.md
-
-spike-investigation.md
 
 build32/
-
-adaptive-deviation-rejection-proposal.md
-
-nte-fg-investigation.md
-
-streamline-compat-report.md
-
-adaptive-smoothing-fix.md
-
-kiro-auto-knowledge-guide.md
 
 debug_data/
 build-release/
@@ -32,3 +10,9 @@ build-release32/
 
 # Python caches
 __pycache__/
+
+user_data/
+user_hang/
+tools/testbed/
+
+dist/
