@@ -214,7 +214,7 @@ std::atomic<bool> s_status_collision_headroom{false};
 std::atomic<double> s_status_collision_limit_us{0.0};
 std::atomic<uint32_t> s_status_collision_checked{0};
 std::atomic<uint32_t> s_status_collision_guarded{0};
-std::atomic<bool> s_status_collision_behind_wait{false};
+std::atomic<bool> s_status_collision_aside{false};
 std::atomic<uint32_t> s_status_queue_order_pairs{0};
 std::atomic<uint32_t> s_status_release_margin_samples{0};
 std::atomic<uint32_t> s_status_release_margin_late{0};
@@ -249,7 +249,7 @@ static void PublishPacingStatus(const SchedulerPacingStatus& status) noexcept
     s_status_collision_limit_us.store(status.collision_limit_us, std::memory_order_relaxed);
     s_status_collision_checked.store(status.collision_checked, std::memory_order_relaxed);
     s_status_collision_guarded.store(status.collision_guarded, std::memory_order_relaxed);
-    s_status_collision_behind_wait.store(status.collision_behind_wait, std::memory_order_relaxed);
+    s_status_collision_aside.store(status.collision_aside, std::memory_order_relaxed);
     s_status_queue_order_pairs.store(status.queue_order_pairs, std::memory_order_relaxed);
     s_status_release_margin_samples.store(status.release_margin_samples, std::memory_order_relaxed);
     s_status_release_margin_late.store(status.release_margin_late, std::memory_order_relaxed);
@@ -290,7 +290,7 @@ bool Scheduler_ReadPacingStatus(SchedulerPacingStatus* status) noexcept
         copy.collision_limit_us = s_status_collision_limit_us.load(std::memory_order_relaxed);
         copy.collision_checked = s_status_collision_checked.load(std::memory_order_relaxed);
         copy.collision_guarded = s_status_collision_guarded.load(std::memory_order_relaxed);
-        copy.collision_behind_wait = s_status_collision_behind_wait.load(std::memory_order_relaxed);
+        copy.collision_aside = s_status_collision_aside.load(std::memory_order_relaxed);
         copy.queue_order_pairs = s_status_queue_order_pairs.load(std::memory_order_relaxed);
         copy.release_margin_samples = s_status_release_margin_samples.load(std::memory_order_relaxed);
         copy.release_margin_late = s_status_release_margin_late.load(std::memory_order_relaxed);
@@ -359,11 +359,13 @@ int s_logged_start_limit = -1;
 // (lead_controller.h) has been logged. Once per process.
 bool s_logged_lead_queue = false;
 // The queue-order verdicts last logged (lead_controller.h): the next frame's
-// GPU work runs behind the GPU queue wait (the collision guard stands aside)
-// or behind the FG input wait (the lead samples leave out the frame's wait
-// for the previous frame).
+// GPU work runs behind the GPU queue wait or behind the FG input wait (the
+// lead samples leave out the frame's wait for the previous frame).
 bool s_logged_behind_wait = false;
 bool s_logged_fg_behind_wait = false;
+// The built collision guard's state last logged (lead_controller.h): 0 stands aside, 1 back on a concurrent pair,
+// 2 back because the queue order cannot be measured. It starts at 2, where the guard starts: nothing to tell yet.
+int s_logged_guard_state = 2;
 // The same verdict for frames planned with present-first ordering (lead_controller.h): they are judged by
 // their own evidence, so it is logged apart and the periods of the interleave do not log each other's flips.
 bool s_logged_ordered_behind_wait = false;
@@ -516,13 +518,14 @@ static void ResetAdaptationRegime(const char* reason) noexcept
 }
 
 // Logs each switch between the headroom guard and the Present-call margin
-// (collision-aware release), each change of the GPU queue wait's and the FG
-// input wait's queue-order verdict for the frame's FG divisor, and the first
-// lead sample that left out the game's simulation → render queue. The GPU queue wait's verdict is the one of
-// the frame's own regime: a frame planned with present-first ordering (lead_controller.h) is judged by the
-// pairs of ordered frames and logged apart. The start term's verdict (applies on the measured service, applies
-// on the fallback, stands aside) is logged on a change too, whichever of its periods the plan was made in.
-static void ObserveCollisionGuard(double fg_divisor, bool ordered) noexcept
+// (collision-aware release), each change of the built collision guard's state (stands aside, back on a concurrent
+// pair, back without the queue order's instruments) and of the GPU queue wait's and the FG input wait's
+// queue-order verdict for the frame's FG divisor, and the first lead sample that left out the game's simulation →
+// render queue. The GPU queue wait's lines come only from its own plans and take the frame's own regime: a frame
+// planned with present-first ordering (lead_controller.h) is judged by the pairs of ordered frames and logged
+// apart. The start term's verdict (applies on the measured service, applies on the fallback, stands aside) is
+// logged on a change too, whichever of its periods the plan was made in.
+static void ObserveCollisionGuard(double fg_divisor, bool ordered, bool gpu_queue_wait_plan) noexcept
 {
     const LeadController& lead = s_source_stage.Lead();
     const LeadStatistics statistics = lead.Statistics();
@@ -532,31 +535,54 @@ static void ObserveCollisionGuard(double fg_divisor, bool ordered) noexcept
                  statistics.last_queue_us, statistics.last_sample_us);
         s_logged_lead_queue = true;
     }
-    const bool behind_wait = lead.NextGpuWorkBehindWait(PacingRung::GpuQueueWait, fg_divisor);
-    if (ordered) {
-        if (behind_wait != s_logged_ordered_behind_wait) {
-            if (behind_wait) {
-                LOG_INFO("Collision guard: stands aside for ordered frames (the render queue's next frame waits "
-                         "for the held frame's Present; %zu waited releases checked, none with the next frame's "
-                         "GPU work started before the release)", lead.OrderedConcurrencyPairs());
-            } else {
-                LOG_INFO("Collision guard: back for ordered frames (%zu of %zu waited releases had the next "
-                         "frame's GPU work start before the release, newest %+.0f us, or Reflex reports stopped)",
-                         lead.OrderedConcurrentPairs(), lead.OrderedConcurrencyPairs(),
-                         statistics.last_ordered_concurrency_us);
+    // The GPU queue wait's lines only on its own plans: its verdicts take the regime of the newest GPU queue wait
+    // plan, which a frame planned on another rung does not tell.
+    if (gpu_queue_wait_plan) {
+        const bool behind_wait = lead.NextGpuWorkBehindWait(PacingRung::GpuQueueWait, fg_divisor);
+        if (ordered) {
+            if (behind_wait != s_logged_ordered_behind_wait) {
+                if (behind_wait) {
+                    LOG_INFO("Collision guard: stands aside for ordered frames (the render queue's next frame waits "
+                             "for the held frame's Present; %zu waited releases checked, none with the next frame's "
+                             "GPU work started before the release)", lead.OrderedConcurrencyPairs());
+                } else {
+                    LOG_INFO("Collision guard: back for ordered frames (%zu of %zu waited releases had the next "
+                             "frame's GPU work start before the release, newest %+.0f us, or Reflex reports stopped)",
+                             lead.OrderedConcurrentPairs(), lead.OrderedConcurrencyPairs(),
+                             statistics.last_ordered_concurrency_us);
+                }
+                s_logged_ordered_behind_wait = behind_wait;
             }
-            s_logged_ordered_behind_wait = behind_wait;
-        }
-    } else if (behind_wait != s_logged_behind_wait) {
-        if (behind_wait) {
-            LOG_INFO("Collision guard: stands aside (in the newest %zu waited releases the next frame's GPU work, "
-                     "submitting before the release, started only after it: it runs behind the wait; newest %+.0f us)",
-                     lead.ConcurrencyPairs(PacingRung::GpuQueueWait), statistics.last_concurrency_us);
         } else {
-            LOG_INFO("Collision guard: back (the next frame's GPU work started %.0f us before a waited release: "
-                     "it runs beside the wait)", -statistics.last_concurrency_us);
+            const int guard_state = lead.CollisionGuardStandsAside(fg_divisor) ? 0
+                : (lead.ConcurrentPairs(PacingRung::GpuQueueWait) != 0 ? 1 : 2);
+            if (guard_state != s_logged_guard_state) {
+                if (guard_state == 0) {
+                    LOG_INFO("Collision guard: stands aside (%zu waited releases checked, none with the next frame's "
+                             "GPU work started before the release)", lead.ConcurrencyPairs(PacingRung::GpuQueueWait));
+                } else if (guard_state == 1) {
+                    LOG_INFO("Collision guard: back (the next frame's GPU work started %.0f us before a waited "
+                             "release: it runs beside the wait)", -statistics.last_concurrency_us);
+                } else {
+                    LOG_INFO("Collision guard: back (the queue order cannot be measured: no GPU queue probe wait, "
+                             "Reflex GPU start or render submission start among the newest %u GPU queue wait frames)",
+                             LEAD_WORK_STALE_FRAMES);
+                }
+                s_logged_guard_state = guard_state;
+            }
+            if (behind_wait != s_logged_behind_wait) {
+                if (behind_wait) {
+                    LOG_INFO("Lead: the next frame's GPU work runs behind the GPU queue wait (in the newest %zu waited "
+                             "releases it started only after the release; newest %+.0f us): lead samples leave out "
+                             "its wait for the previous frame", lead.ConcurrencyPairs(PacingRung::GpuQueueWait),
+                             statistics.last_concurrency_us);
+                } else {
+                    LOG_INFO("Lead: GPU queue wait lead samples keep the measured readiness (a waited release had "
+                             "the next frame's GPU work start before it, or Reflex reports stopped)");
+                }
+                s_logged_behind_wait = behind_wait;
+            }
         }
-        s_logged_behind_wait = behind_wait;
     }
     const bool fg_behind_wait = lead.NextGpuWorkBehindWait(PacingRung::FgInputWait, fg_divisor);
     if (fg_behind_wait != s_logged_fg_behind_wait) {
@@ -829,9 +855,8 @@ static void FillControllerStatus(SchedulerPacingStatus* status) noexcept
         lead_statistics.collision_checked_frames != 0 ? lead_statistics.last_collision_limit_us : 0.0;
     status->collision_checked = clip(lead_statistics.collision_checked_frames);
     status->collision_guarded = clip(lead_statistics.collision_guarded_frames);
-    status->collision_behind_wait =
-        lead.NextGpuWorkBehindWait(PacingRung::GpuQueueWait,
-            s_last_fg_divisor_raw > 0 ? static_cast<double>(s_last_fg_divisor_raw) : 1.0);
+    status->collision_aside =
+        lead.CollisionGuardStandsAside(s_last_fg_divisor_raw > 0 ? static_cast<double>(s_last_fg_divisor_raw) : 1.0);
     status->queue_order_pairs = static_cast<uint32_t>(lead.ConcurrencyPairs(PacingRung::GpuQueueWait));
     status->release_margin_samples = clip(lead_statistics.margin_samples);
     status->release_margin_late = clip(lead_statistics.margin_late_samples);
@@ -1409,7 +1434,7 @@ static SourceStageFrame RunPlanned(
     PublishCadence(cadence_context, release);
 
     ObserveCollisionGuard(unified && frame.planned ? frame.plan.fg_divisor : input.fg_divisor,
-        frame.planned && frame.plan.ordered);
+        frame.planned && frame.plan.ordered, frame.planned && frame.plan.rung == PacingRung::GpuQueueWait);
 
     if (PacingTelemetry_Active()) {
         PacingSourceRecord source{};

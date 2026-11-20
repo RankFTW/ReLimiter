@@ -225,8 +225,8 @@ constexpr double LEAD_LATE_ARRIVAL_US = 100.0; // kUnifiedLateReleaseUs
 // lack the end, and where they are complete the next frame's start is 0.27 to 0.47 ms after the release,
 // never before. Such a pair enters no window, of either output or regime, and is counted
 // (LeadStatistics::concurrency_end_missing); the missing end is the mark, no limit on a time decides it.
-// Behind the wait the GPU queue wait's guards stand aside, and on both GPU
-// outputs the lead sample leaves out the frame's wait for the GPU to finish
+// Behind the wait, on both GPU outputs, the lead sample leaves out the
+// frame's wait for the GPU to finish
 // frame n − 1 (LeadController::SampleUs), except for a frame the cap released
 // whose own submissions set its readiness: its report shows the GPU waited
 // inside its work for its submissions while its first work streamed. Such a
@@ -234,6 +234,30 @@ constexpr double LEAD_LATE_ARRIVAL_US = 100.0; // kUnifiedLateReleaseUs
 // this: the next frame's heavy work queues behind the guarded release, so
 // Q10(D) rises with the lead (CONTROL: p10 4.7 ms guarded, 5.5 ms at +1.7 ms,
 // 8.1 ms at +4.6 ms lead) and never shows the room.
+// The built guard (the C and D limit of a GPU queue wait plan that is not ordered) does not wait for that
+// verdict: it applies while a concurrent pair is among the newest LEAD_CONCURRENCY_SAMPLES, or while the order
+// cannot be measured, and stands aside otherwise. The order can be measured while each instrument a pair needs
+// has reported recently: a GPU queue probe resume with its pre-Wait GPU time within the newest
+// LEAD_WORK_STALE_FRAMES frames that queued a wait (status Held, probe asked for or not: a probe turned off reports
+// nothing more; a frame whose Present came after its target queues none and gives the probe nothing to report, so
+// it does not age that evidence, or the guard's own limit, keeping Presents after their targets, would keep the
+// probe from ever reporting again), and a Reflex GPU
+// start and a RENDERSUBMIT_START within the newest LEAD_WORK_STALE_FRAMES frames planned with the GPU queue
+// wait's lead. The instruments' ages describe the game's and the driver's reporting, so like the pairs they
+// survive ResetBuckets; Reset starts them over. While the instruments work, the absence of a concurrent pair cannot
+// be the guard's reason to apply, because its own limit withholds the evidence: a pair needs a waited frame whose
+// next frame had begun submitting by the release, a limit below the lead the frames need makes every frame late
+// (none waits), and one below I plus the next frame's submission start releases every frame before that start.
+// Cyberpunk 2077 (benchmark, cap 72, no FG): in 3 of 9 launches the guard judged from the start with fewer than 32
+// pairs, limited the lead to I + Q10(D) − H = 15.9 to 16.6 ms while the frames needed 24 to 36 ms, and 85 to 100%
+// of the frames were late for the rest of the process with no further pair (displayed frame-to-frame change p50
+// 0.8 to 1.1 ms); the other 6 stood aside at about 9 s, and none of their 4,828 pairs was concurrent (change p50
+// 0.2 ms); with this rule 6 of 6 launches stood aside at 7 to 8 s (change p50 0.15 to 0.19 ms). A concurrent
+// pair brings the guard back at once; the pair leaves the window only with newer pairs, so where the restored limit
+// keeps frames from waiting the guard stays (a game whose next frame's work runs beside the wait). The pairs alone
+// still decide the lead samples and the spike floor (NextGpuWorkBehindWait), and an ordered plan's guard keeps
+// the ordered rule below. Known and accepted: a game whose next frame's work runs beside the wait has no guard
+// from the first measured frame until its first concurrent pair (Rogue Core: from the first or second pair).
 constexpr size_t LEAD_CONCURRENCY_SAMPLES = 64;
 // Clock map spread (about 6 µs) and probe mapping; Rogue Core's concurrent
 // pairs start p50 0.7-0.9 ms before the Signal.
@@ -1066,14 +1090,24 @@ public:
     // Queue order (above) of a GPU output (GpuQueueWait or FgInputWait; false
     // for the others): the newest pairs show the next frame's GPU work
     // running behind the wait and the FG divisor slot's Reflex reports are
-    // current. Behind the wait the GPU queue wait's guards stand aside and the
-    // output's lead samples leave out the frame's wait for the previous
-    // frame. The pairs are kept across Reset: they describe the game's GPU
-    // submission, not the lifecycle. For the GPU queue wait the verdict is the
-    // regime of the newest plan (present-first ordering, above): the pairs of
-    // its ordered frames with the reports seen since the last reset and the
-    // work age, or the built pairs.
+    // current. Behind the wait the output's lead samples leave out the frame's
+    // wait for the previous frame and the spike floor applies; an ordered GPU
+    // queue wait plan's guard stands aside, a built plan's has its own rule
+    // (CollisionGuardStandsAside). The pairs are kept across Reset: they
+    // describe the game's GPU submission, not the lifecycle. For the GPU queue
+    // wait the verdict is the regime of the newest plan (present-first
+    // ordering, above): the pairs of its ordered frames with the reports seen
+    // since the last reset and the work age, or the built pairs.
     bool NextGpuWorkBehindWait(PacingRung rung, double fg_divisor) const noexcept;
+    // The GPU queue wait's collision guard in the regime of the newest plan (above): an ordered plan's stands
+    // aside where NextGpuWorkBehindWait says so; a built plan's while no concurrent pair is among the newest
+    // LEAD_CONCURRENCY_SAMPLES and the queue order can be measured (QueueOrderMeasurable).
+    bool CollisionGuardStandsAside(double fg_divisor) const noexcept;
+    // The instruments a GPU queue wait pair needs have reported recently (above): a GPU queue probe resume with
+    // its pre-Wait GPU time within the newest LEAD_WORK_STALE_FRAMES frames that queued a wait, a Reflex
+    // GPU start and a RENDERSUBMIT_START within the newest LEAD_WORK_STALE_FRAMES frames planned with that lead;
+    // false until each has, after the last Reset.
+    bool QueueOrderMeasurable(double fg_divisor) const noexcept;
     size_t ConcurrencyPairs(PacingRung rung) const noexcept;
     size_t ConcurrentPairs(PacingRung rung) const noexcept;
     // Present-first ordering (above): the GPU queue wait's pairs of frames planned ordered, and those of
@@ -1291,6 +1325,10 @@ private:
     bool BehindWait(PacingRung rung, size_t divisor) const noexcept;
     bool BehindWait(PacingRung rung, size_t divisor, bool ordered) const noexcept;
     bool SampleBehindWait(const PendingFrame& frame, const PendingFrame* previous) const noexcept;
+    // The collision guard's own verdict (above) in the regime of the newest GPU queue wait plan (ordered_), and
+    // whether the order's instruments are current (order_instruments_).
+    bool GuardStandsAside(size_t divisor) const noexcept;
+    bool OrderMeasurable(size_t divisor) const noexcept;
     // F, the median first submission − RENDERSUBMIT_START of the report pairs
     // that stream (above); 0 until LEAD_WARM_SAMPLES.
     double FirstSubmissionUs() const noexcept;
@@ -1387,6 +1425,16 @@ private:
     // verdict also needs a warm heavy-work window, but an ordered plan's does not (BehindWait), so it asks for a
     // report actually seen.
     std::array<bool, LEAD_DIVISOR_BUCKETS> work_report_seen_{};
+    // Queue order instruments (above), per FG divisor: the frames that queued a wait since the newest GPU
+    // queue probe resume carrying its pre-Wait GPU time, and the frames planned with the GPU queue wait's lead since
+    // the newest Reflex GPU start and since the newest RENDERSUBMIT_START; UINT32_MAX until one after the last Reset
+    // (ResetBuckets keeps them).
+    struct OrderInstruments {
+        uint32_t probe_age = UINT32_MAX;
+        uint32_t start_age = UINT32_MAX;
+        uint32_t submit_age = UINT32_MAX;
+    };
+    std::array<OrderInstruments, LEAD_DIVISOR_BUCKETS> order_instruments_{};
     // Late state (above), per FG divisor: the arrival lateness of the newest
     // planned GPU queue wait frames and the D of the newest reported ones
     // (none after an ordered predecessor).

@@ -185,9 +185,9 @@ struct SchedulerPacingStatus {
 	uint32_t release_margin_late = 0;      // of those, later than 1 ms
 	uint32_t release_headroom_samples = 0; // waited resumes with the next frame's heavy GPU work start known
 	uint32_t release_headroom_late = 0;    // of those, later than 1 ms
-	// Queue order (lead_controller.h): the next frame's GPU work runs behind
-	// the wait, so the collision guard stands aside; pairs in the window.
-	bool collision_behind_wait = false;
+	// The collision guard stands aside (lead_controller.h, LeadController::CollisionGuardStandsAside: no concurrent
+	// pair while the queue order can be measured, or an ordered plan behind the wait); pairs in the window.
+	bool collision_aside = false;
 	uint32_t queue_order_pairs = 0;
 
 	// Source placement. Current on every publication.

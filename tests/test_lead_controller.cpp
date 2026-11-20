@@ -1823,15 +1823,17 @@ void TestReleaseHeadroomObservations()
     CHECK(late->Statistics().headroom_samples == 0);
 }
 
-// Queue order (Rogue Core): the collision guard stands aside
-// once 32 waited releases found the next frame's GPU work, submitting before
-// the release, starting only after it, and comes back at the first pair
-// whose next frame started more than 100 µs before the release, until that
-// pair leaves the newest 64. A next frame submitting after the release, or
-// one without a GPU start, is no pair. It stands aside only while the
-// heavy-work window is current: 65 GPU queue wait releases without a Reflex
-// report bring the guard back until a report arrives. The pairs outlive a
-// lifecycle reset.
+// Queue order (Rogue Core): the lead samples treat the next frame's GPU work
+// as behind the wait once 32 waited releases found it, submitting before
+// the release, starting only after it, and stop at the first pair whose next
+// frame started more than 100 µs before the release, until that pair leaves
+// the newest 64. A next frame submitting after the release, or one without a
+// GPU start, is no pair. That verdict needs the heavy-work window current: 65
+// GPU queue wait releases without a Reflex report end it until a report
+// arrives. The built collision guard has its own rule (lead_controller.h): it
+// stands aside while no concurrent pair exists and the order can be measured,
+// before the 32 pairs, and is back at once on a concurrent one. The pairs
+// outlive a lifecycle reset.
 void TestCollisionGuardQueueOrder()
 {
     auto controller = MakeController();
@@ -1875,8 +1877,11 @@ void TestCollisionGuardQueueOrder()
 
     for (uint32_t n = 0; n + 1 < LEAD_WARM_SAMPLES; ++n) pair(5000.0, 6050.0);
     CHECK(!controller->NextGpuWorkBehindWait(PacingRung::GpuQueueWait, 1.0));
+    // The probe, the GPU starts and the submission starts measure the order and no pair was concurrent: the
+    // guard stands aside before the lead samples' 32 pairs.
+    CHECK(controller->QueueOrderMeasurable(1.0) && controller->CollisionGuardStandsAside(1.0));
     controller->NextLeadUs(request, nullptr, &guard);
-    CHECK(guard.judged);
+    CHECK(!guard.judged);
     pair(5000.0, 6050.0);
     CHECK(controller->NextGpuWorkBehindWait(PacingRung::GpuQueueWait, 1.0));
     CHECK(controller->ConcurrencyPairs(PacingRung::GpuQueueWait) == LEAD_WARM_SAMPLES);
@@ -1885,8 +1890,8 @@ void TestCollisionGuardQueueOrder()
     const uint64_t checked = controller->Statistics().collision_checked_frames;
     const double lead = controller->NextLeadUs(request, nullptr, &guard);
     CHECK(!guard.judged);
-    // The lead returns to the unguarded lead at the lead slew.
-    CHECK(std::fabs(lead - (10010.0 + 100.0)) <= 20.0);
+    // The lead returns to the unguarded lead at the lead slew, the second step since the guard stood aside.
+    CHECK(std::fabs(lead - (10010.0 + 200.0)) <= 20.0);
     CHECK_NEAR(lead + guard.reduction_us, controller->BucketStatus(PacingRung::GpuQueueWait, 1.0).lead_us);
     CHECK(controller->Statistics().collision_checked_frames == checked);
 
@@ -1949,6 +1954,218 @@ void TestCollisionGuardQueueOrder()
     CHECK(controller->NextGpuWorkBehindWait(PacingRung::GpuQueueWait, 1.0));
     CHECK(controller->Statistics().concurrency_samples == 0);
     CHECK(controller->Statistics().invalid_inputs == 0);
+}
+
+// ── The built guard's own rule (lead_controller.h) ──
+
+namespace
+{
+    // A closed loop on the GPU queue wait with the built guard on (I = 7,000; warm-up as in
+    // TestHeadroomGuardLimitsLead, so the guard's limit is 7,000 + 4,010 − 1,000 = 10,010 against the bucket's
+    // 10,510): the controller plans each frame's lead L and the frame's Signal is at o = s + L. Its GPU is
+    // ready at s + ready_us and reaches the gate's Wait then, so it waited at the Signal only when ready_us <= L,
+    // and resumes 100 µs after the later of the two. Frames follow each other one grid interval (10,000) apart:
+    // the next frame begins submitting submit_us after its release, so its submission started by the previous
+    // frame's Signal only when L >= 10,000 + submit_us, and its GPU work starts next_start_us after the previous
+    // frame's resume (behind the wait) or, when negative, that long before the previous frame's Signal (beside
+    // it). Each instrument the queue order needs can be withheld.
+    struct GuardLoop
+    {
+        double ready_us = 10300.0;
+        double submit_us = 200.0;
+        double present_us = 5000.0;
+        double next_start_us = 50.0;
+        bool probe_wait = true;    // the resume carries its pre-Wait GPU time
+        bool gpu_start = true;     // the Reflex report carries a GPU start
+        bool submit_marker = true; // RENDERSUBMIT_START arrives
+        bool probe_on = true;      // the plan asks for a resume probe (developer key gpu_queue_probe)
+    };
+
+    struct GuardLoopResult
+    {
+        uint32_t judged = 0;      // plans the built guard judged
+        uint32_t aside = 0;       // and those it did not
+        double max_lead_us = 0.0;
+        bool behind_seen = false; // the lead samples' verdict said "behind the wait" after a frame
+    };
+
+    class GuardLoopRunner
+    {
+    public:
+        GuardLoopRunner(LeadController* controller, uint64_t first_index) : controller_(controller), index_(first_index)
+        {
+            request_ = Request(PacingRung::GpuQueueWait, 500.0, 7000.0);
+            request_.collision_guard = true;
+        }
+
+        GuardLoopResult Run(uint32_t frames, const GuardLoop& loop)
+        {
+            GuardLoopResult result{};
+            for (uint32_t n = 0; n < frames; ++n, ++index_) {
+                LeadGuardOutcome guard{};
+                const double lead_us = controller_->NextLeadUs(request_, nullptr, &guard);
+                if (guard.judged) ++result.judged;
+                else ++result.aside;
+                result.max_lead_us = std::max(result.max_lead_us, lead_us);
+                const double s = static_cast<double>(index_) * kInterval;
+                LeadFrameStart start = Start(index_, PacingRung::GpuQueueWait, s);
+                SetLead(&start, lead_us);
+                start.guard = guard;
+                start.gpu_resume_probe = loop.probe_on;
+                controller_->OnSourceRelease(start);
+                if (loop.submit_marker) controller_->OnStageEvent(Event(index_, Kind::RenderSubmitStart, s + loop.submit_us));
+                controller_->OnStageEvent(Event(index_, Kind::PresentCall, s + loop.present_us));
+                const double ready = s + loop.ready_us;
+                // The executor queues the frame's wait only when its Present came before its target (Held); later
+                // it reports Late and queues nothing, so the probe has nothing to report.
+                const bool queued = loop.present_us <= lead_us;
+                const double signal = queued ? s + lead_us : s + loop.present_us;
+                const double resume = std::max(signal, ready) + 100.0;
+                controller_->OnStageEvent(Event(index_, Kind::GpuReady, ready));
+                controller_->OnStageEvent(Event(index_, Kind::OutputRelease, signal,
+                    queued ? PacingPlanStatus::Held : PacingPlanStatus::Late));
+                if (queued && loop.probe_on) {
+                    controller_->OnStageEvent(loop.probe_wait ? Resume(index_, resume, ready)
+                                                              : Event(index_, Kind::GpuResume, resume));
+                }
+                double gpu_start = ready - 6000.0;
+                if (previous_signal_us_ > 0.0) {
+                    gpu_start = loop.next_start_us >= 0.0 ? previous_resume_us_ + loop.next_start_us
+                                                          : previous_signal_us_ + loop.next_start_us;
+                }
+                Report(controller_, Key(index_).producer_epoch, Key(index_).frame_id, 6000.0,
+                    loop.gpu_start ? Qpc(gpu_start) : 0, 6000.0);
+                previous_signal_us_ = signal;
+                previous_resume_us_ = resume;
+                if (controller_->NextGpuWorkBehindWait(PacingRung::GpuQueueWait, 1.0)) result.behind_seen = true;
+            }
+            return result;
+        }
+
+    private:
+        LeadController* controller_;
+        uint64_t index_;
+        LeadRequest request_{};
+        double previous_signal_us_ = 0.0;
+        double previous_resume_us_ = 0.0;
+    };
+
+    std::unique_ptr<LeadController> MakeGuardedController()
+    {
+        auto controller = MakeController();
+        for (uint64_t frame = 0; frame < 41; ++frame) FeedWorkFrame(controller.get(), 1 + frame, 6000.0);
+        return controller;
+    }
+}
+
+// The freeze (Cyberpunk 2077, lead_controller.h): frames need 10,300 against the guard's 10,010, so under the
+// guard every frame is late, none waits and no pair can form. Once the probe, the GPU starts and the submission
+// starts measure the order, the guard stands aside without a pair, the lead rises at the slew, frames wait, the
+// pairs come, and the lead samples' verdict turns "behind the wait" at 32 of them; the guard never judges again.
+void TestGuardStandsAsideWithoutConcurrentPair()
+{
+    auto controller = MakeGuardedController();
+    GuardLoopRunner runner(controller.get(), 201);
+    const GuardLoop loop{};
+    // The first plan comes before any frame measured the order (the warm-up frames had no probe).
+    CHECK(runner.Run(1, loop).judged == 1);
+    CHECK(controller->QueueOrderMeasurable(1.0) && controller->CollisionGuardStandsAside(1.0));
+    const GuardLoopResult result = runner.Run(300, loop);
+    CHECK(result.judged == 0);
+    CHECK(result.max_lead_us > loop.ready_us);
+    CHECK(controller->Statistics().concurrency_samples >= LEAD_WARM_SAMPLES);
+    CHECK(controller->ConcurrentPairs(PacingRung::GpuQueueWait) == 0);
+    CHECK(result.behind_seen);
+}
+
+// Without any one instrument the order cannot be measured: the guard applies as before (its limit, frames late,
+// no pair), one frame with all three puts it aside, and 65 frames planned with the GPU queue wait's lead without
+// that instrument bring it back. A probe turned off (no resume at all) counts as a missing probe.
+void TestGuardAppliesWithoutInstruments()
+{
+    for (int withheld = 0; withheld < 4; ++withheld) {
+        auto controller = MakeGuardedController();
+        GuardLoopRunner runner(controller.get(), 201);
+        GuardLoop lacking{};
+        lacking.probe_wait = withheld != 0;
+        lacking.gpu_start = withheld != 1;
+        lacking.submit_marker = withheld != 2;
+        lacking.probe_on = withheld != 3;
+        GuardLoopResult result = runner.Run(300, lacking);
+        CHECK(result.judged == 300);
+        CHECK(result.max_lead_us <= 10010.0 + 20.0);
+        CHECK(controller->Statistics().concurrency_samples == 0);
+        CHECK(!controller->QueueOrderMeasurable(1.0) && !controller->CollisionGuardStandsAside(1.0));
+        runner.Run(1, GuardLoop{});
+        CHECK(controller->QueueOrderMeasurable(1.0));
+        result = runner.Run(LEAD_WORK_STALE_FRAMES + 2, lacking);
+        CHECK(result.aside == LEAD_WORK_STALE_FRAMES + 1 && result.judged == 1);
+        CHECK(!controller->QueueOrderMeasurable(1.0));
+    }
+}
+
+// A concurrent pair (the next frame's GPU work 1 ms before the Signal) brings the guard back at once, the first
+// pair of all included, and it stays: its limit keeps frames from waiting, so no newer pair pushes that one out
+// (a game whose next frame's work runs beside the wait keeps its guard). The frame planned before the pair was
+// recorded may still give one more, concurrent too; no clean pair ever enters.
+void TestGuardBackOnFirstConcurrentPair()
+{
+    auto controller = MakeGuardedController();
+    GuardLoopRunner runner(controller.get(), 201);
+    GuardLoop beside{};
+    beside.next_start_us = -1000.0;
+    runner.Run(1, beside);
+    runner.Run(20, beside);
+    const size_t pairs = controller->ConcurrencyPairs(PacingRung::GpuQueueWait);
+    CHECK(pairs >= 1 && pairs <= 2);
+    CHECK(controller->ConcurrentPairs(PacingRung::GpuQueueWait) == pairs);
+    CHECK(!controller->CollisionGuardStandsAside(1.0));
+    const GuardLoopResult result = runner.Run(200, beside);
+    CHECK(result.judged == 200 && result.max_lead_us <= 10010.0 + 20.0);
+    CHECK(!result.behind_seen);
+}
+
+// A bucket reset (a mode change such as an alt-tab) clears C, D and the bucket and keeps the pairs and the
+// instruments' ages. The guard stays aside instead of waiting for a warm D window, which needs waited frames: under
+// the Present-call margin's 7,000 + 5,000 − 2,500 = 9,500 against the 10,300 the frames need no frame would wait
+// and D would never warm. A lifecycle reset starts the instruments over.
+void TestGuardAfterBucketResetStandsAside()
+{
+    auto controller = MakeGuardedController();
+    GuardLoopRunner runner(controller.get(), 201);
+    runner.Run(1, GuardLoop{});
+    CHECK(runner.Run(300, GuardLoop{}).behind_seen);
+    controller->ResetBuckets();
+    CHECK(controller->QueueOrderMeasurable(1.0));
+    CHECK(controller->ConcurrencyPairs(PacingRung::GpuQueueWait) >= LEAD_WARM_SAMPLES);
+    const GuardLoopResult result = runner.Run(300, GuardLoop{});
+    CHECK(result.judged == 0);
+    CHECK(result.behind_seen);
+    CHECK(controller->ConcurrentPairs(PacingRung::GpuQueueWait) == 0);
+    controller->Reset(kFrequency);
+    CHECK(!controller->QueueOrderMeasurable(1.0) && !controller->CollisionGuardStandsAside(1.0));
+}
+
+// The probe's evidence ages only with frames that queued a probed wait. A stretch where every Present comes after
+// its target (a slow CPU section: 25,000 µs after the release, above the 3 I a lead sample may be) queues no wait.
+// The guard, aside on clean pairs, stays aside through it; were the probe's age counted over every frame it would
+// expire there, and the guard's limit (10,010) below the Presents that follow (10,200) would then keep every later
+// frame unqueued and the probe silent for good.
+void TestGuardKeepsAsideThroughUnqueuedFrames()
+{
+    auto controller = MakeGuardedController();
+    GuardLoopRunner runner(controller.get(), 201);
+    runner.Run(1, GuardLoop{});
+    CHECK(runner.Run(300, GuardLoop{}).behind_seen);
+    GuardLoop slow{};
+    slow.present_us = 25000.0;
+    slow.ready_us = 25500.0;
+    CHECK(runner.Run(100, slow).judged == 0);
+    CHECK(controller->QueueOrderMeasurable(1.0));
+    GuardLoop tight{};
+    tight.present_us = 10200.0;
+    CHECK(runner.Run(200, tight).judged == 0);
+    CHECK(controller->ConcurrentPairs(PacingRung::GpuQueueWait) == 0);
 }
 
 // ── D after a waited predecessor (G1) ──
@@ -4118,9 +4335,9 @@ void TestPresentFirstOrder()
     };
     const auto steady = [&](bool ordered, double gpu_start_us) { return pair(ordered, ordered, gpu_start_us); };
 
-    // An ordered request puts the guard aside where the built evidence (no pair yet) keeps it, and says so; the
-    // lead is the bucket's, reached at the slew from the guarded 10,010. A request that is not ordered is judged
-    // at once: the plan's word is not sticky.
+    // An ordered request puts the guard aside where the built guard applies (the warm-up frames had no probe, so
+    // the order cannot be measured yet), and says so; the lead is the bucket's, reached at the slew from the
+    // guarded 10,010. A request that is not ordered is judged at once: the plan's word is not sticky.
     plan(false);
     CHECK(guard.judged && !guard.ordered && std::fabs(guard.offset_us - 3010.0) <= 20.0);
     CHECK(std::fabs(plan(true) - 10110.0) <= 20.0);
@@ -4131,9 +4348,10 @@ void TestPresentFirstOrder()
     CHECK(!controller->NextGpuWorkBehindWait(PacingRung::GpuQueueWait, 1.0));
 
     // Clean pairs of ordered frames fill the ordered window, not the built one, and their D is no sample of the
-    // built heavy-work window. The built evidence still has nothing: a request that is not ordered keeps the
-    // guard, an ordered one stands aside. The next frame's lead sample leaves out the wait carried from the
-    // previous gate (8,900 of 10,000, 1,100 µs) and waited for its report.
+    // built heavy-work window. The built evidence still has no pair, but the frames measure the order and no
+    // built pair was concurrent: a request that is not ordered stands aside too (the built guard's own rule),
+    // while the built lead-sample verdict stays "not behind". The next frame's lead sample leaves out the wait
+    // carried from the previous gate (8,900 of 10,000, 1,100 µs) and waited for its report.
     for (int n = 0; n < 40; ++n) CHECK(steady(true, 6050.0));
     CHECK(controller->OrderedConcurrencyPairs() == 40 && controller->OrderedConcurrentPairs() == 0);
     CHECK(controller->ConcurrencyPairs(PacingRung::GpuQueueWait) == 0);
@@ -4143,7 +4361,8 @@ void TestPresentFirstOrder()
     CHECK_NEAR(controller->Statistics().last_sample_us, 8900.0);
     CHECK_NEAR(controller->Statistics().last_predecessor_wait_us, 1100.0);
     plan(false);
-    CHECK(guard.judged && !guard.ordered && std::fabs(guard.offset_us - 3010.0) <= 20.0);
+    CHECK(!guard.judged && !guard.ordered);
+    CHECK(!controller->NextGpuWorkBehindWait(PacingRung::GpuQueueWait, 1.0));
     plan(true);
     CHECK(!guard.judged && guard.ordered);
 
@@ -4168,14 +4387,16 @@ void TestPresentFirstOrder()
     CHECK(controller->Statistics().work_samples == 40);
 
     // The pairs of frames planned as built are the built window's, and their D is a sample of the built
-    // heavy-work window as ever. A request that is not ordered keeps the guard until the built evidence has 32
-    // clean pairs of its own (the ordered window, full of clean pairs, lends it none); a built frame's lead
-    // sample keeps the measured readiness although the ordered evidence is clean.
+    // heavy-work window as ever. A request that is not ordered stands aside without a concurrent built pair;
+    // the built lead-sample verdict waits for 32 clean pairs of its own (the ordered window, full of clean
+    // pairs, lends it none), so a built frame's lead sample keeps the measured readiness until then although
+    // the ordered evidence is clean.
     CHECK(!steady(false, 6050.0));
     CHECK(controller->ConcurrencyPairs(PacingRung::GpuQueueWait) == 1 && controller->Statistics().work_samples == 41);
     CHECK_NEAR(controller->Statistics().last_sample_us, 10000.0);
     plan(false);
-    CHECK(guard.judged);
+    CHECK(!guard.judged);
+    CHECK(!controller->NextGpuWorkBehindWait(PacingRung::GpuQueueWait, 1.0));
     for (uint32_t n = 1; n < LEAD_WARM_SAMPLES; ++n) steady(false, 6050.0);
     CHECK(controller->ConcurrencyPairs(PacingRung::GpuQueueWait) == LEAD_WARM_SAMPLES);
     CHECK(controller->Statistics().work_samples == 40 + LEAD_WARM_SAMPLES);
@@ -5844,6 +6065,11 @@ int main()
     TestHeadroomGuardLimitsLead();
     TestReleaseHeadroomObservations();
     TestCollisionGuardQueueOrder();
+    TestGuardStandsAsideWithoutConcurrentPair();
+    TestGuardAppliesWithoutInstruments();
+    TestGuardBackOnFirstConcurrentPair();
+    TestGuardAfterBucketResetStandsAside();
+    TestGuardKeepsAsideThroughUnqueuedFrames();
     TestWorkSampleRequiresWaitedPredecessor();
     TestWorkSampleArrivalOrders();
     TestCallWindowKeepsEveryGpuWaitSample();

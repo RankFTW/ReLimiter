@@ -161,6 +161,7 @@ void LeadController::Reset(int64_t qpc_frequency) noexcept
     ResetStartTerm();
     work_age_frames_.fill(0);
     work_report_seen_.fill(false);
+    order_instruments_.fill(OrderInstruments{});
     for (LateWindow& late : late_arrivals_) late.Reset();
     for (LateWindow& late : late_work_) late.Reset();
     first_submission_window_.Reset();
@@ -432,8 +433,7 @@ double LeadController::CollisionGuardedLeadUs(const LeadRequest& request, size_t
         late_arrivals_[divisor].PushConsecutive(request.late_index,
             std::isfinite(request.late_us) && request.late_us > 0.0 ? request.late_us : 0.0);
     }
-    if (request.rung == PacingRung::GpuQueueWait && request.collision_guard &&
-        !BehindWait(PacingRung::GpuQueueWait, divisor)) {
+    if (request.rung == PacingRung::GpuQueueWait && request.collision_guard && !GuardStandsAside(divisor)) {
         double offset_us = 0.0;
         bool headroom = false;
         if (CollisionOffsetUs(divisor, request.release_headroom_us, &offset_us, &headroom)) {
@@ -798,6 +798,15 @@ void LeadController::OnSourceRelease(const LeadFrameStart& frame) noexcept
             : fg_report_age_frames_[slot.bucket % LEAD_DIVISOR_BUCKETS];
         if (age < UINT32_MAX) ++age;
     }
+    // Queue order instruments (lead_controller.h): the GPU start's and the submission start's ages count the same
+    // frames (the probe's counts the frames that queued a wait, OnStageEvent); a submission start stored
+    // ahead of this release counts as seen with it.
+    if (slot.gpu_wait_lead) {
+        OrderInstruments& instruments = order_instruments_[slot.bucket % LEAD_DIVISOR_BUCKETS];
+        if (instruments.start_age < UINT32_MAX) ++instruments.start_age;
+        if (instruments.submit_age < UINT32_MAX) ++instruments.submit_age;
+        if (HasField(slot, FieldRenderSubmit)) instruments.submit_age = 0;
+    }
     // The start term's ages count the same frames per output (lead_controller.h): the GPU queue wait's frames planned
     // with its lead, the FG input wait's sampled frames.
     size_t start_output = 0;
@@ -868,6 +877,18 @@ void LeadController::OnStageEvent(const PacingStageEvent& event) noexcept
     SetField(frame, field, event.qpc);
     if (field == FieldOutputRelease) frame->output_status = event.status;
     if (field == FieldGpuResume) frame->gpu_wait_qpc = event.gpu_wait_qpc;
+    if (frame->started && frame->gpu_wait_lead) {
+        // Queue order instruments (lead_controller.h): a frame whose wait was queued (Held) ages the probe's
+        // evidence, whether or not a probe was asked for (a probe turned off reports nothing more), and a resume
+        // with the pre-Wait GPU time renews it; a frame that queued no wait (its Present came after its target)
+        // leaves it alone: it gave the probe nothing to report.
+        OrderInstruments& instruments = order_instruments_[frame->bucket % LEAD_DIVISOR_BUCKETS];
+        if (field == FieldOutputRelease && event.status == PacingPlanStatus::Held && instruments.probe_age < UINT32_MAX) {
+            ++instruments.probe_age;
+        }
+        if (field == FieldGpuResume && event.gpu_wait_qpc > 0) instruments.probe_age = 0;
+        if (field == FieldRenderSubmit) instruments.submit_age = 0;
+    }
     if (!frame->started) ++frame->early_events;
     RecordResumeDelay(frame);
     RecordCallTime(frame);
@@ -920,6 +941,7 @@ void LeadController::OnGpuReport(uint32_t producer_epoch, uint64_t frame_id, con
         if (frame.gpu_wait_lead) {
             work_age_frames_[frame.bucket % LEAD_DIVISOR_BUCKETS] = 0;
             work_report_seen_[frame.bucket % LEAD_DIVISOR_BUCKETS] = true;
+            if (report.start_qpc > 0) order_instruments_[frame.bucket % LEAD_DIVISOR_BUCKETS].start_age = 0;
         }
         if (frame.sampled && frame.rung == PacingRung::FgInputWait) {
             fg_report_age_frames_[frame.bucket % LEAD_DIVISOR_BUCKETS] = 0;
@@ -1486,6 +1508,35 @@ bool LeadController::BehindWait(PacingRung rung, size_t divisor, bool ordered) c
 bool LeadController::SampleBehindWait(const PendingFrame& frame, const PendingFrame* previous) const noexcept
 {
     return BehindWait(frame.rung, frame.bucket % LEAD_DIVISOR_BUCKETS, previous != nullptr && previous->ordered);
+}
+
+// The built guard (lead_controller.h) applies on a concurrent pair or without the instruments, and stands aside
+// otherwise; the ordered rule is BehindWait's.
+bool LeadController::GuardStandsAside(size_t divisor) const noexcept
+{
+    if (ordered_) return BehindWait(PacingRung::GpuQueueWait, divisor, true);
+    return queue_order_[0].concurrent == 0 && OrderMeasurable(divisor);
+}
+
+bool LeadController::OrderMeasurable(size_t divisor) const noexcept
+{
+    const OrderInstruments& instruments = order_instruments_[divisor];
+    return instruments.probe_age <= LEAD_WORK_STALE_FRAMES && instruments.start_age <= LEAD_WORK_STALE_FRAMES &&
+        instruments.submit_age <= LEAD_WORK_STALE_FRAMES;
+}
+
+bool LeadController::CollisionGuardStandsAside(double fg_divisor) const noexcept
+{
+    size_t index = 0;
+    return FindBucketIndex(PacingRung::GpuQueueWait, fg_divisor, &index) &&
+        GuardStandsAside(index % LEAD_DIVISOR_BUCKETS);
+}
+
+bool LeadController::QueueOrderMeasurable(double fg_divisor) const noexcept
+{
+    size_t index = 0;
+    return FindBucketIndex(PacingRung::GpuQueueWait, fg_divisor, &index) &&
+        OrderMeasurable(index % LEAD_DIVISOR_BUCKETS);
 }
 
 bool LeadController::NextGpuWorkBehindWait(PacingRung rung, double fg_divisor) const noexcept
