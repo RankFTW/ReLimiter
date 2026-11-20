@@ -187,6 +187,7 @@ void TestPlanPublishedBeforeWaitAndLeadFed()
     CHECK(first.plan.output_target_qpc == kStart + Ticks(kSeedLeadUs));
     CHECK(clock.wait_calls == 0); // S_1 = now: nothing to wait for
     CHECK(first.release_qpc == kStart);
+    CHECK(!first.start_paced); // nothing held it
 
     clock.now += Ticks(2'000.0);
     request.key = Key(11);
@@ -204,6 +205,7 @@ void TestPlanPublishedBeforeWaitAndLeadFed()
     CHECK(clock.last_wait_target == second.plan.source_wake_qpc);
     CHECK(second.slept);
     CHECK(second.release_qpc == second.plan.source_wake_qpc);
+    CHECK(second.start_paced); // held to S_2
 
     // Release fed: H0 samples X = a - s from the drained MarkerArrival.
     const uint64_t samples_before = g_stage.Lead().Statistics().samples;
@@ -453,6 +455,7 @@ void TestWaitClamp()
     CHECK(second.wait_target_qpc == planned_at + Ticks(kIntervalUs));
     CHECK(clock.last_wait_target == second.wait_target_qpc);
     CHECK(g_stage.Statistics().clamped_waits == clamped + 1);
+    CHECK(!second.start_paced); // released before S_2
 }
 
 void TestStageEventDrainObservesOutput()
@@ -1110,6 +1113,7 @@ void TestUnifiedBranch()
     CHECK(first.unified.kind == UnifiedResolutionKind::MarkerPath);
     CHECK((first.unified.flags & kUpReset) != 0 && (first.unified.flags & kUpMarkerStart) != 0);
     CHECK(first.release_qpc == kStart && clock.wait_calls == 0);
+    CHECK(!first.start_paced); // the law's reset: no planned start
     // One frame generation factor: B = R, so H = R + L.
     CHECK(std::llabs(first.plan.output_target_qpc - first.release_qpc - Ticks(first.plan.lead_us)) <= 1);
 
@@ -1135,6 +1139,7 @@ void TestUnifiedBranch()
     CHECK(second.game_arrival_qpc == arrival2);
     CHECK(second.plan.grid_index == first.plan.grid_index + 1);
     CHECK(second.plan.interval_us == kIntervalUs);
+    CHECK(second.start_paced); // the Sleep held it to T
 
     // A late arrival: released at once; the origin moves to the actual release, so the
     // next start is never closer than I (no catch-up).
@@ -1146,6 +1151,7 @@ void TestUnifiedBranch()
     const SourceStageFrame third = g_stage.RunPlannedFrame(UnifiedRequest(Key(102), &mailbox), &clock);
     CHECK(third.planned && third.release_qpc == arrival3);
     CHECK((third.unified.flags & kUpLate) != 0);
+    CHECK(!third.start_paced); // the game arrived after T
     clock.now = arrival3 + Ticks(1'000.0);
     const UnifiedStart start4 = SleepHook(&mailbox, clock.now, UnifiedSleepOutcome::None, 0);
     CHECK(UnifiedPacer_TargetTicks(start4.target) >= third.release_qpc + Ticks(kIntervalUs) - 1);
@@ -1159,6 +1165,7 @@ void TestUnifiedBranch()
     CHECK((fourth.unified.flags & kUpSleepRunning) != 0);
     CHECK(clock.wait_calls == waits_before + 1 && fourth.release_qpc >= t4);
     CHECK(fourth.wait_start_qpc != 0 && fourth.wait_end_qpc >= fourth.wait_start_qpc);
+    CHECK(fourth.start_paced); // the marker held it to T
 
     // A reported failure: consumed, the marker waits to T.
     clock.now = fourth.release_qpc + Ticks(500.0);
@@ -1167,6 +1174,7 @@ void TestUnifiedBranch()
     CHECK(fifth.planned && fifth.unified.kind == UnifiedResolutionKind::WaitFailed);
     CHECK((fifth.unified.flags & kUpSleepFailed) != 0 && mailbox.load() == 0);
     CHECK(fifth.release_qpc >= UnifiedPacer_TargetTicks(start5.target));
+    CHECK(fifth.start_paced); // the marker held it to T after the Sleep's failure
 
     // Every release is committed once and never earlier than T.
     CHECK(g_stage.Unified().Counters().late_releases >= 1);
@@ -1512,16 +1520,19 @@ void TestUnifiedFailedMarkerWait()
         CHECK(failed.release_qpc == arrival && failed.release_qpc < target);
         CHECK(!g_stage.Unified().HasOrigin()); // R < T was not committed: no origin, none in the future
         CHECK((failed.unified.flags & kUpReset) != 0);
+        CHECK(!failed.start_paced);
         clock.fail_from_call = 0;
         clock.now = arrival + Ticks(2'000.0);
         const int waits = clock.wait_calls;
         const SourceStageFrame next = g_stage.RunPlannedFrame(UnifiedMarkerRequest(Key(402), &mailbox), &clock);
         CHECK(next.planned && next.release_qpc == arrival + Ticks(2'000.0) && clock.wait_calls == waits);
         CHECK((next.unified.flags & kUpReset) != 0 && next.unified.kind == UnifiedResolutionKind::MarkerPath);
+        CHECK(!next.start_paced); // the first start after the reset
         clock.now = next.release_qpc + Ticks(1'000.0);
         const SourceStageFrame following = g_stage.RunPlannedFrame(UnifiedMarkerRequest(Key(403), &mailbox), &clock);
         CHECK(following.release_qpc == next.release_qpc + Ticks(kIntervalUs)); // I after the actual release
         CHECK((following.unified.flags & kUpReset) == 0);
+        CHECK(following.start_paced);
         g_stage.SetUnifiedEnabled(false, 1);
     }
 

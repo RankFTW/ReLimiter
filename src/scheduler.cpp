@@ -205,8 +205,6 @@ std::atomic<uint64_t> s_status_stage_events_dropped{0};
 std::atomic<bool> s_status_lead_budget_limited{false};
 std::atomic<double> s_status_lead_quantile_us{0.0};
 std::atomic<double> s_status_lead_floor_us{0.0};
-std::atomic<double> s_status_lead_floor_tail_us{0.0};
-std::atomic<double> s_status_lead_floor_gpu_us{0.0};
 std::atomic<bool> s_status_lead_floor_limited{false};
 std::atomic<double> s_status_release_margin_us{0.0};
 std::atomic<double> s_status_release_headroom_us{0.0};
@@ -240,8 +238,6 @@ static void PublishPacingStatus(const SchedulerPacingStatus& status) noexcept
     s_status_lead_budget_limited.store(status.lead_budget_limited, std::memory_order_relaxed);
     s_status_lead_quantile_us.store(status.lead_quantile_us, std::memory_order_relaxed);
     s_status_lead_floor_us.store(status.lead_floor_us, std::memory_order_relaxed);
-    s_status_lead_floor_tail_us.store(status.lead_floor_tail_us, std::memory_order_relaxed);
-    s_status_lead_floor_gpu_us.store(status.lead_floor_gpu_us, std::memory_order_relaxed);
     s_status_lead_floor_limited.store(status.lead_floor_limited, std::memory_order_relaxed);
     s_status_release_margin_us.store(status.release_margin_us, std::memory_order_relaxed);
     s_status_release_headroom_us.store(status.release_headroom_us, std::memory_order_relaxed);
@@ -281,8 +277,6 @@ bool Scheduler_ReadPacingStatus(SchedulerPacingStatus* status) noexcept
         copy.lead_budget_limited = s_status_lead_budget_limited.load(std::memory_order_relaxed);
         copy.lead_quantile_us = s_status_lead_quantile_us.load(std::memory_order_relaxed);
         copy.lead_floor_us = s_status_lead_floor_us.load(std::memory_order_relaxed);
-        copy.lead_floor_tail_us = s_status_lead_floor_tail_us.load(std::memory_order_relaxed);
-        copy.lead_floor_gpu_us = s_status_lead_floor_gpu_us.load(std::memory_order_relaxed);
         copy.lead_floor_limited = s_status_lead_floor_limited.load(std::memory_order_relaxed);
         copy.release_margin_us = s_status_release_margin_us.load(std::memory_order_relaxed);
         copy.release_headroom_us = s_status_release_headroom_us.load(std::memory_order_relaxed);
@@ -1313,10 +1307,7 @@ static void NoteLeadSpikeFloor(const SourceStageFrame& frame, const LeadBucketSt
         s_lead_floor_idle_plans = 0;
         if (s_lead_floor_logged) return;
         s_lead_floor_logged = true;
-        const LeadController& lead = s_source_stage.Lead();
-        LOG_INFO("Lead spike floor: on at %.1f ms (arrival tail %.1f ms + GPU %.1f ms; own lead %.1f ms), %s FG %gx",
-            bucket.spike_floor_us / 1000.0, lead.SpikeTailUs(frame.plan.rung) / 1000.0,
-            lead.SpikeGpuUs(frame.plan.rung) / 1000.0,
+        LOG_INFO("Lead spike floor: on at %.1f ms (own lead %.1f ms), %s FG %gx", bucket.spike_floor_us / 1000.0,
             own_us / 1000.0, PacingRung_Text(frame.plan.rung), frame.plan.fg_divisor);
         return;
     }
@@ -1462,8 +1453,6 @@ static SourceStageFrame RunPlanned(
     status.lead_samples = bucket.samples;
     status.lead_quantile_us = bucket.quantile_us;
     status.lead_floor_us = bucket.spike_floor_us;
-    status.lead_floor_tail_us = s_source_stage.Lead().SpikeTailUs(frame.plan.rung);
-    status.lead_floor_gpu_us = s_source_stage.Lead().SpikeGpuUs(frame.plan.rung);
     status.lead_floor_limited = bucket.spike_floor_limited;
     NoteLeadSpikeFloor(frame, bucket, pipeline.allowance_us);
     status.grid_epoch = frame.plan.grid_epoch;

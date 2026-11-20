@@ -488,17 +488,24 @@ enum class LeadStartSource : uint8_t {
 // waited more than 3 ms for a frame's work 8–18 times per minute, and display
 // jumps above 4 ms rose to 5.2–9.5 per 1,000 from 1.3–1.6 at the earlier
 // 40 ms lead, whose 6–9 ms queue in front of the render thread absorbed them.
-// The lead is therefore at least L_spike = Q_tail(a) + Γ:
+// The lead is therefore at least L_spike = Q_tail(ℓ), ℓ = a + Γ_n, the lead
+// one frame needed:
 // - a, the arrival: release → the frame's first GPU work at the driver
 //   without the simulation → render queue q (above), (w − s − q) + F_n, F_n
-//   the frame's own driverStartTime − renderSubmitStartTime. Only frames
-//   whose first work streamed (LeadGpuReport::first_work_streamed), whose
-//   render thread did not take them only at or after frame n − 1's Signal
-//   (e < o_{n−1} <= w: that timing is ReLimiter's), within 3 I. It holds the
-//   game's simulation, render-thread turnaround and first submission, which
-//   did not move with the lead (simulation p50 / p99 5.1 / 11.7 ms at L 41,
-//   5.05 / 12.1 at L 29.8). Held-first frames (Gears of War: E-Day, first
-//   work pinned to the previous Signal) add no arrival.
+//   the frame's own driverStartTime − renderSubmitStartTime, plus the slot's
+//   anchor delta (lead anchor, below: never more than the plan's share of
+//   the release gap). Only frames whose start ReLimiter held to its planned
+//   start (LeadFrameStart::paced_start): their start followed the lead, so a
+//   longer lead would have started them earlier. A frame the game started
+//   late, one whose wait failed and the first after a reset of the start law
+//   started when they did whatever the lead. Only frames whose first work
+//   streamed (LeadGpuReport::first_work_streamed) and whose render thread did
+//   not take them only at or after frame n − 1's Signal (e < o_{n−1} <= w:
+//   that timing is ReLimiter's). It holds the game's simulation,
+//   render-thread turnaround and first submission, which did not move with
+//   the lead (simulation p50 / p99 5.1 / 11.7 ms at L 41, 5.05 / 12.1 at
+//   L 29.8). Held-first frames (Gears of War: E-Day, first work pinned to the
+//   previous Signal) add no arrival.
 // - Q_tail: the LEAD_SPIKE_TAIL_RANK-th largest of the maxima of the newest
 //   LEAD_SPIKE_BLOCKS closed blocks of LEAD_SPIKE_BLOCK_FRAMES decided frames
 //   (about 31 s at 65 real frames per second), among the blocks that kept an
@@ -515,8 +522,25 @@ enum class LeadStartSource : uint8_t {
 //   jumps each. Replayed, the second-largest added 0.8–3.9 ms of lead in
 //   those scenes and removed most of them; the largest also set the lead in
 //   Gears of War: E-Day's GPU-paced cadence (40% of frames) and is not used.
-// - Γ: the median GPU start → readiness time (r − g) of the newest
-//   LEAD_SPIKE_GPU_SAMPLES frames.
+// - Γ_n: the median GPU start → readiness time (r − g) of the newest
+//   LEAD_SPIKE_GPU_SAMPLES frames of the frame's output when its arrival is
+//   decided; a frame decided before that many are known adds nothing. Each
+//   arrival keeps the GPU time of its own scene.
+// - ℓ at most 3 I, the lead's outlier bound and its ceiling: a larger ℓ is
+//   left out. No lead covers it, and in the floor it would only pin the lead
+//   at 3 I for a window.
+// Cyberpunk 2077's benchmark set the paced start, Γ_n, the 3 I bound and the
+// anchor's share (below). With FG 2× at a 120 cap,
+// two frames after release gaps of 96 and 139 ms in the scene load carried
+// 47.8 and 69.4 ms of anchor delta (half of each gap) on arrivals of 22.2 and
+// 33.4 ms, neither started by ReLimiter's wait: an 84 ms floor held the lead at
+// 3 I (50 ms against an own lead of 38–40) for the benchmark's first 25 s, PC
+// latency 15–18 ms above NVIDIA's limiter. Without FG at 72, loading-screen
+// arrivals of 24.6 ms (Γ 0.5 ms then) plus the gameplay Γ of 11.5 ms gave a
+// 36.4 ms floor against an own lead of 28.6 ms, set again after an alt-tab.
+// Replayed with the three rules the floors were 34.9 and 25.2 ms, below the
+// own lead, and Gears of War: E-Day's moved by less than 1 ms (25.7 → 24.9,
+// 27.5 → 28.0).
 // The window counts decided frames, not kept arrivals: every frame whose
 // arrival is decided counts toward its block, kept or left out, so the window
 // is the newest 2,048 decided frames whatever share of them keeps an arrival.
@@ -533,15 +557,14 @@ enum class LeadStartSource : uint8_t {
 // A frame whose work reaches the GPU after the GPU is free is ready a + Γ
 // after its release, so a lead of at least L_spike has it ready by its
 // target. The floor applies behind the wait once LEAD_SPIKE_WARM_BLOCKS
-// blocks with a kept arrival and LEAD_SPIKE_GPU_SAMPLES GPU times of the
-// frame's output are known, and enters only the warm target,
+// blocks of the frame's output kept an ℓ, and enters only the warm target,
 // max(Q_q + allowance, L_spike): the slew and S follow one lead.
 // It needs no load threshold: where the arrival tail is thin it lies below
-// the lead (Gears
-// 1.4–9.7 ms below in every capture, CONTROL's light scene within 0.3 ms).
-// It is not part of the 3 I budget, and it did not
-// slow the game's render submission (CONTROL p50 7.8–8.0 ms with and without
-// it). Reset and ResetBuckets clear both outputs' memories.
+// the lead (Gears 1.4–9.7 ms below in every capture, CONTROL's light scene
+// within 0.3 ms). It never makes a lead budget-limited (budget_limited comes
+// from the own target), and it did not slow the game's render submission
+// (CONTROL p50 7.8–8.0 ms with and without it). Reset and ResetBuckets clear
+// both outputs' memories.
 
 // Report pairs (frame n's Reflex report and n − 1's, driver clock): a pair
 // whose first work reached the driver in the first half of the render
@@ -680,18 +703,28 @@ struct LeadFrameStart {
     // ignored. s (source_release_qpc) keeps its physical meaning in every
     // wait and stage-time check: the wait validation above, the gated hold, C
     // and D, the behind-wait correction, the render queue and the spike
-    // arrival's coordinates. The slot stores delta = (s − B) in µs (>= 0; 0
-    // without an anchor) and adds it only where a duration measured from s
-    // becomes a lead quantity, after the range checks: the lead window's
-    // sample (after the behind-wait correction and q) and the spike floor's
-    // binned arrival. A lead L then covers a readiness measured from B while
-    // every wait check still sees s. Without an anchor on every frame each
-    // result is unchanged.
+    // arrival's coordinates. The slot stores delta = min(s − B, (N − 1)/N · I)
+    // in µs (>= 0; 0 without an anchor; N the plan's FG divisor and I its
+    // interval) and adds it only where a duration measured from s becomes a
+    // lead quantity, after the range checks: the lead window's sample (after
+    // the behind-wait correction and q) and the spike floor's arrival. A lead
+    // L then covers a readiness measured from B while every wait check still
+    // sees s. B splits the release gap R(n) − R(n − 1) (unified_pacer.h,
+    // ComputeAnchor): a frame released at its target follows R(n − 1) by I, so
+    // its s − B is the plan's share exactly; what a later release adds is how
+    // late the game was, which no lead covers, and it stays out (Cyberpunk
+    // 2077 FG 2×: one 96 ms gap lifted the own lead from 31.4 to 58.1 ms, above
+    // 3 I, until its samples left the window). Without an anchor on every
+    // frame each result is unchanged.
     int64_t lead_anchor_qpc = 0;
     // The owner sets this together with lead_anchor_qpc, only in the unified
     // pacer's branch: the lead anchor is applied only when it is true (the
     // controller compares no anchor value otherwise).
     bool anchored = false;
+    // The owner held this frame's start to its planned start: the wait ran to the start target, the game did not
+    // arrive after it, and it is not the first start after a reset of the start law (source_stage.cpp,
+    // SourceStageFrame::start_paced). Only such a frame gives the spike floor an arrival (above).
+    bool paced_start = false;
     // Start term (above): the game's arrival at ReLimiter for this frame, a: the Reflex Sleep hook's arrival where
     // the unified pacer reserved the start, else the marker's, before any wait of ReLimiter's own. 0 unknown, and an
     // arrival later than s is none; a frame without one gives no turnaround and no untied-start evidence. The
@@ -722,8 +755,9 @@ struct LeadRequest {
     // behind the wait. The FG input wait leaves it out always; no other rung reads this.
     bool queue_correction = false;
     // Lead anchor (above): the planned frame's own delta = (s − B) in µs, 0
-    // none (always 0 with the unified pacer off). L itself is learned from
-    // the slots' samples, which carry their own deltas; the planned frame's
+    // none (always 0 with the unified pacer off), not limited to the plan's
+    // share. L itself is learned from the slots' samples, which carry their
+    // own deltas (each at most its plan's share); the planned frame's
     // delta is read only where a limit bounds the physical release → target
     // distance H − R = L − delta: the collision guard (GPU queue wait rung)
     // and the start term (GPU queue wait and FG input wait). Each adds it to
@@ -844,13 +878,13 @@ struct LeadStatistics {
     uint64_t queued_samples = 0;
     double last_queue_us = 0.0;
     double last_sample_us = 0.0;     // newest sample added to a bucket
-    // Spike floor (above): arrivals added, arrivals of GPU-rung frames left
-    // out (first work not streamed, Signal-pinned, stage times missing or
-    // beyond 3 I), GPU times added, and the newest arrival.
+    // Spike floor (above): kept ℓ, GPU-rung frames left out (start not paced,
+    // first work not streamed, Signal-pinned, stage times missing, Γ not yet
+    // known, ℓ beyond 3 I), GPU times added, and the newest kept ℓ.
     uint64_t spike_samples = 0;
     uint64_t spike_excluded = 0;
     uint64_t spike_gpu_samples = 0;
-    double last_spike_arrival_us = 0.0;
+    double last_spike_lead_us = 0.0;
     // Saturation rule (SetQueueWaitMode, below; unified pacer only): GPU-rung
     // lead samples that waited for the law's z_used (deferred), were fed with
     // it (queue_wait_samples; last_queue_wait_removed_us is the newest part
@@ -1066,12 +1100,11 @@ public:
 
     LeadBucketStatus BucketStatus(PacingRung rung, double fg_divisor) const noexcept;
     // Spike floor (above): L_spike for a bucket, 0 where it does not apply
-    // (not a GPU wait behind the wait, or its output's memories not yet warm);
-    // the arrival tail Q_tail and Γ of the rung's output, 0 until known and for
-    // a rung that is not a GPU wait.
+    // (not a GPU wait behind the wait, or its output's memory not yet warm);
+    // Q_tail(ℓ) of the rung's output whatever its queue order, 0 until known
+    // and for a rung that is not a GPU wait.
     double SpikeFloorUs(PacingRung rung, double fg_divisor) const noexcept;
     double SpikeTailUs(PacingRung rung) const noexcept;
-    double SpikeGpuUs(PacingRung rung) const noexcept;
     // Median sample X of a warm bucket (release to output point); 0 when the
     // bucket is cold or unknown. The source slack of a plan is L minus this
     // value.
@@ -1174,17 +1207,18 @@ private:
         bool work_recorded = false;     // D = r − A − s entered the work window, or given up
         bool headroom_recorded = false; // r_{n+1} − A_{n+1} − o_n entered the headroom learner
         bool first_work_streamed = false; // LeadGpuReport::first_work_streamed
-        // Lead anchor (unified pacer only): (s − B) in µs, stored at the
-        // release only when the owner passed an anchor, so a slot is 0 (the
-        // whole-struct reset) with the key off. Added to the lead sample and the
-        // spike arrival. Placed in
+        // Lead anchor (unified pacer only): min(s − B, the plan's share) in
+        // µs, stored at the release only when the owner passed an anchor, so a
+        // slot is 0 (the whole-struct reset) with the key off. Added to the lead
+        // sample and the spike arrival. Placed in
         // the padding between the bools: PendingFrame does not grow.
         bool anchored = false; // LeadFrameStart::anchored with delta > 0: the emit paths add anchor_delta_us
         float anchor_delta_us = 0.0f;
         int64_t gpu_start_qpc = 0;      // Reflex gpuRenderStartTime as QPC; 0 unknown
         bool concurrency_recorded = false; // (o_n, g_{n+1}) entered the queue-order window
-        bool spike_recorded = false;     // its spike floor arrival was decided (added or left out)
+        bool spike_recorded = false;     // its spike floor ℓ was decided (kept or left out)
         bool spike_gpu_recorded = false; // its r − g was decided
+        bool paced_start = false;        // LeadFrameStart::paced_start: only such a frame keeps an ℓ
         bool gpu_wait_lead = false;      // planned with the GPU queue wait's lead (held)
         bool late_state = false;         // planned in the late state: its successor adds no D to the work window
         bool ordered = false;            // planned ordered: its pair, its successor's D and sample are that regime's
@@ -1372,10 +1406,10 @@ private:
     double QueueUs(const PendingFrame& frame, const PendingFrame* previous) const noexcept;
     // q itself.
     double RenderQueueWaitUs(const PendingFrame& frame, const PendingFrame& previous) const noexcept;
-    // Spike floor (above): a frame's arrival once its report came (counted in
-    // its output's open block, kept or left out), its r − g once both are
-    // known, and a restart of both outputs' memories. SpikeArrivalUs is the
-    // arrival to keep, the anchor's delta in it, NaN for a frame left out.
+    // Spike floor (above): a frame's ℓ once its report came (counted in its
+    // output's open block, kept or left out), its r − g once both are known,
+    // and a restart of both outputs' memories. SpikeArrivalUs is the arrival
+    // a of a paced start, the anchor's delta in it, NaN for a frame left out.
     void RecordSpikeArrival(PendingFrame* frame, double first_submission_us) noexcept;
     double SpikeArrivalUs(const PendingFrame& frame, double first_submission_us) const noexcept;
     void RecordSpikeGpu(PendingFrame* frame) noexcept;
@@ -1505,10 +1539,10 @@ private:
     // divisor slot (LEAD_WORK_STALE_FRAMES + 1 after a reset: stale).
     std::array<uint32_t, LEAD_DIVISOR_BUCKETS> fg_report_age_frames_{};
     // Spike floor (above), one per GPU output (StartOutput): the open block's
-    // decided frames and the maximum of its kept arrivals, the newest closed
-    // blocks' maxima as 20 µs bins (LEAD_SPIKE_NO_ARRIVAL: none kept), how
-    // many of them kept one and the tail they give (0 below
-    // LEAD_SPIKE_WARM_BLOCKS); the newest r − g times and their median.
+    // decided frames and the maximum of its kept ℓ, the newest closed blocks'
+    // maxima as 20 µs bins (LEAD_SPIKE_NO_ARRIVAL: none kept), how many of
+    // them kept one and the tail they give (0 below LEAD_SPIKE_WARM_BLOCKS);
+    // the newest r − g times and their median, Γ_n for the next ℓ.
     struct SpikeMemory {
         std::array<uint16_t, LEAD_SPIKE_BLOCKS> block_max_bins{};
         std::array<float, LEAD_SPIKE_GPU_SAMPLES> gpu_us{};

@@ -61,21 +61,28 @@ reject a floor, never as evidence that one is safe.
 --replay-spike-floor[=RANK] (default 2, the production rank; write the value
 after "=" and put the capture paths first) replays the lead spike floor per
 segment: for a GPU wait frame whose next GPU work runs behind the wait,
-L' = max(L, L_spike) with
-L_spike = Q_tail(a) + Gamma. a is the CPU arrival: the release -> the first
-GPU work reaching the driver (driver_start) less the time the finished
-simulation waited for the render thread (q = max(0, min(w, b(n-1)) -
-max(s, e)), w = RENDERSUBMIT_START clamped to [s, p]); kept when the first
-work streamed (before the middle of [w, RENDERSUBMIT_END]), 0 <= a <= 3 I and
-the frame was not Signal-pinned (e < gate_signal_after(n-1) <= w). Only after
-this range check, unified-pacer arrivals include the release-to-anchor delta.
-Gamma is the lower median of the newest 32 valid r - g values (0 < r - g <= 3 I).
-By default each GPU output closes a block every 64 decided frames; Q_tail is
-the RANK-th largest 20 us-bin midpoint among the newest 32 closed blocks,
-ignoring empty blocks and requiring at least 4 blocks with evidence. With
---spike-memory arrivals (older builds) both outputs share one memory and
-only kept arrivals advance blocks. History crosses segments and settle windows
-but not controller generations. Only earlier frames enter the floor. The stall model is
+L' = max(L, L_spike). a is the CPU arrival: the release -> the first GPU work
+reaching the driver (driver_start) less the time the finished simulation
+waited for the render thread (q = max(0, min(w, b(n-1)) - max(s, e)),
+w = RENDERSUBMIT_START clamped to [s, p]); kept only when the first work
+streamed (before the middle of [w, RENDERSUBMIT_END]) and the frame was not
+Signal-pinned (e < gate_signal_after(n-1) <= w). Gamma is the lower median of
+the newest 32 valid r - g values (0 < r - g <= 3 I). --spike-memory selects
+the rules of the capture's build:
+  paired (default, current builds): only frames whose start ReLimiter held
+  (up_flags without the late 0x1 or reset 0x1000 bit; a row without up_flags
+  counts as held), a >= 0, plus the anchor delta capped at the plan's share
+  (N - 1)/N * I; each kept value is l = a + Gamma of the frames before it, at
+  most 3 I; L_spike = Q_tail(l).
+  frames (builds from d30003e to b3967ac): 0 <= a <= 3 I, then the uncapped
+  anchor delta; L_spike = Q_tail(a) + today's Gamma.
+  arrivals (older builds): as frames, but both outputs share one memory and
+  only kept arrivals advance blocks.
+In paired and frames each GPU output closes a block every 64 decided frames;
+Q_tail is the RANK-th largest 20 us-bin midpoint among the newest 32 closed
+blocks, ignoring empty blocks and requiring at least 4 blocks with evidence.
+History crosses segments and settle windows but not controller generations.
+Only earlier frames enter the floor. The stall model is
 max(0, a - (lead - I + G)) with G the median of g - f over frames whose first
 work waited for the gate (f = max(r, Signal) of n - 1), I the median
 interval_us of the segment. Each segment reports L' p5/p50/p95, the share of
@@ -94,6 +101,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import statistics
 from bisect import bisect_right
 from collections import Counter, deque
@@ -135,6 +143,8 @@ SPIKE_GAMMA_SAMPLES = 32   # newest r - g values of Gamma, and the least it need
 SPIKE_WARM_S = 32.0        # not evaluated: the first seconds of a segment
 SPIKE_TAIL_RANK = 2        # the rank LeadController uses (LEAD_SPIKE_TAIL_RANK): the default of the replay
 SPIKE_RANGE_INTERVALS = 3.0  # arrivals and r - g beyond this many intervals are not samples
+UP_LATE, UP_RESET = 0x0001, 0x1000  # up_flags: released after its start target / the start law restarted
+SPIKE_MEMORIES = ("paired", "frames", "arrivals")
 STALL_ABSOLUTE_MS = 3.0
 SPIKE_CAVEAT = ("the replay keeps the render thread's timing as captured (the arrival is not changed by the "
                 "floor) and can only reject a floor, never approve one")
@@ -175,6 +185,7 @@ class Frame:
     anchor_delta_ms: float = 0.0
     start_applied: bool = False
     start_limit_ms: float = 0.0
+    up_flags: int | None = None                            # unified pacer flags (UnifiedFlag); None: not written
 
 
 @dataclass
@@ -254,7 +265,8 @@ def load(path: Path, events_path: Path | None = None) -> Capture:
                       source_placement=int(_float(row, "source_placement") or 0), grid_index=grid,
                       fg_divisor=_float(row, "fg_divisor") or 1.0, generation=generation,
                       start_applied=bool(_float(row, "plan_start_applied")),
-                      start_limit_ms=(_float(row, "plan_start_limit_us") or 0.0) / 1000.0)
+                      start_limit_ms=(_float(row, "plan_start_limit_us") or 0.0) / 1000.0,
+                      up_flags=None if (flags := _float(row, "up_flags")) is None else int(flags))
             unique.setdefault((generation, f.frame_id), f)  # FG outputs repeat a real frame's row
     reports = sorted(unique.values(), key=lambda f: f.s)
     for f in reports:
@@ -579,16 +591,19 @@ def _gate_pass(prev: Frame) -> float | None:
     return max(values) if values else None
 
 
-def _spike_sample(f: Frame, prev: Frame | None, interval_ms: float) -> tuple[float | None, str | None, float | None, float | None]:
+def _spike_sample(f: Frame, prev: Frame | None, interval_ms: float,
+                  paired: bool = False) -> tuple[float | None, str | None, float | None, float | None]:
     """(arrival a, why a is not kept, r - g, g - f) of frame n, in ms.
 
     a = (driver_start - s) - q with q = max(0, min(w, b(n-1)) - max(s, e)) (LeadController::QueueUs; w is
     RENDERSUBMIT_START clamped to [s, p]): the time from the release to the first work reaching the driver
     less the time the finished simulation waited for the render thread. Kept only when the first work
-    streamed (driver_start before the middle of [w, RENDERSUBMIT_END]), 0 <= a <= 3 I, and the frame was
-    not Signal-pinned (e < o(n-1) <= w: the render thread waited for the Signal, not for work).
-    For unified plans the kept arrival is then measured from B, not s (add the
-    anchor delta). g - f only over frames whose first work waited for the gate."""
+    streamed (driver_start before the middle of [w, RENDERSUBMIT_END]) and the frame was not Signal-pinned
+    (e < o(n-1) <= w: the render thread waited for the Signal, not for work). For unified plans the kept
+    arrival is measured from B, not s (add the anchor delta). paired (current builds): only a start the
+    owner held (no late or reset flag), a >= 0 and the delta capped at the plan's share (N - 1)/N * I, the
+    3 I bound left to the paired value; otherwise 0 <= a <= 3 I before the full delta. g - f only over frames
+    whose first work waited for the gate."""
     m = f.m
     limit = SPIKE_RANGE_INTERVALS * interval_ms
     gamma = None
@@ -599,6 +614,8 @@ def _spike_sample(f: Frame, prev: Frame | None, interval_ms: float) -> tuple[flo
     driver = m["driver_start"]
     passed = _gate_pass(prev)
     gap = m["gpu_start"] - passed if passed is not None and "gpu_start" in m and driver < passed else None
+    if paired and f.up_flags is not None and f.up_flags & (UP_LATE | UP_RESET):
+        return None, "start_not_held", gamma, gap
     call = f.present_call if f.present_call is not None else m.get("present_start")
     if call is None or not all(k in m for k in ("rs_start", "rs_end", "sim_end")) or "present_end" not in prev.m:
         return None, "no_arrival", gamma, gap
@@ -608,9 +625,13 @@ def _spike_sample(f: Frame, prev: Frame | None, interval_ms: float) -> tuple[flo
         return None, "not_streamed", gamma, gap
     if prev.signal is not None and m["sim_end"] < prev.signal <= w:
         return None, "signal_pinned", gamma, gap
-    if not 0.0 <= arrival <= limit:
+    if not 0.0 <= arrival <= (float("inf") if paired else limit):
         return None, "arrival_out_of_range", gamma, gap
-    return arrival + f.anchor_delta_ms, None, gamma, gap
+    delta = f.anchor_delta_ms
+    if paired:  # LeadController::OnSourceRelease: N = max(fg_divisor, 1), 1 when not finite
+        divisor = f.fg_divisor if math.isfinite(f.fg_divisor) and f.fg_divisor > 1.0 else 1.0
+        delta = min(delta, interval_ms * (1.0 - 1.0 / divisor))
+    return arrival + delta, None, gamma, gap
 
 
 def _percentiles(values: list[float]) -> dict[str, float | None]:
@@ -668,10 +689,13 @@ class _SpikeRecord:
 def _spike_records(capture: Capture, segmenter: Segmenter, rank: int, memory: str) -> Iterator[_SpikeRecord]:
     """One decision per captured real frame with a report. A frame sees only prior samples.
 
-    Segment membership affects evaluation, never history. Report delivery order,
-    pre-capture history and unannounced live bucket resets cannot be reconstructed.
+    paired keeps l = a + Gamma, Gamma of the frames before it (none before 32 are known), at most 3 I, and its
+    floor is Q_tail(l); frames and arrivals keep a and add today's Gamma to Q_tail(a). Segment membership
+    affects evaluation, never history. Report delivery order, pre-capture history and unannounced live bucket
+    resets cannot be reconstructed.
     """
-    by_frames = memory == "frames"
+    by_frames = memory != "arrivals"
+    paired = memory == "paired"
     memories: dict[int, _SpikeMemory] = {}
     warm_end: dict[str, float] = {}
     prev: Frame | None = None
@@ -688,10 +712,22 @@ def _spike_records(capture: Capture, segmenter: Segmenter, rank: int, memory: st
                 memories[key] = _SpikeMemory()
             m = memories[key]
             adjacent = prev if prev is not None and f.frame_id == prev.frame_id + 1 else None
-            arrival, why, gpu, gap = _spike_sample(f, adjacent, f.interval_ms)
+            arrival, why, gpu, gap = _spike_sample(f, adjacent, f.interval_ms, paired)
             tail, gamma = m.tail, m.gamma
-            spike = tail + gamma if tail is not None and gamma is not None else None
-            closed = m.record(arrival, gpu, by_frames, rank)
+            value = arrival
+            if paired:
+                spike = tail
+                if arrival is not None and gamma is None:
+                    arrival = value = None
+                    why = "gamma_not_known"
+                elif arrival is not None:
+                    value = arrival + gamma
+                    if value > SPIKE_RANGE_INTERVALS * f.interval_ms:
+                        arrival = value = None
+                        why = "lead_out_of_range"
+            else:
+                spike = tail + gamma if tail is not None and gamma is not None else None
+            closed = m.record(value, gpu, by_frames, rank)
         else:
             why = "not_gpu_output"
         yield _SpikeRecord(f, segment, warmed, arrival, why, gap, tail, gamma, spike, closed)
@@ -757,7 +793,7 @@ def spike_floor(stream: list[_SpikeRecord], rank: int, predict: bool) -> dict[st
 def analyze(path: Path, events_path: Path | None = None, settle_s: float = 2.0, quantile: float = 0.95,
             allowance_us: float = 500.0, replays: list[tuple[str, float]] | None = None,
             replay_segment: str = "held", submit_saving_ms: float = 0.0, spike_rank: int | None = None,
-            predict: bool = False, spike_memory: str = "frames") -> dict[str, Any]:
+            predict: bool = False, spike_memory: str = "paired") -> dict[str, Any]:
     capture = load(path, events_path)
     segmenter = Segmenter(capture, settle_s * 1000.0)
     origin = capture.frames[0].s if capture.frames else 0.0
@@ -913,13 +949,14 @@ def main() -> int:
                         help="assume each replayed submission this much shorter (optimistic bound)")
     parser.add_argument("--replay-spike-floor", nargs="?", const=SPIKE_TAIL_RANK, type=int, metavar="RANK",
                         dest="spike_rank",
-                        help="replay the lead spike floor L' = max(L, Q_tail + Gamma) per segment, Q_tail the "
-                             f"RANK-th largest block maximum of the arrivals (default {SPIKE_TAIL_RANK}, the "
-                             "production rank; write --replay-spike-floor=RANK, capture paths first). The replay "
-                             "keeps the render thread's timing as captured and can only reject a floor, never "
-                             "approve one")
-    parser.add_argument("--spike-memory", choices=("frames", "arrivals"), default="frames",
-                        help="per-output blocks of decided frames (default), or older shared blocks of kept arrivals")
+                        help="replay the lead spike floor L' = max(L, L_spike) per segment, L_spike the RANK-th "
+                             f"largest block maximum (default {SPIKE_TAIL_RANK}, the production rank; write "
+                             "--replay-spike-floor=RANK, capture paths first) under --spike-memory's rules. The "
+                             "replay keeps the render thread's timing as captured and can only reject a floor, "
+                             "never approve one")
+    parser.add_argument("--spike-memory", choices=SPIKE_MEMORIES, default="paired",
+                        help="the rules of the capture's build: paired (default, current), frames (d30003e to "
+                             "b3967ac: Q_tail(a) + today's Gamma) or arrivals (older shared blocks of kept arrivals)")
     parser.add_argument("--predict", action="store_true",
                         help="with --replay-spike-floor: L' = L_spike alone (archives whose captured lead exceeds "
                              "the floor); same reject-only caveat")

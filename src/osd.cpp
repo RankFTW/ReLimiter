@@ -236,10 +236,8 @@ static void DrawPacingPipelineStatus() {
             status.lead_samples, status.lead_budget_limited ? ", at budget" : "", status.grid_epoch);
         // Lead spike floor (lead_controller.h): shown where it applies.
         if (status.lead_floor_us > 0.0) {
-            ImGui::TextDisabled("Lead spike floor: %.2f ms = arrival tail %.2f + GPU %.2f | own quantile %.2f ms%s",
-                status.lead_floor_us / 1000.0, status.lead_floor_tail_us / 1000.0,
-                status.lead_floor_gpu_us / 1000.0, status.lead_quantile_us / 1000.0,
-                status.lead_floor_limited ? " | sets the lead" : "");
+            ImGui::TextDisabled("Lead spike floor: %.2f ms | own quantile %.2f ms%s", status.lead_floor_us / 1000.0,
+                status.lead_quantile_us / 1000.0, status.lead_floor_limited ? " | sets the lead" : "");
         }
     } else {
         ImGui::TextDisabled("Lead: - | Grid epoch: -");

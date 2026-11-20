@@ -686,20 +686,13 @@ double LeadController::SpikeFloorUs(PacingRung rung, double fg_divisor) const no
         return 0.0;
     }
     const SpikeMemory& memory = spike_memory_[output];
-    if (memory.evidence < LEAD_SPIKE_WARM_BLOCKS || memory.gpu_count < LEAD_SPIKE_GPU_SAMPLES) return 0.0;
-    return memory.tail_us + memory.gpu_median_us;
+    return memory.evidence < LEAD_SPIKE_WARM_BLOCKS ? 0.0 : memory.tail_us;
 }
 
 double LeadController::SpikeTailUs(PacingRung rung) const noexcept
 {
     size_t output = 0;
     return StartOutput(rung, &output) ? spike_memory_[output].tail_us : 0.0;
-}
-
-double LeadController::SpikeGpuUs(PacingRung rung) const noexcept
-{
-    size_t output = 0;
-    return StartOutput(rung, &output) ? spike_memory_[output].gpu_median_us : 0.0;
 }
 
 double LeadController::ValidQuantile(double quantile) noexcept
@@ -776,16 +769,20 @@ void LeadController::OnSourceRelease(const LeadFrameStart& frame) noexcept
     slot.queue_correction = frame.guard.queue_correction;
     // Start term (lead_controller.h): the game's arrival; one later than the release is none.
     slot.arrival_qpc = frame.arrival_qpc > 0 && frame.arrival_qpc <= frame.source_release_qpc ? frame.arrival_qpc : 0;
+    slot.paced_start = frame.paced_start;
     // Lead anchor (lead_controller.h, unified pacer only): the owner sets
     // frame.anchored only there, so with the key off this is one not-taken
     // branch on a bool and the slot keeps its zero from the whole-struct
     // reset (slots are only reset that way). s keeps its physical meaning in
-    // every check; delta = (s − B) enters only the lead quantities
-    // (EmitLeadSample, RecordSpikeArrival). An anchor not
+    // every check; delta = min(s − B, (N − 1)/N · I) enters only the lead
+    // quantities (EmitLeadSample, RecordSpikeArrival): a release later than
+    // its plan adds the game's lateness to s − B, not to them. An anchor not
     // earlier than s is none.
     if (frame.anchored && frame.lead_anchor_qpc > 0 && frame.lead_anchor_qpc < frame.source_release_qpc) {
+        const double divisor = std::isfinite(frame.fg_divisor) ? std::max(frame.fg_divisor, 1.0) : 1.0;
+        const double share_us = frame.interval_us * (divisor - 1.0) / divisor;
         slot.anchor_delta_us = static_cast<float>(
-            MicrosecondsBetween(frame.lead_anchor_qpc, frame.source_release_qpc));
+            std::min(MicrosecondsBetween(frame.lead_anchor_qpc, frame.source_release_qpc), share_us));
         slot.anchored = slot.anchor_delta_us > 0.0f;
     }
     SetField(&slot, FieldSource, frame.source_release_qpc);
@@ -1944,22 +1941,25 @@ double LeadController::RenderQueueWaitUs(const PendingFrame& frame, const Pendin
     return queue_us > 0.0 ? queue_us : 0.0;
 }
 
-// Spike floor arrival (lead_controller.h): a = (w − s − q) + F_n, decided once
-// per frame when its report arrives (the first report wins). The frame counts
-// in its output's open block whether its arrival is kept or left out.
+// Spike floor ℓ (lead_controller.h): a + Γ_n, decided once per frame when its
+// report arrives (the first report wins), with the output's Γ at that moment:
+// a frame decided before LEAD_SPIKE_GPU_SAMPLES GPU times are known, one
+// without an arrival and one whose ℓ lies beyond 3 I are left out. The frame
+// counts in its output's open block whether its ℓ is kept or left out.
 void LeadController::RecordSpikeArrival(PendingFrame* frame, double first_submission_us) noexcept
 {
     size_t output = 0;
     if (frame->spike_recorded || !frame->sampled || !StartOutput(frame->rung, &output)) return;
     frame->spike_recorded = true;
-    const double arrival_us = SpikeArrivalUs(*frame, first_submission_us);
     SpikeMemory& memory = spike_memory_[output];
-    if (std::isnan(arrival_us)) {
+    const double spike_lead_us = memory.gpu_count < LEAD_SPIKE_GPU_SAMPLES ? std::numeric_limits<double>::quiet_NaN()
+        : SpikeArrivalUs(*frame, first_submission_us) + memory.gpu_median_us;
+    if (!(spike_lead_us <= LEAD_LONG_SAMPLE_INTERVALS * frame->interval_us)) {
         ++statistics_.spike_excluded;
     } else {
         ++statistics_.spike_samples;
-        statistics_.last_spike_arrival_us = arrival_us;
-        const auto bin = static_cast<uint16_t>(std::min(arrival_us / LEAD_HISTOGRAM_BIN_US,
+        statistics_.last_spike_lead_us = spike_lead_us;
+        const auto bin = static_cast<uint16_t>(std::min(spike_lead_us / LEAD_HISTOGRAM_BIN_US,
             static_cast<double>(LEAD_SPIKE_NO_ARRIVAL - 1)));
         if (!memory.current_kept || bin > memory.current_max_bin) memory.current_max_bin = bin;
         memory.current_kept = true;
@@ -1971,10 +1971,10 @@ double LeadController::SpikeArrivalUs(const PendingFrame& frame, double first_su
 {
     constexpr double kLeftOut = std::numeric_limits<double>::quiet_NaN();
     const PendingFrame* previous = Previous(frame);
-    if (!frame.first_work_streamed || !std::isfinite(first_submission_us) || first_submission_us < 0.0 ||
-        previous == nullptr || !previous->started || !HasField(frame, FieldSimulationEnd) ||
-        !HasField(frame, FieldRenderSubmit) || !HasField(frame, FieldPresentCall) ||
-        !HasField(*previous, FieldPresentEnd)) {
+    if (!frame.paced_start || !frame.first_work_streamed || !std::isfinite(first_submission_us) ||
+        first_submission_us < 0.0 || previous == nullptr || !previous->started ||
+        !HasField(frame, FieldSimulationEnd) || !HasField(frame, FieldRenderSubmit) ||
+        !HasField(frame, FieldPresentCall) || !HasField(*previous, FieldPresentEnd)) {
         return kLeftOut;
     }
     // The render thread took a finished frame only at or after frame n − 1's
@@ -1988,9 +1988,8 @@ double LeadController::SpikeArrivalUs(const PendingFrame& frame, double first_su
     const double submit_us = std::clamp(MicrosecondsBetween(source, frame.qpc[FieldRenderSubmit]),
         0.0, std::max(present_us, 0.0));
     const double arrival_us = submit_us - RenderQueueWaitUs(frame, *previous) + first_submission_us;
-    if (!(arrival_us >= 0.0) || arrival_us > LEAD_LONG_SAMPLE_INTERVALS * frame.interval_us) return kLeftOut;
-    // Lead anchor: the arrival's range check above is on s; the kept arrival
-    // is measured from B (unified pacer only).
+    if (!(arrival_us >= 0.0)) return kLeftOut;
+    // Lead anchor: the arrival measured from B (unified pacer only); its 3 I bound applies to ℓ.
     return frame.anchored ? arrival_us + static_cast<double>(frame.anchor_delta_us) : arrival_us;
 }
 

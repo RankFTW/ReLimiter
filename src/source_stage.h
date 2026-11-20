@@ -220,6 +220,10 @@ struct SourceStageFrame {
     bool planned = false;    // false: invalid request or grid input; no plan, no wait
     bool plan_published = false;
     bool slept = false;
+    // The start was held to its planned start: the wait (the Sleep hook's consumed one or the marker's own) ran to
+    // the start target, the game did not arrive after it and the start law was not reset at this frame. The lead
+    // controller keeps a spike floor arrival only from such a frame (LeadFrameStart::paced_start).
+    bool start_paced = false;
     PacingFramePlan plan{};
     PacingEpochReason epoch_started = PacingEpochReason::None; // started by this plan; None = none
     PacingEpochReason grid_epoch_reason = PacingEpochReason::None; // reason that started plan.grid_epoch

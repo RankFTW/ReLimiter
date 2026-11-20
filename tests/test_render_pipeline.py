@@ -252,11 +252,13 @@ def spike_capture(lead_ms=lambda k: 12.0 if k % 4 else 20.0, gamma=lambda k: SPI
 
 
 class SpikeFloorTests(unittest.TestCase):
+    """--spike-memory frames: the rules of builds d30003e to b3967ac, L_spike = Q_tail(a) + today's Gamma."""
+
     def run_floor(self, rank=4, predict=False, **capture):
         rows, kept = spike_capture(**capture)
         with tempfile.TemporaryDirectory() as directory:
             path = write(directory, rows, columns=SPIKE_COLUMNS)
-            report = pipeline.analyze(path, spike_rank=rank, predict=predict)
+            report = pipeline.analyze(path, spike_rank=rank, predict=predict, spike_memory="frames")
         return report, kept
 
     def test_arrival_reconstruction_and_exclusions(self):
@@ -446,6 +448,59 @@ class SpikeFloorTests(unittest.TestCase):
             with mock.patch.object(sys, "argv", ["render_pipeline.py", str(path), "--predict"]), \
                     contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 pipeline.main()
+
+
+PAIRED_COLUMNS = SPIKE_COLUMNS + ["up_flags"]
+
+
+class PairedSpikeFloorTests(unittest.TestCase):
+    """--spike-memory paired (the default, current builds): only held starts, the anchor delta at most the plan's
+    share, l = a + Gamma of the frames before it, at most 3 I, and L_spike = Q_tail(l)."""
+
+    def test_held_starts_and_the_anchor_share(self):
+        rows = [spike_row(k, 12.0, "spike" if k > 1 else "normal", 32.0 if k == 6 else 9.0) for k in range(1, 7)]
+        for r, flags in zip(rows, (0, 0, pipeline.UP_LATE, pipeline.UP_RESET, "", 0)):
+            r["up_flags"] = flags
+        with tempfile.TemporaryDirectory() as directory:
+            frames = pipeline.load(write(directory, rows, columns=PAIRED_COLUMNS)).frames
+        self.assertEqual([f.up_flags for f in frames], [0, 0, 1, 0x1000, None, 0])
+        second = frames[1]
+        second.fg_divisor, second.anchor_delta_ms = 2.0, 11.0  # released 22 ms after its grid predecessor at FG 2x
+        self.assertAlmostEqual(pipeline._spike_sample(second, frames[0], 10.0, paired=True)[0], 9.0 + 5.0, places=6)
+        self.assertAlmostEqual(pipeline._spike_sample(second, frames[0], 10.0)[0], 9.0 + 11.0, places=6)
+        second.fg_divisor = float("inf")  # as in production, a divisor that is not finite counts as 1: no share
+        self.assertAlmostEqual(pipeline._spike_sample(second, frames[0], 10.0, paired=True)[0], 9.0, places=6)
+        for late in (frames[2], frames[3]):  # released after its target; the start law restarted
+            self.assertEqual(pipeline._spike_sample(late, frames[0], 10.0, paired=True)[:2], (None, "start_not_held"))
+        self.assertAlmostEqual(pipeline._spike_sample(frames[4], frames[3], 10.0, paired=True)[0], 9.0, places=6)
+        # a = 32 ms > 3 I: the paired sample keeps it (its bound is on l), the older rules do not
+        self.assertAlmostEqual(pipeline._spike_sample(frames[5], frames[4], 10.0, paired=True)[0], 32.0, places=6)
+        self.assertEqual(pipeline._spike_sample(frames[5], frames[4], 10.0)[:2], (None, "arrival_out_of_range"))
+
+    def test_each_kept_value_keeps_the_gpu_time_of_its_frames(self):
+        # Blocks 1-6: r - g is 6.0 on even frames and 8.0 on odd ones, so the lower median of the 32 frames before
+        # any frame is 6.0. Each block's 9.005 ms arrival (an even frame) takes 8.0 itself: had it entered the
+        # median before the decision, that median would be 8.0. Blocks 7-8: 9.5 and, at frame 450, a 25 ms
+        # arrival (l = 34.5 ms > 3 I).
+        rows = []
+        for k in range(1, 64 * 8 + 1):
+            spike = k <= 64 * 6 and k % 64 == 10
+            arrival = 9.005 if spike else 25.0 if k == 450 else 0.5
+            gamma = 9.5 if k > 64 * 6 else 8.0 if spike or k % 2 else 6.0
+            rows.append(spike_row(k, 12.0, "normal" if arrival == 0.5 else "spike", arrival, gamma))
+        with tempfile.TemporaryDirectory() as directory:
+            path = write(directory, rows, columns=SPIKE_COLUMNS)
+            c = pipeline.load(path)
+            self.assertEqual(pipeline.analyze(path, spike_rank=2)["spike_floor"]["memory"], "paired")
+        segmenter = pipeline.Segmenter(c, 0)
+        paired = list(pipeline._spike_records(c, segmenter, 2, "paired"))
+        frames = list(pipeline._spike_records(c, segmenter, 2, "frames"))
+        self.assertEqual(paired[9].why, "gamma_not_known")  # frame 10: before 32 GPU times were known
+        self.assertEqual(paired[449].why, "lead_out_of_range")
+        self.assertAlmostEqual(frames[449].arrival, 25.0, places=6)
+        # 9.005 + 6.0 at the 20 us bin midpoint, whatever the GPU time is now; the older rules add today's 9.5
+        self.assertAlmostEqual(paired[-1].spike, 15.01, places=6)
+        self.assertAlmostEqual(frames[-1].spike, 9.01 + 9.5, places=6)
 
 
 if __name__ == "__main__":

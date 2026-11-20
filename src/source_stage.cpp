@@ -293,6 +293,9 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     }
 
     frame.release_qpc = clock->Now();
+    // Held to its planned start: the source wait ran, unclamped, to S_n.
+    frame.start_paced = frame.slept && frame.wait_target_qpc == grid_plan.source_wake_qpc &&
+        frame.release_qpc >= grid_plan.source_wake_qpc;
     LeadFrameStart start{};
     start.key = plan.key;
     start.grid_index = plan.grid_index;
@@ -313,6 +316,7 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     // The FG input wait has no resume probes (gpu_present_gate_d3d12.cpp):
     // only the GPU queue wait may wait for a GpuResume event.
     start.gpu_resume_probe = pipeline.gpu_probes && plan.rung == PacingRung::GpuQueueWait;
+    start.paced_start = frame.start_paced;
     lead_.OnSourceRelease(start);
     return frame;
 }
@@ -625,6 +629,23 @@ SourceStageFrame SourceStage::RunUnifiedFrame(
         frame.pre_wait_start_qpc = start.arrival_qpc;
         frame.pre_wait_end_qpc = release_qpc;
     }
+    // The start was held to its planned start. The evidence of the wait:
+    //    - a consumed Sleep reservation: the Sleep hook's outcome is Completed (its start wait ran
+    //      to T). Late (no start wait was needed, however the reservation looked) and Failed are
+    //      not waits that held it;
+    //    - the marker's own wait (no usable reservation, or a failed or still running one): it ran
+    //      (frame.wait_start_qpc is set only when the marker waited) and returned at the target. A
+    //      marker that arrives after the target waits for nothing, whatever happened to the
+    //      reservation.
+    //    A frame that arrived after its planned start (release_now) or whose wait was cancelled or
+    //    clamped short of the target (wait_failed) was not held either. The lead's spike floor also
+    //    leaves out the first start after a reset of the law (SourceStageFrame::start_paced).
+    const bool wait_ran_to_target = resolution.kind == UnifiedResolutionKind::Consumed
+        ? UnifiedMailbox_Outcome(word) == UnifiedSleepOutcome::Completed &&
+              release_qpc >= UnifiedPacer_TargetTicks(start.target)
+        : frame.wait_start_qpc != 0 && frame.slept && release_qpc >= UnifiedPacer_TargetTicks(start.target);
+    const bool start_held = !start.release_now && !wait_failed && wait_ran_to_target;
+    frame.start_paced = start_held && ((start.flags | commit_flags) & kUpReset) == 0;
     LeadFrameStart lead_start{};
     lead_start.key = plan.key;
     lead_start.grid_index = plan.grid_index;
@@ -644,26 +665,13 @@ SourceStageFrame SourceStage::RunUnifiedFrame(
     // A(n): the Sleep hook's arrival of a consumed reservation, else the marker's (the start term's turnaround).
     lead_start.arrival_qpc = start.arrival_qpc;
     lead_start.gpu_resume_probe = pipeline.gpu_probes && plan.rung == PacingRung::GpuQueueWait;
+    lead_start.paced_start = frame.start_paced;
     lead_.OnSourceRelease(lead_start);
 
     // 6. The law's ring entry of this frame (producer frame id, release, and whether the GPU term
-    //    paced its start: the hardware term was the binding one at the plan (kUpBoundGpu) and a
-    //    start wait actually RAN and reached that plan's target). The evidence of the wait:
-    //    - a consumed Sleep reservation: the Sleep hook's outcome is Completed (its start wait ran
-    //      to T). Late (no start wait was needed, however the reservation looked) and Failed are
-    //      not waits that paced;
-    //    - the marker's own wait (no usable reservation, or a failed or still running one): it ran
-    //      (frame.wait_start_qpc is set only when the marker waited) and returned at the target. A
-    //      marker that arrives after the target waits for nothing: not paced, whatever happened to
-    //      the reservation.
-    //    A frame that arrived after its planned start (release_now) or whose wait was cancelled or
-    //    clamped short of the target (wait_failed) is not paced either.
-    const bool wait_ran_to_target = resolution.kind == UnifiedResolutionKind::Consumed
-        ? UnifiedMailbox_Outcome(word) == UnifiedSleepOutcome::Completed &&
-              release_qpc >= UnifiedPacer_TargetTicks(start.target)
-        : frame.wait_start_qpc != 0 && frame.slept && release_qpc >= UnifiedPacer_TargetTicks(start.target);
-    const bool gpu_paced = (start.flags & kUpBoundGpu) != 0 && !start.release_now && !wait_failed &&
-        wait_ran_to_target;
+    //    paced its start: the hardware term was the binding one at the plan (kUpBoundGpu) and the
+    //    start was held to that plan's target, above).
+    const bool gpu_paced = (start.flags & kUpBoundGpu) != 0 && start_held;
     // How long the start was held: the Sleep hook's wait the branch consumed and the marker's own. The queue
     // law counts no more of the frame's starvation than this (UnifiedPacer::OnPlan).
     const int64_t held_ticks = std::max<int64_t>(0, frame.pre_wait_end_qpc - frame.pre_wait_start_qpc) +
