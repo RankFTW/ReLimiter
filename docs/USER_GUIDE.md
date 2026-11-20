@@ -261,7 +261,7 @@ Enable **Show OSD** in the OSD section. The default visibility key is **PageUp**
 |-------|----------|
 | **Performance** | FPS, 1% Low, 0.1% Low, Frametime and Frametime Graph |
 | **Quality** | Jitter, Frame Pacing |
-| **Latency** | CPU Latency, GPU Render, Frame Cost, FG Time, PC Latency and its Breakdown |
+| **Latency** | CPU Latency, GPU Render, Frame Cost, FG Time, PCL (PC Latency) and its Breakdown |
 | **Pipeline** | Frame Generation, Limiter |
 | **Hardware** | GPU temperature, clock, usage and VRAM; CPU and RAM usage |
 | **DLSS Info** | Quality level, active features, render/output resolution, presets and component versions |
@@ -272,7 +272,7 @@ FPS, lows and the frametime graph describe ReLimiter's measured pacing cadence. 
 
 **Jitter** is the average change from one frame interval to the next over the last 5 seconds. Lower is smoother; a steady frame rate has almost none, even when it is below the cap. It is green under 8% of the frame interval, yellow under 16% and red above, and reads `Jitter: -` while no frames are measured. It is measured on the frames named under [Frame Pacing](#frame-pacing) and needs no PC latency collection, also with DLSS Frame Generation. Where hardware flip metering places the generated frames, it is measured on the real frames entering frame generation and reads `(real frames)`: the generated frames are not measured. In ReLimiter's own captures that figure rose and fell with the displayed one from scene to scene, and read about 0.1 ms lower in calm scenes and higher in rough ones.
 
-**PC Latency** and its **Breakdown** option are available only when `native_pcl_enabled=true` in the INI. Otherwise, those controls and readouts stay hidden, including when loading an OSD preset. See [Optional PC Latency Measurement](#optional-pc-latency-measurement) for setup. Measurements can arrive with a delay; a stale or unavailable reading should not be treated as a current result.
+**PCL** (PC Latency) and its **Breakdown** option are available only when `native_pcl_enabled=true` in the INI. Otherwise, those controls and readouts stay hidden, including when loading an OSD preset. See [Optional PC Latency Measurement](#optional-pc-latency-measurement) for setup. A live reading shows the number alone; otherwise the line names its state, for example `PCL: N/A (warming)`, or `(low-FPS unreliable)` in amber after a number. Measurements can arrive with a delay; a stale or unavailable reading should not be treated as a current result.
 
 ### Frame Pacing
 
@@ -522,7 +522,7 @@ PC latency collection is disabled by default and has no user-interface toggle. I
 
 1. Close the game.
 2. Set `native_pcl_enabled=true` under `[FrameLimiter]` in `relimiter.ini`.
-3. Launch the game and enable **PC Latency** in the OSD if you want a readout.
+3. Launch the game and enable **PCL** in the OSD if you want a readout.
 
 This requires suitable NVIDIA PCL markers from the game and Windows tracing permissions. In most games it does not change pacing.
 

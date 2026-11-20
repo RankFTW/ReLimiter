@@ -941,8 +941,8 @@ static void DrawSettingsImpl(reshade::api::effect_runtime* runtime, bool editabl
         HelpTip("CPU pipeline time: SIM_START to RENDERSUBMIT_END. Measures how long the CPU spends on simulation + render submission.");
         if (g_config.native_pcl_enabled) {
             FlowSeparator();
-            if (ImGui::Checkbox("PC Latency##osd_elem", &g_config.osd_show_native_pcl)) config_dirty = true;
-            HelpTip("Show native NVIDIA PC Latency correlated to the displayed application frame.");
+            if (ImGui::Checkbox("PCL##osd_elem", &g_config.osd_show_native_pcl)) config_dirty = true;
+            HelpTip("Show PCL: native NVIDIA PC Latency, correlated to the displayed application frame.");
             if (g_config.osd_show_native_pcl) {
                 ImGui::SameLine();
                 ImGui::TextDisabled("-");
@@ -2285,12 +2285,21 @@ static void DrawOSDImpl(reshade::api::effect_runtime* runtime) {
                 }
             }
 
+            // A live reading is the number alone; the state is named only when the number is
+            // missing or not to be trusted (low FPS), with the line's colour.
             char native_pcl_text[96];
-            if (total_available) {
+            if (total_available && native_pcl.reliable) {
                 snprintf(
                     native_pcl_text,
                     sizeof(native_pcl_text),
-                    "PC Latency: %.1f ms (%s)",
+                    "PCL: %.1f ms",
+                    native_pcl.total_us / 1000.0);
+            }
+            else if (total_available) {
+                snprintf(
+                    native_pcl_text,
+                    sizeof(native_pcl_text),
+                    "PCL: %.1f ms (%s)",
                     native_pcl.total_us / 1000.0,
                     NativePcl_StatusText(native_pcl.status));
             }
@@ -2298,7 +2307,7 @@ static void DrawOSDImpl(reshade::api::effect_runtime* runtime) {
                 snprintf(
                     native_pcl_text,
                     sizeof(native_pcl_text),
-                    "PC Latency: N/A (%s)",
+                    "PCL: N/A (%s)",
                     NativePcl_StatusText(native_pcl.status));
             }
             OSDTextColored(native_pcl_color, native_pcl_text);
