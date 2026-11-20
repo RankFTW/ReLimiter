@@ -126,7 +126,7 @@ void TestMarkerEligibilityAndFg() {
         CHECK(fg.QualifiedFrames() == 0);
     }
 }
-// The thread-local production route behind NativeGate_OnMarker/NativeGateCall:
+// The production route behind NativeGate_OnMarker/NativeGateCall (each thread's route on the shared chain):
 // every marker feeds it, and it qualifies after kQualificationFrames complete
 // mappings in a selecting mode. Shadow never qualifies for selection.
 void RouteFrame(uint64_t frame, bool expect_native) {
@@ -351,6 +351,69 @@ void TestSameThreadOwnerKeepsMarker() {
     });
     marker.join();
 }
+// The production route with four live threads taking the frames in turn, each frame's marker and Present on one
+// thread (Cyberpunk 2077): it qualifies after 32 frames, publishes the count from whichever thread presented
+// last, and then selects native carriage. A Present without a marker keeps the qualification on a thread that
+// never carried a frame and resets it on one that did.
+void TestRotatingPresentThreads() {
+    NativeGate_SetMode(NativeGateMode::Marker);
+    struct Worker {
+        std::atomic<uint64_t> command{0}; // (serial << 32) | frame; frame 0: a Present without a marker
+        std::atomic<uint64_t> done{0};
+        std::atomic<bool> expect_native{false};
+        std::thread thread;
+    };
+    constexpr int kThreads = 4;
+    Worker workers[kThreads];
+    std::atomic<bool> stop{false};
+    const auto markerless = [](uint64_t frame) {
+        auto context = Context(frame);
+        NativeGate_BeginScope(context.native_swapchain, context.swapchain_generation);
+        {
+            NativeGateCall call(context, 0);
+            CHECK(call.trace.source_frame_id == 0 && call.trace.status == NativeGateStatus::Unmapped);
+            call.Complete(true, false);
+        }
+        NativeGate_EndScope(context.native_swapchain, context.swapchain_generation);
+    };
+    for (auto& worker : workers) {
+        worker.thread = std::thread([&worker, &stop, markerless] {
+            uint64_t last = 0, frame = 2000;
+            while (!stop.load()) {
+                const uint64_t command = worker.command.load();
+                if (command == last) { std::this_thread::yield(); continue; }
+                last = command;
+                const uint64_t id = command & 0xFFFF'FFFFu;
+                if (id == 0) markerless(frame);
+                else RouteFrame(frame = id, worker.expect_native.load());
+                worker.done.store(command);
+            }
+        });
+    }
+    uint64_t serial = 0;
+    const auto run = [&](int index, uint64_t frame, bool expect_native) {
+        Worker& worker = workers[index];
+        worker.expect_native.store(expect_native);
+        const uint64_t command = (++serial << 32) | frame;
+        worker.command.store(command);
+        while (worker.done.load() != command) std::this_thread::yield();
+    };
+    for (uint64_t frame = 2001; frame <= 2000 + NativePresentGateRoute::kQualificationFrames; ++frame) {
+        run(static_cast<int>(frame % kThreads), frame, false);
+        CHECK(NativeGate_GetQualifiedFrames() == frame - 2000);
+    }
+    CHECK(NativeGate_IsRouteQualified());
+    run(1, 2033, true);
+    std::thread([markerless] { markerless(2033); }).join();
+    CHECK(NativeGate_IsRouteQualified());
+    run(2, 2034, true);
+    run(3, 0, false);
+    CHECK(!NativeGate_IsRouteQualified() && NativeGate_GetQualifiedFrames() == 0);
+    run(0, 2035, false);
+    CHECK(NativeGate_GetQualifiedFrames() == 1);
+    stop.store(true);
+    for (auto& worker : workers) worker.thread.join();
+}
 void TestFgObservationDoesNotAuthorizeEnforcement() {
     NativePresentGateRoute route;
     for(uint64_t frame=1;frame<=40;++frame) {
@@ -379,6 +442,57 @@ void TestFgObservationDoesNotAuthorizeEnforcement() {
     route.EndCall(true,false);
     CHECK(!route.EndScope(context.native_swapchain,context.swapchain_generation));
     CHECK(route.QualifiedFrames()==0);
+}
+// Cyberpunk 2077 presents each frame from whichever job thread is free. The routes of its Present threads share
+// one chain, so 32 consecutive frames qualify the route whichever thread presents each frame.
+void TestSharedChainAcrossThreads() {
+    NativeGateChain chain;
+    NativePresentGateRoute a(&chain), b(&chain), c(&chain);
+    NativePresentGateRoute* rotation[] = {&a, &b, &c};
+    for (uint64_t frame = 1; frame <= 32; ++frame) {
+        CHECK(Frame(rotation[frame % 3], frame).status == NativeGateStatus::Warming);
+        CHECK(chain.qualified == frame);
+    }
+    CHECK(Frame(rotation[33 % 3], 33).status == NativeGateStatus::Native);
+    // The next frame's marker on another thread before this frame's scope has ended: still consecutive.
+    auto first = Context(34), second = Context(35);
+    CHECK(a.Marker(first, Key(34), NativeGateMode::Native, 1));
+    a.BeginScope(first.native_swapchain, first.swapchain_generation);
+    CHECK(a.BeginCall(first, 0, 1).status == NativeGateStatus::Native);
+    a.EndCall(true, false);
+    CHECK(b.Marker(second, Key(35), NativeGateMode::Native, 1));
+    CHECK(a.EndScope(first.native_swapchain, first.swapchain_generation));
+    b.BeginScope(second.native_swapchain, second.swapchain_generation);
+    CHECK(b.BeginCall(second, 0, 1).status == NativeGateStatus::Native);
+    b.EndCall(true, false);
+    CHECK(b.EndScope(second.native_swapchain, second.swapchain_generation) && chain.qualified == 32);
+    // A marker no Present takes (36 on c): the next frame's completion starts the chain again, and c's next
+    // marker, after the route went on, does not count that gap twice.
+    auto lost = Context(36);
+    c.Marker(lost, Key(36), NativeGateMode::Native, 1);
+    Frame(&a, 37);
+    CHECK(chain.qualified == 1);
+    Frame(&b, 38);
+    CHECK(Frame(&c, 39).status == NativeGateStatus::Warming && chain.qualified == 3);
+    // The marker of a thread that hands its frames to another never touches the chain.
+    NativePresentGateRoute marker_only(&chain);
+    auto handed = Context(40);
+    CHECK(!marker_only.Marker(handed, Key(40), NativeGateMode::Native, 1, false));
+    CHECK(marker_only.Status() == NativeGateStatus::Warming && chain.qualified == 3 && chain.begun.frame_id == 39);
+    for (uint64_t frame = 40; frame < 40 + NativePresentGateRoute::kQualificationFrames; ++frame) Frame(rotation[frame % 3], frame);
+    CHECK(chain.qualified == 32);
+    // A Present without a marker on a thread that never carried a frame (a loading screen's) leaves the chain
+    // alone; on a thread that carried one it resets it.
+    auto stray = Context(72);
+    NativePresentGateRoute foreign(&chain);
+    foreign.BeginScope(stray.native_swapchain, stray.swapchain_generation);
+    CHECK(foreign.BeginCall(stray, 0, 1).status == NativeGateStatus::Unmapped);
+    foreign.EndCall(true, false);
+    CHECK(!foreign.EndScope(stray.native_swapchain, stray.swapchain_generation) && chain.qualified == 32);
+    a.BeginScope(stray.native_swapchain, stray.swapchain_generation);
+    CHECK(a.BeginCall(stray, 0, 1).status == NativeGateStatus::Unmapped);
+    a.EndCall(true, false);
+    CHECK(chain.qualified == 0);
 }
 // Native route diagnostics: a scope that ends without a Present call counts, a scope with one call does
 // not, and the rejected-Present counters are separate per entry point and monotonic.
@@ -527,5 +641,7 @@ int main() {
     TestFgObservationDoesNotAuthorizeEnforcement();
     TestCrossThreadHandoff();
     TestSameThreadOwnerKeepsMarker();
+    TestSharedChainAcrossThreads();
+    TestRotatingPresentThreads();
     std::puts("Native Present gate production routing tests passed (no live pacing validation).");
 }

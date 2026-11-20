@@ -107,8 +107,11 @@ struct Queue {
     std::atomic<bool> fg_requested{false}; // an FG input asks the worker for the FG prefix queue
     std::atomic<bool> fg_refresh{false};   // re-read the FG swapchain identity (worker)
     std::atomic<uint64_t> fg_native{0},fg_swapchain{0};
+    // Written only under `admission`. Any thread may make a frame's FG input (Cyberpunk 2077 presents each frame from
+    // whichever job thread is free); the flag orders each input's submission after the one before it.
     uint64_t fg_sequence=0;
-    std::atomic<uint32_t> fg_thread{0};
+    int fg_last_multiplier=0;     // the multiplier and Streamline binding of the newest FG input: a change starts a
+    uint64_t fg_last_binding=0;   // new FG epoch
     // Worker-only: when the worker first saw this entry retired, and
     // whether its unreclaimed state was already logged.
     int64_t retired_seen_qpc=0;
@@ -142,8 +145,6 @@ size_t status_position=0;
 thread_local Queue* fg_pending_queue=nullptr;
 thread_local FgMeasurement* fg_pending_measurement=nullptr;
 thread_local uint64_t fg_pending_transaction=0;
-thread_local int fg_last_multiplier=0;
-thread_local uint64_t fg_last_binding=0;
 int64_t Qpc() noexcept {LARGE_INTEGER q{};QueryPerformanceCounter(&q);return q.QuadPart;}
 // ── Stage events: every event carries the plan's key and grid index ──
 void PushStage(const PacingPlanKey& key,uint64_t grid_index,PacingStageEventKind kind,PacingRung rung,
@@ -540,7 +541,7 @@ void ReclaimRetiredQueues() noexcept {
         queue.post_ready=queue.post_released=false;
         queue.fg_ready=false;queue.fg_requested=false;queue.fg_refresh=false;
         queue.fg_native=0;queue.fg_swapchain=0;queue.fg_sequence=0;
-        queue.fg_thread=0;
+        queue.fg_last_multiplier=0;queue.fg_last_binding=0;
         if(queue.reclaim_stall_logged)LOG_INFO("GPU Present gate: retired queue reclaimed after %.1f s",
             static_cast<double>(Qpc()-queue.retired_seen_qpc)/static_cast<double>(frequency));
         queue.retired_seen_qpc=0;queue.reclaim_stall_logged=false;
@@ -1500,17 +1501,15 @@ bool GpuPresent_BeginFgInput(uint64_t native,const GpuPresentFgInput& input) noe
         queue->fg_queue.uncertain_submission.load()) {
         release();return undeliverable(GpuPresentStatus::Unsupported);
     }
-    uint32_t owner=0;
     const auto tid=GetCurrentThreadId();
-    queue->fg_thread.compare_exchange_strong(owner,tid,std::memory_order_acq_rel);
-    if(queue->fg_thread.load(std::memory_order_acquire)!=tid || queue->admission.test_and_set(std::memory_order_acquire)) {
+    if(queue->admission.test_and_set(std::memory_order_acquire)) {
         release();return undeliverable(GpuPresentStatus::QueueBusy);
     }
     if(input.binding && !StreamlineHandoff_IsCurrent(input.binding)) {
         queue->admission.clear(std::memory_order_release);release();return undeliverable(GpuPresentStatus::IdentityChanged);
     }
-    if(fg_last_multiplier!=multiplier || fg_last_binding!=input.binding) {
-        fg_last_multiplier=multiplier;fg_last_binding=input.binding;fg_epoch.fetch_add(1,std::memory_order_acq_rel);
+    if(queue->fg_last_multiplier!=multiplier || queue->fg_last_binding!=input.binding) {
+        queue->fg_last_multiplier=multiplier;queue->fg_last_binding=input.binding;fg_epoch.fetch_add(1,std::memory_order_acq_rel);
     }
     FgMeasurement* measurement=nullptr;
     for(auto& entry:queue->fg_measurements) {

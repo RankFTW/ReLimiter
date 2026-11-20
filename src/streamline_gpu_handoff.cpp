@@ -59,10 +59,12 @@ struct Cycle {
     bool separate = false;
     uint32_t worker_thread = 0;
 };
+// The binding is held by identity (the proxy, the source queue, the forward and back fences, the four call sites, newer
+// frames and fence values) and by cycle order (a source Signal needs the previous cycle complete), never by the OS
+// thread that calls the proxy Present: Cyberpunk 2077 runs each frame's Present on whichever job thread is free.
 struct Route {
     uint64_t epoch = 0, config = 0, previous_frame = 0, previous_forward = 0, previous_back = 0;
     int multiplier = 0;
-    uint32_t source_thread = 0;
     UINT sync_interval = 0;
     IDXGISwapChain* proxy = nullptr;
     ID3D12CommandQueue* source = nullptr;
@@ -601,7 +603,6 @@ const char* SourceSignalRejection(const StreamlineInputScope& scope, ID3D12Comma
     if (route.proxy != reinterpret_cast<IDXGISwapChain*>(scope.proxy)) return "proxy_changed";
     if (route.source != queue) return "source_queue_changed";
     if (route.forward != fence) return "forward_fence_changed";
-    if (route.source_thread != GetCurrentThreadId()) return "source_thread_changed";
     if (scope.input.source <= route.previous_frame) return "source_frame_not_newer";
     if (value <= route.previous_forward) return "forward_value_not_newer";
     if (route.successes && route.sites[0] != site) return SiteChangedReasons[0];
@@ -975,7 +976,7 @@ StreamlineFenceCall StreamlineHandoff_BeforeFence(ID3D12CommandQueue* queue, ID3
             if (!route.epoch) {
                 route.epoch = scope->input.binding; route.config = scope->config; route.multiplier = scope->multiplier;
                 route.sync_interval = scope->sync_interval;
-                route.source_thread = GetCurrentThreadId(); route.cycle.input = scope->input;
+                route.cycle.input = scope->input;
                 if (!Retain(reinterpret_cast<IDXGISwapChain*>(scope->proxy), &route.proxy) ||
                     !Retain(queue, &route.source) || !Retain(fence, &route.forward)) { Reject(scope, "source_retain_failed"); return {}; }
                 chain.source_queue.store(queue, std::memory_order_release);

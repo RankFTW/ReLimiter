@@ -655,6 +655,34 @@ static void TestTestPresentLeavesMarker() {
     Reset();
 }
 
+// Cyberpunk 2077 runs each frame's Present on whichever job thread is free: every source scope here (its marker, the
+// proxy Present and both source fence calls) runs on a thread of its own, and each thread stays alive to the end so no
+// two cycles share a thread id. The binding qualifies after four cycles as on one thread, is never invalidated, and the
+// later cycles reach the gate.
+static void TestSourceThreadRotates() {
+    const auto prior_begins = begins;
+    std::promise<void> finish;
+    const std::shared_future<void> done = finish.get_future().share();
+    std::vector<std::thread> sources;
+    uint64_t binding = 0;
+    for (unsigned cycle = 0; cycle < 6; ++cycle) {
+        std::promise<uint64_t> made;
+        auto made_value = made.get_future();
+        sources.emplace_back([made = std::move(made), done]() mutable { made.set_value(Source()); done.wait(); });
+        const auto value = made_value.get();
+        std::thread worker([=]{Worker(value);}); worker.join();
+        StreamlineHandoff_Service();
+        CHECK(h::route.cycle.complete && h::route.previous_frame == value);
+        if (!cycle) binding = h::route.epoch;
+        CHECK(binding && h::route.epoch == binding && h::epoch == binding);
+        CHECK(StreamlineHandoff_IsCurrent(binding) == (cycle >= 3));
+    }
+    CHECK(h::route.successes == 4 && begins == prior_begins + 2);
+    finish.set_value();
+    for (auto& source : sources) source.join();
+    Reset();
+}
+
 static unsigned presents = 0;
 static UINT expected_sync = 2, expected_flags = 4;
 static bool submit_from_present = false;
@@ -747,6 +775,7 @@ int main() {
     TestMaintenanceInvalidationInFlight();
     TestInbandFrameClaim();
     TestTestPresentLeavesMarker();
+    TestSourceThreadRotates();
     // Diagnostic snapshots and opportunistic maintenance never revoke a healthy
     // binding merely because they cannot acquire its observation lock.
     Warm(); const auto stable_binding = h::epoch.load();

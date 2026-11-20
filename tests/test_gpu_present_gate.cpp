@@ -738,7 +738,8 @@ void TestExecutor() {
     queue.fg_native=0x2000; // the identity a previous binding left behind
     fake_clock+=1000;heartbeat=fake_clock;Service();
     CHECK(!queue.fg_refresh.load() && queue.fg_native.load()==0x1000 && queue.fg_ready.load());
-    fg_context=false;g_fg_multiplier=1;queue.fg_ready=false;queue.fg_native=queue.fg_swapchain=0;queue.fg_thread=0;
+    fg_context=false;g_fg_multiplier=1;queue.fg_ready=false;queue.fg_native=queue.fg_swapchain=0;
+    queue.fg_last_multiplier=0;queue.fg_last_binding=0;
     // FG input decision with fg_late_spacing (displayed_slack): the floor's
     // slack comes from the plan's displayed interval I / fg_divisor. Frame 40
     // came out 3,000 ticks late; I = 11,111 ticks. From I: tol 2,777, slack
@@ -892,43 +893,59 @@ void TestExecutor() {
         CHECK(gpu_ticket && !gpu_ticket->fg && gpu_ticket->hold_advance_us==250.0f);
         CHECK(gpu_ticket && gpu_ticket->lead_limit_qpc==GridTarget(kGpuIndex)+11000); // 1 tick = 1 us here
         CHECK(gpu_ticket->trace.target_qpc==GridTarget(kGpuIndex)-250); // the resolver took the same advance
-        // FG input route (BeginFgInput).
+        // FG input route (BeginFgInput). The second input comes from another thread than the first, as in Cyberpunk
+        // 2077, which presents each frame from whichever job thread is free: it is admitted as well, and the same
+        // binding and multiplier start no new FG epoch (which would release the first input's wait early).
         fg_context=true;g_fg_multiplier=2;PublishRung(PacingRung::FgInputWait);
         queue.fg_ready=true;queue.fg_native=0x1000;queue.fg_swapchain=FrameTimeline_GetPresentSwapchainGeneration(0x1000);
         Fence prefix;
         driver.allow_execute=true;
-        queue.fg_queue.queue=&driver;queue.fg_queue.fence=&prefix;
-        queue.fg_queue.timestamps[0].commands=reinterpret_cast<ID3D12CommandList*>(static_cast<uintptr_t>(0x10));
-        fake_clock=GridTarget(kFgIndex)-5000;heartbeat=fake_clock;
-        PacingFramePlan fg_plan;
-        fg_plan.key=PlanKey(kFgIndex);fg_plan.grid_index=kFgIndex;fg_plan.interval_us=kInterval;
-        fg_plan.rung=PacingRung::FgInputWait;fg_plan.mode=PacingTimingMode::Vrr;fg_plan.fg_divisor=2.0;
-        fg_plan.output_target_qpc=GridTarget(kFgIndex);fg_plan.hold_advance_us=321.0f;
-        fg_plan.source_wake_qpc=GridTarget(kFgIndex)-9000;fg_plan.lead_limit_us=17000.0f;
-        CHECK(g_frame_plans.Publish(fg_plan));
-        GpuPresentFgInput input;
-        input.native=0x1000;input.swapchain=queue.fg_swapchain;input.observer=GpuReadiness_Settings();input.prediction=1;
-        input.producer=PlanKey(0).producer_epoch;input.controller=generation_now;
-        input.transaction=9;input.source=kFgIndex;
-        CHECK(GpuPresent_BeginFgInput(reinterpret_cast<uint64_t>(&driver),input));
-        Ticket* fg_ticket=find_ticket(PlanKey(kFgIndex));
-        CHECK(fg_ticket && fg_ticket->fg && fg_ticket->hold_advance_us==321.0f);
-        CHECK(fg_ticket && fg_ticket->lead_limit_qpc==GridTarget(kFgIndex)+8000);
-        CHECK(fg_ticket->trace.target_qpc==GridTarget(kFgIndex)-321);
-        GpuPresent_FinishFgInput(input.transaction,true);
-        // Drop the unread prefix measurement and the fake prefix queue, then release both tickets.
-        auto& measurement=queue.fg_measurements[0];
-        CHECK(measurement.state.load()==TicketState::Submitted && measurement.slot);
-        measurement.slot->ownership=GpuTimestampOwnership::Free;measurement.slot->retire_value=0;
-        measurement.slot=nullptr;measurement.sample={};measurement.state=TicketState::Free;
-        queue.fg_queue.timestamps[0].commands=nullptr;
-        queue.fg_queue.last_submitted=0;queue.fg_queue.fence=nullptr;queue.fg_queue.queue=nullptr;
+        const auto fg_input=[&](uint64_t index,uint64_t transaction,float advance,float limit,bool other_thread)->Ticket* {
+            queue.fg_queue.queue=&driver;queue.fg_queue.fence=&prefix;
+            queue.fg_queue.timestamps[0].commands=reinterpret_cast<ID3D12CommandList*>(static_cast<uintptr_t>(0x10));
+            fake_clock=GridTarget(index)-5000;heartbeat=fake_clock;
+            PacingFramePlan fg_plan;
+            fg_plan.key=PlanKey(index);fg_plan.grid_index=index;fg_plan.interval_us=kInterval;
+            fg_plan.rung=PacingRung::FgInputWait;fg_plan.mode=PacingTimingMode::Vrr;fg_plan.fg_divisor=2.0;
+            fg_plan.output_target_qpc=GridTarget(index);fg_plan.hold_advance_us=advance;
+            fg_plan.source_wake_qpc=GridTarget(index)-9000;fg_plan.lead_limit_us=limit;
+            CHECK(g_frame_plans.Publish(fg_plan));
+            GpuPresentFgInput input;
+            input.native=0x1000;input.swapchain=queue.fg_swapchain;input.observer=GpuReadiness_Settings();input.prediction=1;
+            input.producer=PlanKey(0).producer_epoch;input.controller=generation_now;
+            input.transaction=transaction;input.source=index;
+            bool begun=false;
+            const auto run=[&] { // Begin and Finish run on one thread, inside one proxy Present
+                begun=GpuPresent_BeginFgInput(reinterpret_cast<uint64_t>(&driver),input);
+                GpuPresent_FinishFgInput(input.transaction,true);
+            };
+            if(other_thread)std::thread(run).join();
+            else run();
+            CHECK(begun);
+            Ticket* ticket=find_ticket(PlanKey(index));
+            CHECK(ticket && ticket->fg && ticket->hold_advance_us==advance);
+            CHECK(ticket->lead_limit_qpc==GridTarget(index)-9000+static_cast<int64_t>(limit));
+            CHECK(ticket->trace.target_qpc==GridTarget(index)-static_cast<int64_t>(advance));
+            // Drop the unread prefix measurement and the fake prefix queue.
+            auto& measurement=queue.fg_measurements[0];
+            CHECK(measurement.state.load()==TicketState::Submitted && measurement.slot);
+            measurement.slot->ownership=GpuTimestampOwnership::Free;measurement.slot->retire_value=0;
+            measurement.slot=nullptr;measurement.sample={};measurement.state=TicketState::Free;
+            queue.fg_queue.timestamps[0].commands=nullptr;
+            queue.fg_queue.last_submitted=0;queue.fg_queue.fence=nullptr;queue.fg_queue.queue=nullptr;
+            return ticket;
+        };
+        Ticket* fg_ticket=fg_input(kFgIndex,9,321.0f,17000.0f,false);
+        const auto epoch_after_first=fg_epoch.load();
+        Ticket* other_ticket=fg_input(kFgIndex+1,10,123.0f,15000.0f,true);
+        CHECK(other_ticket!=fg_ticket && fg_epoch.load()==epoch_after_first);
+        // Release the three tickets.
         queue.fg_sequence=0;driver.allow_execute=false;
         fake_clock=GridTarget(kGpuIndex);heartbeat=fake_clock;Service();
-        CHECK(gpu_ticket->signalled && fg_ticket->signalled);
+        CHECK(gpu_ticket->signalled && fg_ticket->signalled && other_ticket->signalled);
         for(const auto& ticket:queue.tickets)CHECK(ticket.state.load()==TicketState::Free);
         fg_context=false;g_fg_multiplier=1;
-        queue.fg_ready=false;queue.fg_native=queue.fg_swapchain=0;queue.fg_thread=0;
+        queue.fg_ready=false;queue.fg_native=queue.fg_swapchain=0;queue.fg_last_multiplier=0;queue.fg_last_binding=0;
         {std::lock_guard<std::mutex> lock(pacing_record_mutex);pacing_signalled_fifo.clear();}
         PacingStageEvent leftover;while(FramePlan_PopStageEvent(&leftover)) {}
         PacingPipeline_SetConfig(saved_pipeline);

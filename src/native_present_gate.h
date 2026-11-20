@@ -62,17 +62,40 @@ struct NativeGateTrace {
     bool cross_thread = false;
 };
 
-// One instance per Present thread. A token must pass through the selected
-// ReShade present/finish_present scope and its exact native swapchain. The
-// marker may come from another thread through the cross-thread hand-off
-// (native_present_gate.cpp); nesting, retries, missing scopes and a
-// Present without a newly published marker reset qualification. History
-// never proves FG real/generated identity, so FG can only be observed in shadow.
+// The qualification of one native route: the chain of consecutive frames it completed. Every thread that
+// presents the route's frames shares it, because a game may present each frame from another thread (Cyberpunk
+// 2077 runs a frame's PRESENT_START and Present on whichever job thread is free; record N.197): consecutive
+// frames belong to the route, not to a thread. Not synchronized here: the production route
+// (native_present_gate.cpp) holds the chain's lock around every call that reaches it.
+struct NativeGateChain {
+    PacingPlanKey last_complete{};          // the newest frame completed (EndScope valid)
+    uint64_t last_swapchain_generation = 0; // that frame's swapchain generation
+    PacingPlanKey begun{};                  // the newest frame whose marker a presenting thread took
+    uint64_t settings_generation = 0;       // of that marker
+    bool no_frame_generation = false;       // of that marker's context
+    bool observe_frame_generation = false;  // of that marker's context
+    uint32_t qualified = 0;
+};
+
+// The route of one Present thread: a frame's marker, its scope and its call. A token must pass through the
+// selected ReShade present/finish_present scope and its exact native swapchain. The marker may come from another
+// thread through the cross-thread hand-off (native_present_gate.cpp); nesting, retries, missing scopes and a
+// Present without a newly published marker reset the chain's qualification. History never proves FG
+// real/generated identity, so FG can only be observed in shadow. A route made without a chain keeps its own.
 class NativePresentGateRoute {
 public:
     static constexpr uint32_t kQualificationFrames = 32;
+    NativePresentGateRoute() noexcept = default;
+    // constexpr: the production route is a thread_local, which then needs no dynamic initialization on threads
+    // the game created before the add-on loaded.
+    constexpr explicit NativePresentGateRoute(NativeGateChain* chain) noexcept : chain_(chain) {}
+    NativePresentGateRoute(const NativePresentGateRoute&) = delete;
+    NativePresentGateRoute& operator=(const NativePresentGateRoute&) = delete;
+    // `presents`: this thread presents the marker's frame (its own marker, or one it took from another
+    // thread). False for the marker of a thread that hands its frames to another (Gears' render thread): the
+    // chain is left alone and the frame is never selected.
     bool Marker(const NativeGateContext& context, const PacingPlanKey& key,
-                NativeGateMode mode, uint64_t settings_generation) noexcept;
+                NativeGateMode mode, uint64_t settings_generation, bool presents = true) noexcept;
     void MarkerReleased(int64_t qpc) noexcept;
     void BeginScope(uint64_t native_swapchain, uint64_t generation) noexcept;
     bool EndScope(uint64_t native_swapchain, uint64_t generation,
@@ -81,18 +104,19 @@ public:
                              uint64_t settings_generation) noexcept;
     void EndCall(bool success, bool retried,
                  const NativeGateTrace* trace = nullptr) noexcept;
-    uint32_t QualifiedFrames() const noexcept { return qualified_; }
+    uint32_t QualifiedFrames() const noexcept { return chain_->qualified; }
     bool Pending() const noexcept { return pending_; }
     NativeGateStatus Status() const noexcept { return status_; }
+    // The chain the next calls reach (the production route swaps in a detached one when its lock is taken).
+    void Attach(NativeGateChain* chain) noexcept { chain_ = chain; }
 
 private:
     bool Matches(const NativeGateContext& context) const noexcept;
+    NativeGateChain own_chain_{};
+    NativeGateChain* chain_ = &own_chain_;
     NativeGateTrace trace_{};
     NativeGateContext context_{};
-    PacingPlanKey last_complete_{};
     uint64_t settings_generation_ = 0;
-    uint64_t last_swapchain_generation_ = 0;
-    uint32_t qualified_ = 0;
     uint32_t depth_ = 0;
     uint32_t calls_ = 0;
     bool pending_ = false;
@@ -100,6 +124,7 @@ private:
     bool invalid_ = false;
     bool completed_ = false;
     bool native_selected_ = false;
+    bool carried_ = false; // this thread completed a frame of the route
     NativeGateStatus status_ = NativeGateStatus::Off;
 };
 
