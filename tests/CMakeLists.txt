@@ -422,22 +422,25 @@ endif()
 
 # Replay of the tail-stamp policy (tools/testbed/stamp_policy_replay): an executable, NOT a ctest. It drives the
 # production core and the production worker-step planner with the events recorded submission streams would produce and
-# writes one CSV row per frame record (the judge is tools/testbed/stamp_policy_sim.py). Built with the tests, both architectures.
-add_executable(stamp_policy_replay
-    ${CMAKE_SOURCE_DIR}/tools/testbed/stamp_policy_replay/replay.cpp
-    ${CMAKE_SOURCE_DIR}/src/gpu_queue_borrow.cpp
-    ${CMAKE_SOURCE_DIR}/src/gpu_queue_probe_core.cpp
-)
-set_target_properties(stamp_policy_replay PROPERTIES
-    CXX_STANDARD 17
-    CXX_STANDARD_REQUIRED YES
-    CXX_EXTENSIONS NO
-)
-target_include_directories(stamp_policy_replay PRIVATE ${CMAKE_SOURCE_DIR}/src)
-if(MSVC)
-    set_property(TARGET stamp_policy_replay PROPERTY
-        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-    target_compile_options(stamp_policy_replay PRIVATE /W4 /utf-8 /permissive-)
+# writes one CSV row per frame record (the judge is tools/testbed/stamp_policy_sim.py). Built with the tests, both architectures,
+# only where the local testbed exists (it is not part of the public tree).
+if(EXISTS ${CMAKE_SOURCE_DIR}/tools/testbed/stamp_policy_replay/replay.cpp)
+    add_executable(stamp_policy_replay
+        ${CMAKE_SOURCE_DIR}/tools/testbed/stamp_policy_replay/replay.cpp
+        ${CMAKE_SOURCE_DIR}/src/gpu_queue_borrow.cpp
+        ${CMAKE_SOURCE_DIR}/src/gpu_queue_probe_core.cpp
+    )
+    set_target_properties(stamp_policy_replay PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED YES
+        CXX_EXTENSIONS NO
+    )
+    target_include_directories(stamp_policy_replay PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    if(MSVC)
+        set_property(TARGET stamp_policy_replay PROPERTY
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        target_compile_options(stamp_policy_replay PRIVATE /W4 /utf-8 /permissive-)
+    endif()
 endif()
 
 # The REAL gpu_queue_probe glue (src/gpu_queue_probe_d3d12.cpp, src/streamline_queue_hooks.cpp with the pure core, borrow and
