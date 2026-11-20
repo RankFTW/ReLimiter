@@ -170,28 +170,32 @@ REMOVED_PACING_COLUMNS = (
 # Profile name of the full pre-removal rows header: pre-removal-source-199.
 PRE_REMOVAL_PROFILE_PREFIX = "pre-removal-source"
 
-# Rows columns appended after the removal, in order (the writer's last columns). A file of an earlier build lacks
-# them: plan_ordered (developer key gpu_wait_present_first; 1 when the frame's plan was made on present-first
-# ordering, empty otherwise) is read as 0 there, since those builds never ordered a frame; plan_start_limit_us and
-# plan_start_applied (developer key gpu_wait_start_limit; the collision guard's start term: the limit in
-# microseconds, 1 when it limited the plan) are read as 0 there, since those builds had no start limit.
-APPENDED_AFTER_REMOVAL_PACING_COLUMNS = ("plan_ordered", "plan_start_limit_us", "plan_start_applied")
+# Rows columns appended after the removal, in writer order. A build without plan_ordered never ordered a
+# frame; a build without the start limit columns had no start limit. Those missing values mean 0. The own
+# lead and spike floor were not recorded before the lead term columns: their missing values are unavailable.
+LEAD_TERM_COLUMNS = ("plan_lead_own_us", "plan_lead_floor_us")
+APPENDED_AFTER_REMOVAL_PACING_COLUMNS = ("plan_ordered", "plan_start_limit_us", "plan_start_applied",
+                                        *LEAD_TERM_COLUMNS)
 
-# The current rows header (195 columns, profile current-source-195): the
+# The current rows header (197 columns, profile current-source-197): the
 # pre-removal header without REMOVED_PACING_COLUMNS, the order of the others
 # unchanged, then APPENDED_AFTER_REMOVAL_PACING_COLUMNS.
 CURRENT_PACING_HEADER = [name for name in PRE_REMOVAL_PACING_HEADER if name not in REMOVED_PACING_COLUMNS] + \
     list(APPENDED_AFTER_REMOVAL_PACING_COLUMNS)
 
+# The 195-column prefix records the start limit but neither input to the lead target.
+PRE_LEAD_TERMS_PROFILE_PREFIX = "pre-lead-terms-source"
+PRE_LEAD_TERMS_PACING_HEADER = CURRENT_PACING_HEADER[:195]
+
 # The rows header of the builds between the plan_ordered column and the start limit columns (193 columns): a
 # prefix of the current header, profile pre-start-limit-source-193.
 PRE_START_LIMIT_PROFILE_PREFIX = "pre-start-limit-source"
-PRE_START_LIMIT_PACING_HEADER = CURRENT_PACING_HEADER[:-2]
+PRE_START_LIMIT_PACING_HEADER = CURRENT_PACING_HEADER[:193]
 
 # The rows header of the builds between the removal and the plan_ordered column (192 columns): a prefix of the
 # current header, profile pre-plan-ordered-source-192.
 PRE_PLAN_ORDERED_PROFILE_PREFIX = "pre-plan-ordered-source"
-PRE_PLAN_ORDERED_PACING_HEADER = CURRENT_PACING_HEADER[:-3]
+PRE_PLAN_ORDERED_PACING_HEADER = CURRENT_PACING_HEADER[:192]
 
 CURRENT_PACING_EVENTS_HEADER = [
     "sequence", "capture_epoch", "event_type", "event_qpc", "qpc_frequency",
@@ -305,6 +309,7 @@ METRIC_COLUMNS = {
         "deviation_us", "animation_error_us", "latency_us", "gpu_residence_us",
         "cpu_hold_us", "predicted_render_us", "pcl_i2fs_us", "pcl_fs2p_us",
         "pcl_p2d_us", "pcl_total_us", "pcl_dropped_accumulation_us", "plan_lead_us",
+        *LEAD_TERM_COLUMNS,
         "governor_interval_us", "plan_signal_advance_us", "pre_sleep_margin_us",
     ],
     "frameview": [
@@ -439,6 +444,8 @@ def schema_profile(kind: str, header: list[str]) -> str:
         current, historical, historical_lengths = profiles[kind]
         if header == current:
             return f"current-source-{len(current)}"
+        if kind == "relimiter_pacing" and header == PRE_LEAD_TERMS_PACING_HEADER:
+            return f"{PRE_LEAD_TERMS_PROFILE_PREFIX}-{len(header)}"
         if kind == "relimiter_pacing" and header == PRE_START_LIMIT_PACING_HEADER:
             return f"{PRE_START_LIMIT_PROFILE_PREFIX}-{len(header)}"
         if kind == "relimiter_pacing" and header == PRE_PLAN_ORDERED_PACING_HEADER:
@@ -595,13 +602,15 @@ def _family_warnings(result: dict[str, Any], file_name: str) -> list[str]:
         warnings.append("The header is the pre-removal schema: the columns " + ", ".join(REMOVED_PACING_COLUMNS) +
                         " exist and carry the removed mechanisms' values, which are empty, constant or zero in "
                         "the last builds that wrote them; later builds do not write them.")
+    elif profile.startswith(f"{PRE_LEAD_TERMS_PROFILE_PREFIX}-"):
+        warnings.append("The header predates plan_lead_own_us and plan_lead_floor_us: neither lead term was "
+                        "recorded, so both are unavailable, not zero.")
     elif profile.startswith(f"{PRE_START_LIMIT_PROFILE_PREFIX}-"):
         warnings.append("The header is the schema before the plan_start_limit_us and plan_start_applied columns: "
-                        "both are absent and read as 0 (builds before them had no start limit); no other column "
-                        "differs.")
+                        "both are absent and read as 0 (builds before them had no start limit).")
     elif profile.startswith(f"{PRE_PLAN_ORDERED_PROFILE_PREFIX}-"):
         warnings.append("The header is the schema before the plan_ordered column: the column is absent and read "
-                        "as 0 (builds before it never ordered a frame); no other column differs.")
+                        "as 0 (builds before it never ordered a frame).")
     elif profile.startswith("historical-source-"):
         warnings.append("The header is an earlier append-only schema: columns appended since are absent, "
                         "not zero.")
@@ -698,6 +707,9 @@ def print_summary(result: dict[str, Any]) -> None:
             print("  metric availability (valid/nonzero):")
             for column, counts in result["metric_availability"].items():
                 print(f"    {column}: {counts['valid']}/{counts['nonzero']}")
+            absent = [name for name in METRIC_COLUMNS.get(result["kind"], ()) if name not in result["metric_availability"]]
+            if absent:
+                print("    unavailable (no column): " + ", ".join(absent))
         if result["transition_counts"]:
             print("  transitions:")
             for column, count in result["transition_counts"].items():

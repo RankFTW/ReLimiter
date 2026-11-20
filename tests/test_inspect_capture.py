@@ -42,7 +42,8 @@ FEED_ROW_COLUMNS = 198          # + the render-thread feed contrast, spread and 
 ROLE_ROW_COLUMNS = 199          # + the probe record's queue role (the pre-removal header)
 PRE_PLAN_ORDERED_ROW_COLUMNS = 192  # the pre-removal header without the seven removed columns
 PRE_START_LIMIT_ROW_COLUMNS = 193   # + plan_ordered, appended after the removal
-CURRENT_ROW_COLUMNS = 195           # + plan_start_limit_us and plan_start_applied (the current header)
+PRE_LEAD_TERMS_ROW_COLUMNS = 195    # + plan_start_limit_us and plan_start_applied
+CURRENT_ROW_COLUMNS = 197           # + plan_lead_own_us and plan_lead_floor_us
 REMOVED_ROW_COLUMNS = ["predicted_render_us", "governor_step", "governor_interval_us", "plan_signal_advance_us",
                        "pre_sleep_margin_us", "gpu_first_submit_qpc", "gpu_start_qpc"]
 OLD = inspector.PRE_REMOVAL_PACING_HEADER  # every historical prefix length is a prefix of it
@@ -100,7 +101,7 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(len(inspector.CURRENT_PACING_HEADER), CURRENT_ROW_COLUMNS)
         self.assertEqual(len(inspector.CURRENT_PACING_EVENTS_HEADER), PHASE3_EVENT_COLUMNS)
         self.assertEqual(inspector.schema_profile("relimiter_pacing", inspector.CURRENT_PACING_HEADER),
-                         "current-source-195")
+                         "current-source-197")
         self.assertEqual(inspector.schema_profile("relimiter_pacing_events",
                                                   inspector.CURRENT_PACING_EVENTS_HEADER), "current-source-86")
 
@@ -112,14 +113,11 @@ class ProfileTests(unittest.TestCase):
                             inspector.schema_profile("relimiter_pacing", inspector.CURRENT_PACING_HEADER))
 
     def test_header_before_plan_ordered_is_its_own_profile(self):
-        # The builds between the removal and the plan_ordered column wrote the current header without its last
-        # three columns: a prefix of it, a profile of its own (never historical-or-unknown), and with the header
-        # before the start limit columns one of the only two prefixes of the current header that are one.
         before = inspector.PRE_PLAN_ORDERED_PACING_HEADER
         self.assertEqual(len(before), PRE_PLAN_ORDERED_ROW_COLUMNS)
-        self.assertEqual(before, inspector.CURRENT_PACING_HEADER[:-3])
+        self.assertEqual(before, inspector.CURRENT_PACING_HEADER[:PRE_PLAN_ORDERED_ROW_COLUMNS])
         self.assertEqual(before, [name for name in OLD if name not in REMOVED_ROW_COLUMNS])
-        self.assertEqual(inspector.CURRENT_PACING_HEADER[-3], "plan_ordered")
+        self.assertEqual(inspector.CURRENT_PACING_HEADER[len(before)], "plan_ordered")
         self.assertEqual(inspector.detect_kind(before), "relimiter_pacing")
         self.assertEqual(inspector.schema_profile("relimiter_pacing", before), "pre-plan-ordered-source-192")
         self.assertNotEqual(inspector.schema_profile("relimiter_pacing", before),
@@ -127,31 +125,30 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(inspector.schema_profile("relimiter_pacing", before[:-1]), "historical-or-unknown")
 
     def test_header_before_the_start_limit_columns_is_its_own_profile(self):
-        # The builds between the plan_ordered column and the start limit columns wrote the current header without
-        # its last two columns: a prefix of it, a profile of its own (never historical-or-unknown).
         before = inspector.PRE_START_LIMIT_PACING_HEADER
         self.assertEqual(len(before), PRE_START_LIMIT_ROW_COLUMNS)
-        self.assertEqual(before, inspector.CURRENT_PACING_HEADER[:-2])
+        self.assertEqual(before, inspector.CURRENT_PACING_HEADER[:PRE_START_LIMIT_ROW_COLUMNS])
         self.assertEqual(before, inspector.PRE_PLAN_ORDERED_PACING_HEADER + ["plan_ordered"])
-        self.assertEqual(inspector.CURRENT_PACING_HEADER[-2:], ["plan_start_limit_us", "plan_start_applied"])
+        self.assertEqual(inspector.PRE_LEAD_TERMS_PACING_HEADER, before + ["plan_start_limit_us", "plan_start_applied"])
         self.assertEqual(inspector.detect_kind(before), "relimiter_pacing")
         self.assertEqual(inspector.schema_profile("relimiter_pacing", before), "pre-start-limit-source-193")
         self.assertNotEqual(inspector.schema_profile("relimiter_pacing", before),
                             inspector.schema_profile("relimiter_pacing", inspector.CURRENT_PACING_HEADER))
         self.assertNotEqual(inspector.schema_profile("relimiter_pacing", before),
                             inspector.schema_profile("relimiter_pacing", inspector.PRE_PLAN_ORDERED_PACING_HEADER))
-        # Of every shorter prefix of the current header exactly these two are profiles of their own.
+        # Only the three complete post-removal headers are named prefixes.
         named = {length for length in range(1, len(inspector.CURRENT_PACING_HEADER))
                  if inspector.schema_profile("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:length])
                  .startswith("pre-")}
-        self.assertEqual(named, {PRE_PLAN_ORDERED_ROW_COLUMNS, PRE_START_LIMIT_ROW_COLUMNS})
+        self.assertEqual(named, {PRE_PLAN_ORDERED_ROW_COLUMNS, PRE_START_LIMIT_ROW_COLUMNS, PRE_LEAD_TERMS_ROW_COLUMNS})
 
     def test_current_header_is_the_old_header_without_the_removed_columns_and_with_the_appended_ones(self):
         self.assertEqual(list(inspector.REMOVED_PACING_COLUMNS), REMOVED_ROW_COLUMNS)
         self.assertTrue(set(REMOVED_ROW_COLUMNS) <= set(OLD))
         self.assertEqual(inspector.CURRENT_PACING_HEADER,
                          [name for name in OLD if name not in REMOVED_ROW_COLUMNS] +
-                         ["plan_ordered", "plan_start_limit_us", "plan_start_applied"])
+                         ["plan_ordered", "plan_start_limit_us", "plan_start_applied",
+                          "plan_lead_own_us", "plan_lead_floor_us"])
         self.assertFalse(set(REMOVED_ROW_COLUMNS) & set(inspector.CURRENT_PACING_HEADER))
         self.assertEqual(len(set(inspector.CURRENT_PACING_HEADER)), CURRENT_ROW_COLUMNS)
 
@@ -260,7 +257,8 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(inspector.CURRENT_PACING_HEADER[-len(unified_columns) - len(appended):-len(appended)],
                          unified_columns)
         self.assertEqual(inspector.CURRENT_PACING_HEADER[-len(appended):], appended)
-        self.assertEqual(appended, ["plan_ordered", "plan_start_limit_us", "plan_start_applied"])
+        self.assertEqual(appended, ["plan_ordered", "plan_start_limit_us", "plan_start_applied",
+                                    "plan_lead_own_us", "plan_lead_floor_us"])
         self.assertEqual(inspector.CURRENT_PACING_EVENTS_HEADER[PHASE1_EVENT_COLUMNS - 1],
                          "overflowed_present_count")
         self.assertEqual(inspector.CURRENT_PACING_EVENTS_HEADER[PHASE1_EVENT_COLUMNS:], ["reason"])
@@ -335,6 +333,26 @@ class ContinuityTests(TemporaryDirectoryTest):
         self.assertTrue(has_warning(summary, "CSV ring drops"))
         self.assertFalse(has_warning(summary, "file name"))
 
+    def test_lead_term_availability_is_not_the_legacy_start_limit_zero_rule(self):
+        path = self.directory / f"relimiter_pacing_{SUFFIX}.csv"
+        for length, profile in ((197, "current-source-197"), (195, "pre-lead-terms-source-195"),
+                                (193, "pre-start-limit-source-193")):
+            with self.subTest(columns=length):
+                header = inspector.CURRENT_PACING_HEADER[:length]
+                rows = [pacing_row(1, header, plan_lead_own_us="3000.500", plan_lead_floor_us="4100.250"),
+                        pacing_row(2, header, plan_lead_own_us="2900.125"), pacing_row(3, header)]
+                summary = inspector.summarize_capture(write_csv(path, header, rows))
+                self.assertEqual(summary["schema_profile"], profile)
+                metrics = summary["metric_availability"]
+                if length == 197:
+                    self.assertEqual(metrics["plan_lead_own_us"], {"valid": 2, "nonzero": 2, "missing_or_invalid": 1})
+                    self.assertEqual(metrics["plan_lead_floor_us"], {"valid": 1, "nonzero": 1, "missing_or_invalid": 2})
+                else:
+                    self.assertNotIn("plan_lead_own_us", metrics)
+                    self.assertNotIn("plan_lead_floor_us", metrics)
+                if length == 193:
+                    self.assertTrue(has_warning(summary, "both are absent and read as 0"))
+
     def test_capture_rows_of_the_events_file_carry_no_sequence(self):
         rows = [event_row(None, "capture_start"), event_row(10, "queue_drops"), event_row(11, "snapshot"),
                 event_row(13, "pcl_status"), event_row(None, "capture_end")]
@@ -371,7 +389,7 @@ class ContinuityTests(TemporaryDirectoryTest):
         current = write_csv(self.directory / f"relimiter_pacing_{SUFFIX}_2.csv", inspector.CURRENT_PACING_HEADER,
                             [pacing_row(1)])
         summary = inspector.summarize_capture(current)
-        self.assertEqual(summary["schema_profile"], "current-source-195")
+        self.assertEqual(summary["schema_profile"], "current-source-197")
         for column in REMOVED_ROW_COLUMNS:
             self.assertNotIn(column, summary["metric_availability"])  # absent, not a zero
         self.assertFalse(inspector.has_removed_columns(summary["header"]))

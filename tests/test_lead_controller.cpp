@@ -2918,7 +2918,8 @@ namespace
     // n − 1's gate, whichever is later, and is ready 7,000 after its start;
     // the wait releases at max(r, T). A normal frame (sim 2,000) arrives
     // after a = 2,500 and is ready 9,500 after its release: the own lead is
-    // Q95 + 500 = 10,010.
+    // Q95 + 500 = 10,010. The frames take the request's rung (the GPU queue
+    // wait for the other output's memory).
     struct SpikeLoop {
         std::unique_ptr<LeadController> controller = MakeController();
         LeadRequest request = Request(PacingRung::FgInputWait, 500.0, kInterval, 2.0);
@@ -2936,7 +2937,6 @@ namespace
             const double previous_lead = lead;
             lead = controller->NextLeadUs(request, &budget_limited);
             if (n > LEAD_WARM_SAMPLES + 2) largest_step = std::max(largest_step, std::fabs(lead - previous_lead));
-            const PacingRung fg = PacingRung::FgInputWait;
             const double target = 100'000.0 + static_cast<double>(n) * kInterval;
             const double source = target - lead;
             const double simulated = source + sim_us;
@@ -2945,7 +2945,7 @@ namespace
             const double ready = gpu_start + 7000.0;
             const bool held = ready <= target;
             const double release = held ? target : ready;
-            LeadFrameStart start = Start(n, fg, source, kInterval, 2.0);
+            LeadFrameStart start = Start(n, request.rung, source, kInterval, 2.0);
             SetLead(&start, lead);
             controller->OnSourceRelease(start);
             controller->OnStageEvent(Event(n, Kind::SimulationEnd, simulated));
@@ -2971,8 +2971,8 @@ namespace
 }
 
 // Spike floor (lead_controller.h): behind the wait the lead is at least the
-// second-largest of the newest 32 block maxima of 64 arrivals plus the
-// median r − g, once 4 blocks and 32 GPU times are known. One 10,000 µs
+// second-largest of the newest 32 block maxima of 64 decided frames plus the
+// median r − g, once 4 blocks with an arrival and 32 GPU times are known. One 10,000 µs
 // simulation every 64 frames arrives after 10,500 (bin center 10,510): the
 // floor is 17,510 against an own lead near 13.4 ms (the samples of the frames
 // behind a late one keep frame n − 1's frame generation), the lead rises to it
@@ -3002,8 +3002,8 @@ void TestLeadSpikeFloor()
     CHECK(late_spikes_before == 3);
     loop.largest_step = 0.0;
     while (loop.n < 400) loop.Frame(sim_of(loop.n + 1));
-    CHECK_NEAR(loop.controller->SpikeTailUs(), 10510.0);
-    CHECK_NEAR(loop.controller->SpikeGpuUs(), 7000.0);
+    CHECK_NEAR(loop.controller->SpikeTailUs(fg), 10510.0);
+    CHECK_NEAR(loop.controller->SpikeGpuUs(fg), 7000.0);
     CHECK_NEAR(loop.controller->SpikeFloorUs(fg, 2.0), 17510.0);
     CHECK_NEAR(loop.lead, 17510.0);
     CHECK(loop.largest_step <= LEAD_SLEW_MAX_US + 1e-6);
@@ -3016,8 +3016,8 @@ void TestLeadSpikeFloor()
     CHECK(loop.controller->SpikeFloorUs(PacingRung::GpuQueueWait, 2.0) == 0.0);
 
     // A 16,000 µs simulation (arrival 16,500, bin center 16,510) in one block
-    // (frame 424; frames 386–449 close at 449) leaves the tail; a second in
-    // the next block (488; 450–513) sets it. The 10,000 µs frame at 458 is
+    // (frame 424; frames 385–448 close at 448) leaves the tail; a second in
+    // the next block (488; 449–512) sets it. The 10,000 µs frame at 458 is
     // ready by its target at the floor.
     const auto monster_of = [&](uint64_t n) { return n == 424 || n == 488 ? 16000.0 : sim_of(n); };
     uint32_t late_spikes_after = 0;
@@ -3031,10 +3031,10 @@ void TestLeadSpikeFloor()
         }
     }
     CHECK(spikes_after == 1 && late_spikes_after == 0);
-    while (loop.n < 512) loop.Frame(monster_of(loop.n + 1));
-    CHECK_NEAR(loop.controller->SpikeTailUs(), 10510.0);
+    while (loop.n < 511) loop.Frame(monster_of(loop.n + 1));
+    CHECK_NEAR(loop.controller->SpikeTailUs(fg), 10510.0);
     loop.Frame(monster_of(loop.n + 1));
-    CHECK_NEAR(loop.controller->SpikeTailUs(), 16510.0);
+    CHECK_NEAR(loop.controller->SpikeTailUs(fg), 16510.0);
     CHECK_NEAR(loop.controller->SpikeFloorUs(fg, 2.0), 23510.0);
 
     // The request's key off: the own target, reached at the slew.
@@ -3049,7 +3049,7 @@ void TestLeadSpikeFloor()
     CHECK_NEAR(loop.controller->SpikeFloorUs(fg, 2.0), 23510.0);
     loop.controller->ResetBuckets();
     CHECK(loop.controller->SpikeFloorUs(fg, 2.0) == 0.0);
-    CHECK(loop.controller->SpikeTailUs() == 0.0 && loop.controller->SpikeGpuUs() == 0.0);
+    CHECK(loop.controller->SpikeTailUs(fg) == 0.0 && loop.controller->SpikeGpuUs(fg) == 0.0);
 
     // A floor beyond 3 I (arrivals of 24,500 in every block: 24,510 + 7,000)
     // holds the lead at 3 I without a budget-limited lead.
@@ -3059,6 +3059,71 @@ void TestLeadSpikeFloor()
     CHECK_NEAR(budget.lead, 3.0 * kInterval);
     CHECK(!budget.budget_limited && !budget.controller->BucketStatus(fg, 2.0).budget_limited);
     CHECK(budget.controller->Statistics().budget_limited_frames == 0);
+}
+
+// Spike floor memories per output (lead_controller.h): GPU queue wait frames
+// with a 16,000 µs simulation in every block set that output's tail (16,510);
+// FG input wait frames after them, with 10,000 µs ones, set the FG input
+// wait's own tail (10,510) from their own blocks, and the GPU queue wait's
+// tail stays as its frames left it. A reset of the buckets clears both.
+void TestSpikeFloorPerOutput()
+{
+    const PacingRung gpu = PacingRung::GpuQueueWait;
+    const PacingRung fg = PacingRung::FgInputWait;
+    SpikeLoop loop;
+    loop.request.rung = gpu;
+    while (loop.n < 400) loop.Frame((loop.n + 1) % 64 == 10 ? 16000.0 : 2000.0);
+    CHECK_NEAR(loop.controller->SpikeTailUs(gpu), 16510.0);
+    CHECK_NEAR(loop.controller->SpikeGpuUs(gpu), 7000.0);
+    CHECK(loop.controller->SpikeTailUs(fg) == 0.0 && loop.controller->SpikeGpuUs(fg) == 0.0);
+    loop.request.rung = fg;
+    while (loop.n < 400 + 4 * 64) loop.Frame((loop.n + 1) % 64 == 10 ? 10000.0 : 2000.0);
+    CHECK_NEAR(loop.controller->SpikeTailUs(fg), 10510.0);
+    CHECK_NEAR(loop.controller->SpikeGpuUs(fg), 7000.0);
+    CHECK_NEAR(loop.controller->SpikeTailUs(gpu), 16510.0);
+    CHECK(loop.controller->SpikeTailUs(PacingRung::MarkerHold) == 0.0);
+    loop.controller->ResetBuckets();
+    CHECK(loop.controller->SpikeTailUs(gpu) == 0.0 && loop.controller->SpikeTailUs(fg) == 0.0);
+    CHECK(loop.controller->SpikeGpuUs(gpu) == 0.0 && loop.controller->SpikeGpuUs(fg) == 0.0);
+}
+
+// Spike floor blocks close by decided frames (lead_controller.h). Four blocks
+// of frames whose first work did not stream keep no arrival: they give no
+// tail and carry no maximum, so the tail (10,510) comes with the fourth block
+// that kept one. A heavy stretch (16,000 µs simulations, 16,510) then ages
+// out by frames while only one frame in 16 keeps an arrival (2,500, bin
+// center 2,510): the tail falls when all but one of its blocks have left the
+// newest 32, about 16 times sooner than blocks of 64 kept arrivals would let
+// it. A memory that keeps nothing for most of its window switches the floor
+// off: with fewer than 4 blocks that kept an arrival there is no tail.
+void TestSpikeMemoryCountsFrames()
+{
+    const PacingRung fg = PacingRung::FgInputWait;
+    const auto spike_every_block = [](uint64_t n, double sim_us) { return n % 64 == 10 ? sim_us : 2000.0; };
+    SpikeLoop loop;
+    while (loop.n < 4 * 64) loop.Frame(2000.0, false);
+    CHECK(loop.controller->SpikeTailUs(fg) == 0.0);
+    while (loop.n < 7 * 64) loop.Frame(spike_every_block(loop.n + 1, 10000.0));
+    CHECK(loop.controller->SpikeTailUs(fg) == 0.0 && loop.controller->SpikeFloorUs(fg, 2.0) == 0.0);
+    while (loop.n < 8 * 64) loop.Frame(spike_every_block(loop.n + 1, 10000.0));
+    CHECK_NEAR(loop.controller->SpikeTailUs(fg), 10510.0);
+    CHECK(loop.controller->NextGpuWorkBehindWait(fg, 2.0));
+    CHECK_NEAR(loop.controller->SpikeFloorUs(fg, 2.0), 17510.0);
+
+    // Blocks 9–14 heavy; from block 15 on frames 1, 17, 33 and 49 of each block keep an arrival.
+    while (loop.n < 14 * 64) loop.Frame(spike_every_block(loop.n + 1, 16000.0));
+    CHECK_NEAR(loop.controller->SpikeTailUs(fg), 16510.0);
+    const auto sparse = [&] { loop.Frame(2000.0, loop.n % 16 == 0); };
+    while (loop.n < 45 * 64 - 1) sparse();
+    CHECK_NEAR(loop.controller->SpikeTailUs(fg), 16510.0); // blocks 13 and 14 of 13–44
+    sparse();
+    CHECK_NEAR(loop.controller->SpikeTailUs(fg), 2510.0);  // block 14 alone of 14–45
+
+    // Nothing kept: blocks 15–45 leave one by one, and block 74 leaves 3 that kept an arrival.
+    while (loop.n < 74 * 64 - 1) loop.Frame(2000.0, false);
+    CHECK_NEAR(loop.controller->SpikeTailUs(fg), 2510.0);
+    loop.Frame(2000.0, false);
+    CHECK(loop.controller->SpikeTailUs(fg) == 0.0 && loop.controller->SpikeFloorUs(fg, 2.0) == 0.0);
 }
 
 // The spike floor's arrival a = (w − s − q) + F_n of one frame behind frame
@@ -3393,7 +3458,7 @@ void TestLeadAnchorNoAnchorIsIdentical()
         snapshot.leads = loop.leads;
         snapshot.statistics = loop.controller->Statistics();
         snapshot.bucket = loop.controller->BucketStatus(fg, 2.0);
-        snapshot.tail = loop.controller->SpikeTailUs();
+        snapshot.tail = loop.controller->SpikeTailUs(fg);
         snapshot.spike_floor = loop.controller->SpikeFloorUs(fg, 2.0);
         return snapshot;
     };
@@ -5789,6 +5854,8 @@ int main()
     TestFgSubmissionSetLeadCoversReadiness();
     TestFgHeldFirstWorkLeadFalls();
     TestLeadSpikeFloor();
+    TestSpikeFloorPerOutput();
+    TestSpikeMemoryCountsFrames();
     TestSpikeArrival();
     TestLeadAnchorSample();
     TestLeadAnchorKeepsPhysicalRelease();

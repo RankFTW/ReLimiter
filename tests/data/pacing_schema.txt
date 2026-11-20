@@ -219,6 +219,8 @@ row_column gq_queue_role
 row_column plan_ordered
 row_column plan_start_limit_us
 row_column plan_start_applied
+row_column plan_lead_own_us
+row_column plan_lead_floor_us
 
 event_column sequence
 event_column capture_epoch

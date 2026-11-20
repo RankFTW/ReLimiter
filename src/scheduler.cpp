@@ -1290,7 +1290,8 @@ static void NoteLeadSpikeFloor(const SourceStageFrame& frame, const LeadBucketSt
         s_lead_floor_logged = true;
         const LeadController& lead = s_source_stage.Lead();
         LOG_INFO("Lead spike floor: on at %.1f ms (arrival tail %.1f ms + GPU %.1f ms; own lead %.1f ms), %s FG %gx",
-            bucket.spike_floor_us / 1000.0, lead.SpikeTailUs() / 1000.0, lead.SpikeGpuUs() / 1000.0,
+            bucket.spike_floor_us / 1000.0, lead.SpikeTailUs(frame.plan.rung) / 1000.0,
+            lead.SpikeGpuUs(frame.plan.rung) / 1000.0,
             own_us / 1000.0, PacingRung_Text(frame.plan.rung), frame.plan.fg_divisor);
         return;
     }
@@ -1436,8 +1437,8 @@ static SourceStageFrame RunPlanned(
     status.lead_samples = bucket.samples;
     status.lead_quantile_us = bucket.quantile_us;
     status.lead_floor_us = bucket.spike_floor_us;
-    status.lead_floor_tail_us = s_source_stage.Lead().SpikeTailUs();
-    status.lead_floor_gpu_us = s_source_stage.Lead().SpikeGpuUs();
+    status.lead_floor_tail_us = s_source_stage.Lead().SpikeTailUs(frame.plan.rung);
+    status.lead_floor_gpu_us = s_source_stage.Lead().SpikeGpuUs(frame.plan.rung);
     status.lead_floor_limited = bucket.spike_floor_limited;
     NoteLeadSpikeFloor(frame, bucket, pipeline.allowance_us);
     status.grid_epoch = frame.plan.grid_epoch;

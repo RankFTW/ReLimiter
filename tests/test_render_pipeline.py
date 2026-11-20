@@ -183,13 +183,13 @@ class ReplayTests(unittest.TestCase):
 
 
 SPIKE_COLUMNS = ROW_COLUMNS + ["p_qpc", "ready_gpu_qpc", "gate_signal_after_qpc", "reflex_driver_start_us",
-                               "reflex_gpu_render_start_us"]
+                               "reflex_gpu_render_start_us", "source_placement", "grid_index", "controller_generation"]
 SPIKE_FRAMES = 4400
 WARM_FRAME = 3201                # frame k is s - s(1) = 10 (k - 1) ms into the segment: 32 s from k = 3201
 SPIKE_I, SPIKE_G, SPIKE_GAMMA = 10.0, 1.5, 8.5
 # 64-arrival block -> its one long arrival (ms); the other blocks' maximum is the normal 0.5 ms. All six lie in
 # blocks 36..48, which stay inside the newest 32 closed blocks for every evaluated frame (k 3201..4400).
-HISTORY_SPIKES = {38: 9.0, 40: 8.5, 42: 8.0, 44: 7.5, 46: 7.2, 48: 7.1}
+HISTORY_SPIKES = {38: 9.005, 40: 8.505, 42: 8.005, 44: 7.505, 46: 7.205, 48: 7.105}
 # Frames the floor must not sample, each larger than every history spike (kept, one would change Q_tail):
 EXCLUDED_FRAMES = {2400: ("pinned", 10.5),       # the render thread waited for the previous Signal
                    2520: ("normal", 20.0),       # first work after the middle of the render submission
@@ -276,6 +276,66 @@ class SpikeFloorTests(unittest.TestCase):
         self.assertAlmostEqual(samples[0][3], 1.5, places=6)
         self.assertIsNone(samples[3][3])
 
+    def test_anchor_uses_grid_predecessor_even_without_replay_frame_after_range_check(self):
+        # At grid 11 there is no replay Frame; it is still the anchor for grid 12.
+        # Frame 1, the previous Reflex frame, supplies queue context, not the anchor.
+        rows = [spike_row(1, 12.0), spike_row(2, 12.0, "spike", 29.0),
+                spike_row(3, 12.0, "normal", -1.0)]
+        for r, grid in zip(rows, (10, 12, 13)):
+            r.update(source_placement=5, grid_index=grid, fg_divisor=2, controller_generation=1)
+        rows.append(dict(rows[0], real_frame=0, grid_index=11, source_release_qpc=ticks(1004.0)))
+        with tempfile.TemporaryDirectory() as directory:
+            c = pipeline.load(write(directory, rows, columns=SPIKE_COLUMNS))
+        first, second, third = c.frames
+        self.assertEqual(second.anchor_delta_ms, 4.0)
+        self.assertEqual(pipeline._spike_sample(second, first, 10.0)[:2], (33.0, None))
+        self.assertEqual(pipeline._spike_sample(third, second, 10.0)[:2], (None, "arrival_out_of_range"))
+
+    def test_memories_survive_segment_changes_but_not_generation_changes(self):
+        rows = []
+        for k in range(1, 644):
+            rung = 3 if k <= 320 or k >= 642 else (4 if k <= 640 else 0)
+            high = rung == 3
+            rows.append(dict(spike_row(k, 12.0, "spike" if high else "normal",
+                                       9.005 if high else 0.5, 7.0 if high else 2.0),
+                             plan_rung=rung, controller_generation=1 if k < 643 else 2))
+        with tempfile.TemporaryDirectory() as directory:
+            c = pipeline.load(write(directory, rows, columns=SPIKE_COLUMNS))
+        # Settle hides the first 100 rung-4 frames from the segment, not its memory.
+        c.transitions = [c.frames[320].s]
+        segmenter = pipeline.Segmenter(c, 1000)
+        current = list(pipeline._spike_records(c, segmenter, 2, "frames"))
+        old = list(pipeline._spike_records(c, segmenter, 2, "arrivals"))
+        self.assertIsNone(current[320].spike)
+        self.assertEqual(old[320].spike, 9.01 + 7.0)
+        self.assertEqual(current[576].spike, 0.51 + 2.0)
+        self.assertEqual(old[576].spike, 9.01 + 2.0)
+        self.assertIsNone(current[640].spike)  # source-only: no floor
+        self.assertEqual(current[641].spike, 9.01 + 7.0)
+        self.assertIsNone(current[642].spike)
+        self.assertIsNone(old[642].spike)
+
+    def test_sparse_and_empty_blocks_age_by_decided_frames(self):
+        rows = []
+        for k in range(1, 64 * (4 + 32 + 29) + 2):
+            block = (k - 1) // 64
+            row = spike_row(k, 12, "spike", 9.005) if block < 4 else spike_row(k, 12, arrival=0.505)
+            if k % 16 or block >= 36:
+                del row["reflex_sim_end_us"]  # report arrived; missing stage time, not a missing frame
+            rows.append(row)
+        with tempfile.TemporaryDirectory() as directory:
+            c = pipeline.load(write(directory, rows, columns=SPIKE_COLUMNS))
+        rs = list(pipeline._spike_records(c, pipeline.Segmenter(c, 0), 2, "frames"))
+        self.assertEqual([r.frame.frame_id for r in rs if r.closed_with_evidence is not None],
+                         list(range(64, len(rows) + 1, 64)))
+        self.assertEqual(sum(r.closed_with_evidence is True for r in rs), 36)
+        self.assertIsNone(rs[255].tail)
+        self.assertEqual(rs[256].tail, 9.01)
+        self.assertEqual(rs[(4 + 30) * 64].tail, 9.01)  # two old high maxima remain
+        self.assertEqual(rs[(4 + 32) * 64].tail, 0.51)
+        self.assertEqual(rs[(36 + 28) * 64].tail, 0.51)  # four blocks with evidence remain
+        self.assertIsNone(rs[(36 + 29) * 64].spike)
+
     def test_gamma_is_r_minus_g_inside_0_to_3_intervals(self):
         with tempfile.TemporaryDirectory() as directory:
             path = write(directory, [spike_row(k, 12.0, gamma=g) for k, g in enumerate((2.0, 35.0, -0.5, -1.0, 29.5), 1)],
@@ -301,15 +361,15 @@ class SpikeFloorTests(unittest.TestCase):
         self.assertEqual(seg["closed_blocks"], 68)
         self.assertAlmostEqual(seg["interval_ms"], SPIKE_I, places=6)
         self.assertAlmostEqual(seg["gap_g_minus_f_ms"], SPIKE_G, places=6)
-        # Q_tail: 4th largest of the block maxima 9.0 8.5 8.0 7.5 7.2 7.1 (the excluded 10.5 and 20 would give 8.5)
-        for name, expected in (("q_tail_ms", 7.5), ("gamma_ms", SPIKE_GAMMA), ("L_spike_ms", 7.5 + SPIKE_GAMMA)):
+        # Rank four selects 7.505 ms, binned at the midpoint of [7.50, 7.52) ms.
+        for name, expected in (("q_tail_ms", 7.51), ("gamma_ms", SPIKE_GAMMA), ("L_spike_ms", 7.51 + SPIKE_GAMMA)):
             for p in ("p5", "p50", "p95"):
                 self.assertAlmostEqual(seg[name][p], expected, places=6, msg=f"{name} {p}")
         self.assertEqual({p: seg["L_ms"][p] for p in ("p5", "p95")}, {"p5": 12.0, "p95": 20.0})
-        self.assertAlmostEqual(seg["L_prime_ms"]["p5"], 16.0, places=6)   # max(12, 16)
+        self.assertAlmostEqual(seg["L_prime_ms"]["p5"], 16.01, places=6)
         self.assertAlmostEqual(seg["L_prime_ms"]["p95"], 20.0, places=6)  # max(20, 16)
         self.assertAlmostEqual(seg["binding_share"], sum(1 for k in evaluated if k % 4) / len(evaluated), places=9)
-        self.assertAlmostEqual(seg["delta_L_p50_ms"], 4.0, places=6)
+        self.assertAlmostEqual(seg["delta_L_p50_ms"], 4.01, places=6)
         # the 4 live spikes stall at L (a - 3.5: 8.9, 7.5, 6.3, 4.5) and, at L' = 16 (a - 7.5), two stay over I/4
         # = 2.5 ms and over 3 ms (4.9, 3.5; the others 2.3, 0.5)
         self.assertEqual(seg["stalls"], {"model_over_tol": 4, "replay_over_tol": 2, "model_over_3ms": 4,
@@ -327,7 +387,7 @@ class SpikeFloorTests(unittest.TestCase):
     def test_rank_selects_the_largest_block_maximum(self):
         # stall' = a - Q_tail while L_spike = Q_tail + 8.5 exceeds L = 12 (G + Gamma = I); live a 12.4 11.0 9.8 8.0.
         # Rank 7 gives Q_tail 0.5, L_spike 9: below every L, so L' = L and the replay is the model.
-        for rank, tail, over_tol, over_3ms in ((1, 9.0, 1, 1), (6, 7.1, 3, 2), (7, 0.5, 4, 4)):
+        for rank, tail, over_tol, over_3ms in ((1, 9.01, 1, 1), (6, 7.11, 3, 2), (7, 0.51, 4, 4)):
             with self.subTest(rank=rank):
                 seg = self.run_floor(rank)[0]["spike_floor"]["segments"]["held"]
                 self.assertAlmostEqual(seg["q_tail_ms"]["p50"], tail, places=6)
@@ -345,8 +405,8 @@ class SpikeFloorTests(unittest.TestCase):
         report = self.run_floor(predict=True, **capture)[0]
         seg = report["spike_floor"]["segments"]["held"]
         self.assertTrue(report["spike_floor"]["predict"])
-        self.assertAlmostEqual(seg["L_prime_ms"]["p50"], 16.0, places=6)
-        self.assertAlmostEqual(seg["delta_L_p50_ms"], -4.0, places=6)
+        self.assertAlmostEqual(seg["L_prime_ms"]["p50"], 16.01, places=6)
+        self.assertAlmostEqual(seg["delta_L_p50_ms"], -3.99, places=6)
         self.assertEqual(seg["binding_share"], 0.0)
         # at 16 ms the live spikes 12.4 and 11.0 stall (4.9, 3.5) as with L' = L_spike in the other test
         self.assertEqual((seg["stalls"]["model_over_tol"], seg["stalls"]["replay_over_tol"]), (0, 2))
@@ -356,13 +416,13 @@ class SpikeFloorTests(unittest.TestCase):
         # r - g rises from 8.5 to 9.5 ms at frame `rise`: the lower median of the 32 frames before k is 9.5 once 17
         # of them have risen (k = rise + 17). The first k = 3260 or 3261 sets whether the 5th percentile, evaluated
         # frame 59 of 1,200 (index floor(0.05 * 1199)), has risen.
-        for rise, p5 in ((3243, 7.5 + 9.5), (3244, 7.5 + 8.5)):
+        for rise, p5 in ((3243, 7.51 + 9.5), (3244, 7.51 + 8.5)):
             with self.subTest(rise=rise):
                 seg = self.run_floor(gamma=lambda k, rise=rise: 9.5 if k >= rise else SPIKE_GAMMA)[0][
                     "spike_floor"]["segments"]["held"]
                 self.assertAlmostEqual(seg["L_spike_ms"]["p5"], p5, places=6)
-                self.assertAlmostEqual(seg["L_spike_ms"]["p95"], 7.5 + 9.5, places=6)
-                self.assertAlmostEqual(seg["q_tail_ms"]["p50"], 7.5, places=6)
+                self.assertAlmostEqual(seg["L_spike_ms"]["p95"], 7.51 + 9.5, places=6)
+                self.assertAlmostEqual(seg["q_tail_ms"]["p50"], 7.51, places=6)
 
     def test_no_floor_before_the_estimators_fill(self):
         seg = self.run_floor(frames=600)[0]["spike_floor"]["segments"]["held"]
@@ -379,10 +439,10 @@ class SpikeFloorTests(unittest.TestCase):
             self.assertNotIn("spike floor", pipeline.format_report(report))
             out = io.StringIO()
             with mock.patch.object(sys, "argv", ["render_pipeline.py", str(path), "--replay-spike-floor=3",
-                                                 "--predict", "--json"]), contextlib.redirect_stdout(out):
+                                                 "--spike-memory", "arrivals", "--predict", "--json"]), contextlib.redirect_stdout(out):
                 self.assertEqual(pipeline.main(), 0)
             entry = json.loads(out.getvalue())[0]["spike_floor"]
-            self.assertEqual((entry["rank"], entry["predict"]), (3, True))
+            self.assertEqual((entry["rank"], entry["predict"], entry["memory"]), (3, True, "arrivals"))
             with mock.patch.object(sys, "argv", ["render_pipeline.py", str(path), "--predict"]), \
                     contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 pipeline.main()

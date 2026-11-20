@@ -209,12 +209,7 @@ void LeadController::ResetBuckets() noexcept
 
 void LeadController::ResetSpikeFloor() noexcept
 {
-    spike_memory_ = SpikeMemory{};
-    spike_tail_us_ = 0.0;
-    spike_gpu_us_ = {};
-    spike_gpu_head_ = 0;
-    spike_gpu_count_ = 0;
-    spike_gpu_median_us_ = 0.0;
+    spike_memory_.fill(SpikeMemory{});
 }
 
 void LeadController::ResetStartTerm() noexcept
@@ -380,6 +375,7 @@ double LeadController::NextLeadUs(const LeadRequest& request, bool* budget_limit
         bucket.budget_us = max_lead_us;
         bucket.budget_limited = false;
         bucket.spike_floor_limited = false;
+        if (guard != nullptr) guard->own_lead_us = bucket.target_us;
         return CollisionGuardedLeadUs(request, bucket_index, bucket.lead_us, guard);
     }
 
@@ -393,6 +389,10 @@ double LeadController::NextLeadUs(const LeadRequest& request, bool* budget_limit
     const double floor_us = request.spike_floor ? SpikeFloorUs(request.rung, request.fg_divisor) : 0.0;
     bucket.spike_floor_limited = floor_us > own_us;
     bucket.target_us = std::max(own_us, floor_us);
+    if (guard != nullptr) {
+        guard->own_lead_us = own_us;
+        guard->floor_lead_us = floor_us;
+    }
     if (!bucket.lead_started) {
         bucket.lead_us = bucket.target_us;
         bucket.lead_started = true;
@@ -680,12 +680,26 @@ LeadBucketStatus LeadController::BucketStatus(PacingRung rung, double fg_divisor
 double LeadController::SpikeFloorUs(PacingRung rung, double fg_divisor) const noexcept
 {
     size_t index = 0;
-    if (!IsGpuRung(rung) || !FindBucketIndex(rung, fg_divisor, &index) ||
-        !BehindWait(rung, index % LEAD_DIVISOR_BUCKETS) || spike_memory_.count < LEAD_SPIKE_WARM_BLOCKS ||
-        spike_gpu_count_ < LEAD_SPIKE_GPU_SAMPLES) {
+    size_t output = 0;
+    if (!StartOutput(rung, &output) || !FindBucketIndex(rung, fg_divisor, &index) ||
+        !BehindWait(rung, index % LEAD_DIVISOR_BUCKETS)) {
         return 0.0;
     }
-    return spike_tail_us_ + spike_gpu_median_us_;
+    const SpikeMemory& memory = spike_memory_[output];
+    if (memory.evidence < LEAD_SPIKE_WARM_BLOCKS || memory.gpu_count < LEAD_SPIKE_GPU_SAMPLES) return 0.0;
+    return memory.tail_us + memory.gpu_median_us;
+}
+
+double LeadController::SpikeTailUs(PacingRung rung) const noexcept
+{
+    size_t output = 0;
+    return StartOutput(rung, &output) ? spike_memory_[output].tail_us : 0.0;
+}
+
+double LeadController::SpikeGpuUs(PacingRung rung) const noexcept
+{
+    size_t output = 0;
+    return StartOutput(rung, &output) ? spike_memory_[output].gpu_median_us : 0.0;
 }
 
 double LeadController::ValidQuantile(double quantile) noexcept
@@ -1880,80 +1894,103 @@ double LeadController::RenderQueueWaitUs(const PendingFrame& frame, const Pendin
 }
 
 // Spike floor arrival (lead_controller.h): a = (w − s − q) + F_n, decided once
-// per frame when its report arrives (the first report wins).
+// per frame when its report arrives (the first report wins). The frame counts
+// in its output's open block whether its arrival is kept or left out.
 void LeadController::RecordSpikeArrival(PendingFrame* frame, double first_submission_us) noexcept
 {
-    if (frame->spike_recorded || !frame->sampled || !IsGpuRung(frame->rung)) return;
+    size_t output = 0;
+    if (frame->spike_recorded || !frame->sampled || !StartOutput(frame->rung, &output)) return;
     frame->spike_recorded = true;
-    const PendingFrame* previous = Previous(*frame);
-    if (!frame->first_work_streamed || !std::isfinite(first_submission_us) || first_submission_us < 0.0 ||
-        previous == nullptr || !previous->started || !HasField(*frame, FieldSimulationEnd) ||
-        !HasField(*frame, FieldRenderSubmit) || !HasField(*frame, FieldPresentCall) ||
-        !HasField(*previous, FieldPresentEnd)) {
+    const double arrival_us = SpikeArrivalUs(*frame, first_submission_us);
+    SpikeMemory& memory = spike_memory_[output];
+    if (std::isnan(arrival_us)) {
         ++statistics_.spike_excluded;
-        return;
+    } else {
+        ++statistics_.spike_samples;
+        statistics_.last_spike_arrival_us = arrival_us;
+        const auto bin = static_cast<uint16_t>(std::min(arrival_us / LEAD_HISTOGRAM_BIN_US,
+            static_cast<double>(LEAD_SPIKE_NO_ARRIVAL - 1)));
+        if (!memory.current_kept || bin > memory.current_max_bin) memory.current_max_bin = bin;
+        memory.current_kept = true;
+    }
+    if (++memory.current_frames >= LEAD_SPIKE_BLOCK_FRAMES) CloseSpikeBlock(&memory);
+}
+
+double LeadController::SpikeArrivalUs(const PendingFrame& frame, double first_submission_us) const noexcept
+{
+    constexpr double kLeftOut = std::numeric_limits<double>::quiet_NaN();
+    const PendingFrame* previous = Previous(frame);
+    if (!frame.first_work_streamed || !std::isfinite(first_submission_us) || first_submission_us < 0.0 ||
+        previous == nullptr || !previous->started || !HasField(frame, FieldSimulationEnd) ||
+        !HasField(frame, FieldRenderSubmit) || !HasField(frame, FieldPresentCall) ||
+        !HasField(*previous, FieldPresentEnd)) {
+        return kLeftOut;
     }
     // The render thread took a finished frame only at or after frame n − 1's
     // Signal: that timing is ReLimiter's hold, not the game's.
     if (HasField(*previous, FieldOutputRelease)) {
         const int64_t signal_qpc = previous->qpc[FieldOutputRelease];
-        if (frame->qpc[FieldSimulationEnd] < signal_qpc && signal_qpc <= frame->qpc[FieldRenderSubmit]) {
-            ++statistics_.spike_excluded;
-            return;
-        }
+        if (frame.qpc[FieldSimulationEnd] < signal_qpc && signal_qpc <= frame.qpc[FieldRenderSubmit]) return kLeftOut;
     }
-    const int64_t source = frame->qpc[FieldSource];
-    const double present_us = MicrosecondsBetween(source, frame->qpc[FieldPresentCall]);
-    const double submit_us = std::clamp(MicrosecondsBetween(source, frame->qpc[FieldRenderSubmit]),
+    const int64_t source = frame.qpc[FieldSource];
+    const double present_us = MicrosecondsBetween(source, frame.qpc[FieldPresentCall]);
+    const double submit_us = std::clamp(MicrosecondsBetween(source, frame.qpc[FieldRenderSubmit]),
         0.0, std::max(present_us, 0.0));
-    const double arrival_us = submit_us - RenderQueueWaitUs(*frame, *previous) + first_submission_us;
-    if (!(arrival_us >= 0.0) || arrival_us > LEAD_LONG_SAMPLE_INTERVALS * frame->interval_us) {
-        ++statistics_.spike_excluded;
-        return;
-    }
-    // Lead anchor: the arrival's range check above is on s; the binned arrival
+    const double arrival_us = submit_us - RenderQueueWaitUs(frame, *previous) + first_submission_us;
+    if (!(arrival_us >= 0.0) || arrival_us > LEAD_LONG_SAMPLE_INTERVALS * frame.interval_us) return kLeftOut;
+    // Lead anchor: the arrival's range check above is on s; the kept arrival
     // is measured from B (unified pacer only).
-    double binned_us = arrival_us;
-    if (frame->anchored) binned_us += static_cast<double>(frame->anchor_delta_us);
-    ++statistics_.spike_samples;
-    statistics_.last_spike_arrival_us = binned_us;
-    SpikeMemory& memory = spike_memory_;
-    const auto bin = static_cast<uint16_t>(std::min(binned_us / LEAD_HISTOGRAM_BIN_US,
-        static_cast<double>(std::numeric_limits<uint16_t>::max())));
-    if (memory.current_count == 0 || bin > memory.current_max_bin) memory.current_max_bin = bin;
-    if (++memory.current_count < LEAD_SPIKE_BLOCK_SAMPLES) return;
-    memory.block_max_bins[memory.head] = memory.current_max_bin;
-    memory.head = static_cast<uint8_t>((memory.head + 1) % LEAD_SPIKE_BLOCKS);
-    if (memory.count < LEAD_SPIKE_BLOCKS) ++memory.count;
-    memory.current_count = 0;
-    memory.current_max_bin = 0;
-    if (memory.count < LEAD_SPIKE_WARM_BLOCKS) return;
-    // The closed blocks are positions [0, count) until the ring is full.
-    std::array<uint16_t, LEAD_SPIKE_BLOCKS> sorted = memory.block_max_bins;
-    const auto rank = sorted.begin() + static_cast<std::ptrdiff_t>(LEAD_SPIKE_TAIL_RANK - 1);
-    std::nth_element(sorted.begin(), rank, sorted.begin() + memory.count, std::greater<uint16_t>());
-    spike_tail_us_ = (static_cast<double>(*rank) + 0.5) * LEAD_HISTOGRAM_BIN_US;
+    return frame.anchored ? arrival_us + static_cast<double>(frame.anchor_delta_us) : arrival_us;
 }
 
-// Spike floor Γ sample (lead_controller.h): r − g once both are known.
+void LeadController::CloseSpikeBlock(SpikeMemory* memory) noexcept
+{
+    const uint16_t value = memory->current_kept ? memory->current_max_bin : LEAD_SPIKE_NO_ARRIVAL;
+    // A full ring drops its oldest block, at head.
+    if (memory->count == LEAD_SPIKE_BLOCKS && memory->block_max_bins[memory->head] != LEAD_SPIKE_NO_ARRIVAL)
+        --memory->evidence;
+    memory->block_max_bins[memory->head] = value;
+    memory->head = static_cast<uint8_t>((memory->head + 1) % LEAD_SPIKE_BLOCKS);
+    if (memory->count < LEAD_SPIKE_BLOCKS) ++memory->count;
+    if (value != LEAD_SPIKE_NO_ARRIVAL) ++memory->evidence;
+    memory->current_frames = 0;
+    memory->current_max_bin = 0;
+    memory->current_kept = false;
+    memory->tail_us = 0.0;
+    if (memory->evidence < LEAD_SPIKE_WARM_BLOCKS) return;
+    // The closed blocks are positions [0, count) until the ring is full; only those that kept an arrival rank.
+    std::array<uint16_t, LEAD_SPIKE_BLOCKS> kept{};
+    size_t kept_blocks = 0;
+    for (size_t i = 0; i < memory->count; ++i) {
+        if (memory->block_max_bins[i] != LEAD_SPIKE_NO_ARRIVAL) kept[kept_blocks++] = memory->block_max_bins[i];
+    }
+    const auto rank = kept.begin() + static_cast<std::ptrdiff_t>(LEAD_SPIKE_TAIL_RANK - 1);
+    std::nth_element(kept.begin(), rank, kept.begin() + static_cast<std::ptrdiff_t>(kept_blocks),
+        std::greater<uint16_t>());
+    memory->tail_us = (static_cast<double>(*rank) + 0.5) * LEAD_HISTOGRAM_BIN_US;
+}
+
+// Spike floor Γ sample (lead_controller.h): r − g once both are known, in the frame's output's ring.
 void LeadController::RecordSpikeGpu(PendingFrame* frame) noexcept
 {
-    if (frame->spike_gpu_recorded || !frame->sampled || !IsGpuRung(frame->rung) || frame->gpu_start_qpc <= 0 ||
-        !HasField(*frame, FieldGpuReady)) {
+    size_t output = 0;
+    if (frame->spike_gpu_recorded || !frame->sampled || !StartOutput(frame->rung, &output) ||
+        frame->gpu_start_qpc <= 0 || !HasField(*frame, FieldGpuReady)) {
         return;
     }
     frame->spike_gpu_recorded = true;
     const double gpu_us = MicrosecondsBetween(frame->gpu_start_qpc, frame->qpc[FieldGpuReady]);
     if (!(gpu_us > 0.0) || gpu_us > LEAD_LONG_SAMPLE_INTERVALS * frame->interval_us) return;
-    spike_gpu_us_[spike_gpu_head_] = static_cast<float>(gpu_us);
-    spike_gpu_head_ = static_cast<uint8_t>((spike_gpu_head_ + 1) % LEAD_SPIKE_GPU_SAMPLES);
-    if (spike_gpu_count_ < LEAD_SPIKE_GPU_SAMPLES) ++spike_gpu_count_;
+    SpikeMemory& memory = spike_memory_[output];
+    memory.gpu_us[memory.gpu_head] = static_cast<float>(gpu_us);
+    memory.gpu_head = static_cast<uint8_t>((memory.gpu_head + 1) % LEAD_SPIKE_GPU_SAMPLES);
+    if (memory.gpu_count < LEAD_SPIKE_GPU_SAMPLES) ++memory.gpu_count;
     ++statistics_.spike_gpu_samples;
-    if (spike_gpu_count_ < LEAD_SPIKE_GPU_SAMPLES) return;
-    std::array<float, LEAD_SPIKE_GPU_SAMPLES> sorted = spike_gpu_us_;
+    if (memory.gpu_count < LEAD_SPIKE_GPU_SAMPLES) return;
+    std::array<float, LEAD_SPIKE_GPU_SAMPLES> sorted = memory.gpu_us;
     const auto median = sorted.begin() + static_cast<std::ptrdiff_t>((LEAD_SPIKE_GPU_SAMPLES - 1) / 2);
     std::nth_element(sorted.begin(), median, sorted.end());
-    spike_gpu_median_us_ = static_cast<double>(*median);
+    memory.gpu_median_us = static_cast<double>(*median);
 }
 
 // The GPU-rung frame's GPU waited at its gate (probe w <= o, else held and

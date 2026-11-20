@@ -257,6 +257,8 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     frame.guard_reduction_us = guard.reduction_us;
     frame.start_limit_us = guard.start_limit_us;
     frame.start_applied = guard.start_applied;
+    frame.lead_own_us = guard.own_lead_us;
+    frame.lead_floor_us = guard.floor_lead_us;
     frame.epoch_started = grid_plan.epoch_reason;
     frame.grid_epoch_reason = snapshot.epoch_reason;
     if (driver_sleep_matched) {
@@ -345,6 +347,8 @@ void SourceStage::FillSourceRecord(
     record->plan_ordered = static_cast<uint8_t>(plan.ordered);
     record->plan_start_limit_us = frame.start_limit_us;
     record->plan_start_applied = static_cast<uint8_t>(frame.start_applied);
+    record->plan_lead_own_us = frame.lead_own_us;
+    record->plan_lead_floor_us = frame.lead_floor_us;
     record->pipeline_generation = plan.pipeline_generation;
 }
 
@@ -591,6 +595,8 @@ SourceStageFrame SourceStage::RunUnifiedFrame(
     frame.guard_reduction_us = guard.reduction_us;
     frame.start_limit_us = guard.start_limit_us;
     frame.start_applied = guard.start_applied;
+    frame.lead_own_us = guard.own_lead_us;
+    frame.lead_floor_us = guard.floor_lead_us;
     frame.epoch_started = grid_plan.epoch_reason;
     frame.grid_epoch_reason = snapshot.epoch_reason;
 

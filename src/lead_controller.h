@@ -69,16 +69,20 @@ constexpr size_t LEAD_RESUME_MEDIAN_SAMPLES = 32;  // newest u − o in the medi
 // A waited u − o above this is a late GPU resume: measured and shown (OSD,
 // telemetry), never acted on.
 constexpr double LEAD_RESUME_LATE_US = 1000.0;
-// Spike floor (below): arrivals per block, blocks kept, the rank among their
-// maxima that sets the tail, closed blocks and GPU times needed before the
-// floor applies, and the GPU times kept (their median is Γ).
-constexpr uint32_t LEAD_SPIKE_BLOCK_SAMPLES = 64;
+// Spike floor (below), per GPU output: decided frames per block, blocks kept,
+// the rank among their maxima that sets the tail, blocks with a kept arrival
+// and GPU times needed before the floor applies, the GPU times kept (their
+// median is Γ), and the value of a block that kept no arrival.
+constexpr uint32_t LEAD_SPIKE_BLOCK_FRAMES = 64;
 constexpr size_t LEAD_SPIKE_BLOCKS = 32;
 constexpr size_t LEAD_SPIKE_TAIL_RANK = 2;
 constexpr uint32_t LEAD_SPIKE_WARM_BLOCKS = 4;
 constexpr size_t LEAD_SPIKE_GPU_SAMPLES = 32;
+constexpr uint16_t LEAD_SPIKE_NO_ARRIVAL = UINT16_MAX;
 static_assert(LEAD_SPIKE_WARM_BLOCKS >= LEAD_SPIKE_TAIL_RANK && LEAD_SPIKE_TAIL_RANK >= 1,
-    "the tail rank needs that many closed blocks");
+    "the tail rank needs that many blocks with a kept arrival");
+static_assert(LEAD_SPIKE_BLOCKS <= UINT8_MAX && LEAD_SPIKE_BLOCK_FRAMES <= UINT16_MAX,
+    "the block ring and the open block's frame count fit their counters");
 constexpr double LEAD_PRESENT_PLACEMENT_US = 150.0;
 constexpr double LEAD_SEED_MIN_US = 1000.0;
 constexpr double LEAD_SEED_MAX_US = 8000.0;
@@ -472,9 +476,10 @@ enum class LeadStartSource : uint8_t {
 //   5.05 / 12.1 at L 29.8). Held-first frames (Gears of War: E-Day, first
 //   work pinned to the previous Signal) add no arrival.
 // - Q_tail: the LEAD_SPIKE_TAIL_RANK-th largest of the maxima of the newest
-//   LEAD_SPIKE_BLOCKS closed blocks of LEAD_SPIKE_BLOCK_SAMPLES arrivals
-//   (about 31 s at 65 real frames per second): every arrival of that window
-//   but the longest is covered, so one isolated long second does not set it.
+//   LEAD_SPIKE_BLOCKS closed blocks of LEAD_SPIKE_BLOCK_FRAMES decided frames
+//   (about 31 s at 65 real frames per second), among the blocks that kept an
+//   arrival: every arrival of that window but the longest is covered, so one
+//   isolated long second does not set it.
 //   A game whose long simulations recur leaves at most one uncovered per
 //   window besides new maxima. The fourth-largest (the lead's own outlier
 //   rank, about one frame in a thousand) left the three longest of each
@@ -488,17 +493,31 @@ enum class LeadStartSource : uint8_t {
 //   Gears of War: E-Day's GPU-paced cadence (40% of frames) and is not used.
 // - Γ: the median GPU start → readiness time (r − g) of the newest
 //   LEAD_SPIKE_GPU_SAMPLES frames.
+// The window counts decided frames, not kept arrivals: every frame whose
+// arrival is decided counts toward its block, kept or left out, so the window
+// is the newest 2,048 decided frames whatever share of them keeps an arrival.
+// Counted in kept arrivals, the window of a game that keeps few never turned
+// over: Resident Evil Requiem with FG kept 0.0–0.7% of its frames' arrivals,
+// and a pause menu's arrivals held its lead 13–14 ms above the own lead for
+// 193 s of play after it. A block that kept no arrival has no maximum
+// (LEAD_SPIKE_NO_ARRIVAL); a memory with fewer than LEAD_SPIKE_WARM_BLOCKS
+// blocks that kept one has no tail, so a memory without arrivals for most of
+// its window switches itself off.
+// Each GPU output (StartOutput: the GPU queue wait, the FG input wait) keeps
+// its own blocks and Γ: one output's frames never set or age the other's
+// floor (that pause menu ran on the GPU queue wait with FG off).
 // A frame whose work reaches the GPU after the GPU is free is ready a + Γ
 // after its release, so a lead of at least L_spike has it ready by its
 // target. The floor applies behind the wait once LEAD_SPIKE_WARM_BLOCKS
-// blocks and LEAD_SPIKE_GPU_SAMPLES GPU times are known, and enters only the
-// warm target, max(Q_q + allowance, L_spike): the slew and S follow one lead.
+// blocks with a kept arrival and LEAD_SPIKE_GPU_SAMPLES GPU times of the
+// frame's output are known, and enters only the warm target,
+// max(Q_q + allowance, L_spike): the slew and S follow one lead.
 // It needs no load threshold: where the arrival tail is thin it lies below
 // the lead (Gears
 // 1.4–9.7 ms below in every capture, CONTROL's light scene within 0.3 ms).
 // It is not part of the 3 I budget, and it did not
 // slow the game's render submission (CONTROL p50 7.8–8.0 ms with and without
-// it). Reset and ResetBuckets clear it.
+// it). Reset and ResetBuckets clear both outputs' memories.
 
 // Report pairs (frame n's Reflex report and n − 1's, driver clock): a pair
 // whose first work reached the driver in the first half of the render
@@ -579,6 +598,14 @@ struct LeadGuardOutcome {
     // after the release, or on the FG input wait the game's Present return after the gate), or the release headroom,
     // the fallback; Headroom where the term did not run.
     LeadStartSource start_source = LeadStartSource::Headroom;
+    // The lead's own terms at the plan, in µs in the returned lead's units (the release → target distance with the
+    // anchor's delta in it): own_lead_us, the bucket's own target (Q_q + allowance when warm, the seed while cold),
+    // and floor_lead_us, the spike floor (above) that entered the warm target, 0 where it does not apply or the
+    // bucket is cold. The warm target is max(own, floor); the slew, the collision guard and the start term follow
+    // it. Both 0 for a plan without a lead decision (present placement, idle, off, invalid input). CSV
+    // plan_lead_own_us and plan_lead_floor_us.
+    double own_lead_us = 0.0;
+    double floor_lead_us = 0.0;
 };
 
 // One Reflex latency report's GPU times for a frame (LeadController::OnGpuReport).
@@ -1015,11 +1042,12 @@ public:
 
     LeadBucketStatus BucketStatus(PacingRung rung, double fg_divisor) const noexcept;
     // Spike floor (above): L_spike for a bucket, 0 where it does not apply
-    // (not a GPU wait behind the wait, or the memories not yet warm); the
-    // arrival tail Q_tail and Γ it adds, 0 until known.
+    // (not a GPU wait behind the wait, or its output's memories not yet warm);
+    // the arrival tail Q_tail and Γ of the rung's output, 0 until known and for
+    // a rung that is not a GPU wait.
     double SpikeFloorUs(PacingRung rung, double fg_divisor) const noexcept;
-    double SpikeTailUs() const noexcept { return spike_tail_us_; }
-    double SpikeGpuUs() const noexcept { return spike_gpu_median_us_; }
+    double SpikeTailUs(PacingRung rung) const noexcept;
+    double SpikeGpuUs(PacingRung rung) const noexcept;
     // Median sample X of a warm bucket (release to output point); 0 when the
     // bucket is cold or unknown. The source slack of a plan is L minus this
     // value.
@@ -1306,9 +1334,12 @@ private:
     double QueueUs(const PendingFrame& frame, const PendingFrame* previous) const noexcept;
     // q itself.
     double RenderQueueWaitUs(const PendingFrame& frame, const PendingFrame& previous) const noexcept;
-    // Spike floor (above): a frame's arrival once its report came, its r − g
-    // once both are known, and a restart of both memories.
+    // Spike floor (above): a frame's arrival once its report came (counted in
+    // its output's open block, kept or left out), its r − g once both are
+    // known, and a restart of both outputs' memories. SpikeArrivalUs is the
+    // arrival to keep, the anchor's delta in it, NaN for a frame left out.
     void RecordSpikeArrival(PendingFrame* frame, double first_submission_us) noexcept;
+    double SpikeArrivalUs(const PendingFrame& frame, double first_submission_us) const noexcept;
     void RecordSpikeGpu(PendingFrame* frame) noexcept;
     void ResetSpikeFloor() noexcept;
     // Lockstep engines: waits of later frames that gated this one, in ticks.
@@ -1425,22 +1456,28 @@ private:
     // FG input wait frames since the newest Reflex report of one, per FG
     // divisor slot (LEAD_WORK_STALE_FRAMES + 1 after a reset: stale).
     std::array<uint32_t, LEAD_DIVISOR_BUCKETS> fg_report_age_frames_{};
-    // Spike floor (above): the open block's maximum and arrival count, the
-    // newest closed blocks' maxima as 20 µs bins, and the tail they give;
-    // the newest r − g times and their median.
+    // Spike floor (above), one per GPU output (StartOutput): the open block's
+    // decided frames and the maximum of its kept arrivals, the newest closed
+    // blocks' maxima as 20 µs bins (LEAD_SPIKE_NO_ARRIVAL: none kept), how
+    // many of them kept one and the tail they give (0 below
+    // LEAD_SPIKE_WARM_BLOCKS); the newest r − g times and their median.
     struct SpikeMemory {
         std::array<uint16_t, LEAD_SPIKE_BLOCKS> block_max_bins{};
+        std::array<float, LEAD_SPIKE_GPU_SAMPLES> gpu_us{};
+        double tail_us = 0.0;
+        double gpu_median_us = 0.0;
         uint16_t current_max_bin = 0;
-        uint16_t current_count = 0;
+        uint16_t current_frames = 0;
+        bool current_kept = false;
         uint8_t head = 0;
-        uint8_t count = 0;
+        uint8_t count = 0;    // closed blocks in the ring
+        uint8_t evidence = 0; // of those, the blocks that kept an arrival
+        uint8_t gpu_head = 0;
+        uint8_t gpu_count = 0;
     };
-    SpikeMemory spike_memory_{};
-    double spike_tail_us_ = 0.0;
-    std::array<float, LEAD_SPIKE_GPU_SAMPLES> spike_gpu_us_{};
-    uint8_t spike_gpu_head_ = 0;
-    uint8_t spike_gpu_count_ = 0;
-    double spike_gpu_median_us_ = 0.0;
+    // Closes the open block of LEAD_SPIKE_BLOCK_FRAMES decided frames and sets the tail.
+    static void CloseSpikeBlock(SpikeMemory* memory) noexcept;
+    std::array<SpikeMemory, 2> spike_memory_{};
     int64_t qpc_frequency_ = 0;
     bool lifecycle_known_ = false;
     // Saturation rule (SetQueueWaitMode / SetQueueWaitLive).

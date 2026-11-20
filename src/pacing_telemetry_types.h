@@ -92,6 +92,11 @@ struct PacingSourceRecord {
     // whether the plan was limited by it. CSV plan_start_limit_us (empty at 0) and plan_start_applied (1 or empty).
     double plan_start_limit_us = 0.0;
     uint8_t plan_start_applied = 0;
+    // The lead's own terms at the plan (LeadGuardOutcome::own_lead_us and floor_lead_us, lead_controller.h), in µs in
+    // plan_lead_us's units: the own target (Q_q + allowance, the seed while the bucket is cold) and the spike floor
+    // that entered the warm target. CSV plan_lead_own_us and plan_lead_floor_us (empty at 0).
+    double plan_lead_own_us = 0.0;
+    double plan_lead_floor_us = 0.0;
     uint32_t pipeline_generation = 0;    // PacingPipelineSnapshot::generation
     uint8_t fallback_reason = 0;         // PacingFallbackReason of the resolved pipeline
 

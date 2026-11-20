@@ -843,6 +843,19 @@ static const PacingRowColumn PACING_ROW_COLUMNS[] = {
         DecimalIf(line, PacingRowHasPlan(row) && limit_us > 0.0, limit_us); } },
     { "plan_start_applied", [](CsvLine* line, const PacingCsvRow& row) {
         NonZeroIf(line, PacingRowHasPlan(row), row.joined.source.plan_start_applied); } },
+    // Appended: the lead's own terms for the joined Source record's
+    // plan (LeadGuardOutcome::own_lead_us, floor_lead_us), in µs in plan_lead_us's units (the release → target
+    // distance with the anchor's delta in it). plan_lead_own_us: the own target, Q_q + allowance of the plan's
+    // bucket, the seed while it is cold. plan_lead_floor_us: the spike floor that entered the warm target, empty
+    // where it does not apply. The target is max(own, floor); the slew, the collision guard and the start term
+    // (plan_start_limit_us) follow it. Both empty at 0 (no lead decision) or without a plan. Files of earlier builds
+    // lack both columns: the cells are unavailable there, not 0, since those builds had both terms.
+    { "plan_lead_own_us", [](CsvLine* line, const PacingCsvRow& row) {
+        const double own_us = row.joined.source.plan_lead_own_us;
+        DecimalIf(line, PacingRowHasPlan(row) && own_us > 0.0, own_us); } },
+    { "plan_lead_floor_us", [](CsvLine* line, const PacingCsvRow& row) {
+        const double floor_us = row.joined.source.plan_lead_floor_us;
+        DecimalIf(line, PacingRowHasPlan(row) && floor_us > 0.0, floor_us); } },
 };
 
 static const char* PacingEventTypeText(PacingCsvEventType type)

@@ -239,6 +239,10 @@ struct SourceStageFrame {
     // source record's plan_start_limit_us and plan_start_applied.
     double start_limit_us = 0.0;
     bool start_applied = false;
+    // The lead's own terms at this plan (LeadGuardOutcome::own_lead_us and floor_lead_us): the source record's
+    // plan_lead_own_us and plan_lead_floor_us.
+    double lead_own_us = 0.0;
+    double lead_floor_us = 0.0;
     // The driver's Sleep that matched the plan's index (request fields; 0 =
     // none), for the source record.
     int64_t driver_sleep_start_qpc = 0;
