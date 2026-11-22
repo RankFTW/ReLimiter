@@ -17,6 +17,7 @@
 #include "swapchain_manager.h"
 #include "native_present_gate.h"
 #include "streamline_hooks.h"
+#include "streamline_proxy_probe.h"
 #include "focus_lock.h"
 #include "blackout.h"
 #include "period_governor.h"
@@ -720,6 +721,7 @@ static PacingPipelineSnapshot ResolvePipeline(
         PacingPipeline_HasCapability(PacingCapability::FgInputRoute, generation);
     capabilities.fg_separate_presenter =
         PacingPipeline_HasCapability(PacingCapability::FgSeparatePresenter, generation);
+    capabilities.fg_route_blocked = StreamlineProxy_Unavailable();
 
     // The unified owner's transition is applied by ApplyUnifiedKeyTransition at the
     // start of the invocation (OnMarker, before the stage events are drained), never here.

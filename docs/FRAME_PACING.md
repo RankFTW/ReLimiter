@@ -387,7 +387,7 @@ An *output point* (the *rung* in the code) is where the finished frame is held t
 | Output | What it holds | Requirements | Notes |
 |--------|---------------|--------------|-------|
 | `gpu_queue_wait` | The GPU's present queue waits for `T` before it runs the frame's present work. A worker thread signals the time fence at `T`; the game's threads are not blocked | 64-bit, DX12, native Reflex (NvAPI) markers with the native Present route qualified, the present queue ready, VRR, no frame generation | A target more than `clamp(3 I, 2 ms, 100 ms)` ahead is *undeliverable* and the frame is presented unheld |
-| `fg_input_wait` | The GPU waits for `T` in front of each *real* frame's entry to frame generation. One wait per real frame, not per generated frame | 64-bit, DX12, native Reflex (NvAPI) markers, frame generation presenting, the FG input route qualified (an FG input reached an FG-ready queue) | Streamline frame generation of 1 to 3 generated frames per real frame (2× to 4×) |
+| `fg_input_wait` | The GPU waits for `T` in front of each *real* frame's entry to frame generation. One wait per real frame, not per generated frame | 64-bit, DX12, native Reflex (NvAPI) markers, frame generation presenting, the FG input route qualified (an FG input reached an FG-ready queue) | Streamline frame generation of 1 to 5 generated frames per real frame (2× to 6×) |
 | `marker_hold` | The CPU holds at the game's PRESENT_START marker until `T` | A marker route (Reflex or Streamline PCL markers) | A hold longer than 1.5 intervals is not performed (undeliverable) |
 | `source_only` | Nothing after the source wait. The frame passes at PRESENT_START | None | Used by Present-based pacing, idle caps, passthrough and unqualified FG |
 
@@ -412,7 +412,7 @@ flowchart TD
     E -->|no| H{"Frame generation presenting?"}
     H -->|yes| H1{"First unmet FG input wait requirement"}
     H1 -->|none| FG["fg_input_wait, reason none"]
-    H1 -->|one unmet| FU["source_only, reason architecture, api, no_native_route, fg_unqualified, fg_dynamic or fg_route_unsupported"]
+    H1 -->|one unmet| FU["source_only, reason architecture, api, no_native_route, fg_route_blocked, fg_route_unsupported, fg_unqualified or fg_dynamic"]
     H -->|no| J{"First unmet GPU queue wait requirement"}
     J -->|none| GQ["gpu_queue_wait, reason none"]
     J -->|one unmet| MH["marker_hold, reason architecture, api, fixed_refresh, no_native_route or no_gpu_queue"]

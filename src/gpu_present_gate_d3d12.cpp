@@ -1484,7 +1484,7 @@ bool GpuPresent_BeginFgInput(uint64_t native,const GpuPresentFgInput& input) noe
     const auto current=NativeGate_GetContext(begin);
     const auto multiplier=g_fg_multiplier.load(std::memory_order_acquire);
     // One wait per real input, not per generated output. Auto/unknown FG modes pass through.
-    if(!current.observe_frame_generation || multiplier<1 || multiplier>3 || frequency<=0 ||
+    if(!current.observe_frame_generation || multiplier<1 || multiplier>kFgRouteMostGenerated || frequency<=0 ||
         current.native_swapchain!=input.native || current.swapchain_generation!=input.swapchain ||
         current.producer_epoch!=input.producer || current.controller_generation!=input.controller ||
         input.observer!=GpuReadiness_Settings() || input.prediction!=NativeGate_PredictionEpoch())

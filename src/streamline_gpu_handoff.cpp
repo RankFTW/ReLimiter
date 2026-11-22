@@ -174,7 +174,7 @@ const char* PolicyRejection() noexcept {
     if (RuntimeLifecycle_IsStopping()) return "stopping";
     if (!GpuPresent_RequiresReadiness()) return "gpu_deadline_off";
     // Frame generation's state as the resolver published it: Dynamic MFG, Off, dynamic mode, not presenting, or a
-    // multiplier outside 2x to 4x (FrameGeneration_RouteRejection; Auto and an unobserved mode are accepted).
+    // multiplier outside 2x to 6x (FrameGeneration_RouteRejection; Auto and an unobserved mode are accepted).
     const FgRouteRejection reason = Streamline_RouteRejection();
     return reason == FgRouteRejection::None ? nullptr : FgRouteRejection_Text(reason);
 }
@@ -810,7 +810,7 @@ void AdmitSource(StreamlineInputScope& scope, const Marker& source, uint64_t obj
             scope.input = source.input; scope.input.transaction = sequence.fetch_add(1, std::memory_order_relaxed) + 1;
             scope.proxy = object; scope.config = GpuPresent_GetConfig().word;
             scope.multiplier = g_fg_multiplier.load(std::memory_order_acquire);
-            if (scope.multiplier < 1 || scope.multiplier > 3 || !scope.input.transaction) {
+            if (scope.multiplier < 1 || scope.multiplier > kFgRouteMostGenerated || !scope.input.transaction) {
                 failure = !scope.input.transaction ? "transaction_exhausted" : "unsupported_multiplier"; scope.input = {};
             }
         }

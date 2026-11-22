@@ -347,6 +347,7 @@ fallback_reason 12 infeasible retired
 fallback_reason 13 fg_route_unsupported
 fallback_reason 14 driver_limiter_unavailable
 fallback_reason 15 fg_dynamic
+fallback_reason 16 fg_route_blocked
 
 # epoch_reason
 epoch_reason 0 none

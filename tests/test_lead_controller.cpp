@@ -6123,8 +6123,8 @@ int main()
     std::printf("sizeof(LeadController) = %zu bytes\n", sizeof(LeadController));
     // Each window's ring holds 32-bit bins (samples beyond 40.96 ms keep theirs). The pending
     // frames' lead anchor delta (unified pacer, a float in the padding between bools) does not
-    // grow PendingFrame.
-    CHECK(sizeof(LeadController) < 208u * 1024u);
+    // grow PendingFrame. Six FG divisor buckets per rung: frame generation up to 6x.
+    CHECK(sizeof(LeadController) < 272u * 1024u);
 
     TestSourceOnlySample();
     TestMarkerHoldOverlap();

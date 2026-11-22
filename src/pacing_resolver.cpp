@@ -41,6 +41,8 @@ namespace
         if (capabilities.api != PacingApi::DX12) return PacingFallbackReason::Api;
         if (capabilities.route != PacingRoute::NvApiMarkers) return PacingFallbackReason::NoNativeRoute;
         if (capabilities.fg_input_route_ready) return PacingFallbackReason::None;
+        // Causes that keep the route from ever qualifying come before the pending reason.
+        if (capabilities.fg_route_blocked) return PacingFallbackReason::FgRouteBlocked;
         return capabilities.fg_separate_presenter ? PacingFallbackReason::FgRouteUnsupported
                                                   : PacingFallbackReason::FgUnqualified;
     }
@@ -621,6 +623,7 @@ const char* PacingFallbackReason_Text(PacingFallbackReason reason) noexcept
         case PacingFallbackReason::FgRouteUnsupported: return "fg_route_unsupported";
         case PacingFallbackReason::DriverLimiterUnavailable: return "driver_limiter_unavailable";
         case PacingFallbackReason::FgDynamic: return "fg_dynamic";
+        case PacingFallbackReason::FgRouteBlocked: return "fg_route_blocked";
         default: return "unknown";
     }
 }
@@ -631,6 +634,7 @@ const char* PacingFallbackReason_CappedSummary(PacingFallbackReason reason) noex
         case PacingFallbackReason::PresentRoute: return "Capped: smooth pacing needs NVIDIA Reflex in the game";
         case PacingFallbackReason::FgRouteUnsupported: return "Capped: frame generation paces its own frames here (frames are not held)";
         case PacingFallbackReason::FgDynamic: return "Capped: Dynamic frame generation paces its own frames (frames are not held)";
+        case PacingFallbackReason::FgRouteBlocked: return "Capped: frame generation can't be held here (frames are not held)";
         default: return nullptr;
     }
 }

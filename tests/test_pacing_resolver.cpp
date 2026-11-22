@@ -377,6 +377,17 @@ namespace
         CHECK_RESULT(Resolve(config, capabilities, ActiveFg()), Vrr, Marker, SourceOnly, FgRouteUnsupported);
         capabilities.fg_input_route_ready = true;
         CHECK_RESULT(Resolve(config, capabilities, ActiveFg()), Vrr, Marker, FgInputWait, None);
+        // The pending reason keeps the OSD's "Getting ready..."; a route that can never come up shows a capped
+        // summary instead (a user's Cyberpunk 2077 showed "Getting ready..." for good).
+        CHECK(!PacingFallbackReason_CappedSummary(PacingFallbackReason::FgUnqualified));
+        PacingCapabilities blocked = QualifiedDx12();
+        blocked.fg_input_route_ready = false;
+        blocked.fg_route_blocked = true;
+        result = Resolve(config, blocked, ActiveFg());
+        CHECK_RESULT(result, Vrr, Marker, SourceOnly, FgRouteBlocked);
+        CHECK(!result.observe_fg_inputs && PacingFallbackReason_CappedSummary(result.reason));
+        blocked.fg_separate_presenter = true;
+        CHECK_RESULT(Resolve(config, blocked, ActiveFg()), Vrr, Marker, SourceOnly, FgRouteBlocked);
 
         runtime = ActiveFg();
         runtime.fg_dynamic = true;
@@ -1272,7 +1283,7 @@ namespace
     void TestLabels()
     {
         CheckLabels(static_cast<uint32_t>(PacingRung::Count), PacingRung_Text, PacingRung::Count);
-        CheckLabels(16u, PacingFallbackReason_Text, static_cast<PacingFallbackReason>(16));
+        CheckLabels(17u, PacingFallbackReason_Text, static_cast<PacingFallbackReason>(17));
         CheckLabels(static_cast<uint32_t>(PacingTestMode::Count), PacingTestMode_Text, PacingTestMode::Count);
         CheckLabels(4u, PacingTimingMode_Text, static_cast<PacingTimingMode>(4));
         CHECK(std::strcmp(PacingRung_Text(PacingRung::GpuQueueWait), "gpu_queue_wait") == 0);

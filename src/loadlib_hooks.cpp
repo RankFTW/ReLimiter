@@ -59,7 +59,9 @@ static DWORD WINAPI InstallWorker(void* context) {
             if (GetModuleHandleExW(0, L"sl.interposer.dll", &interposer)) {
                 s_streamline_present.store(true, std::memory_order_release);
                 const bool streamline_ready = HookStreamlinePCL(interposer);
-                StreamlineFactoryProbe_TryWorker(interposer, streamline_ready);
+                // Presenting frame generation is DLSS-G running, even where its functions never resolve.
+                StreamlineFactoryProbe_TryWorker(interposer,
+                    streamline_ready || g_fg_presenting.load(std::memory_order_acquire));
             }
             if (!g_config.streamline_compat) NGXHooks_TryInstall();
             FgInput_InstallAndDrain();

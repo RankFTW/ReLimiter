@@ -3,6 +3,7 @@
 #include "fg_present_order_rule.h"
 #include "fg_break_window_rule.h"
 #include "fg_flip_gate_rule.h"
+#include "fg_state_policy.h"
 #include "streamline_gpu_handoff.h"
 #include "gpu_hold_order.h"
 #include "gpu_queue_probe.h"
@@ -153,6 +154,8 @@ struct BreakFrame {
 };
 SRWLOCK window_lock = SRWLOCK_INIT;
 BreakRule window_rules[FgBreakOutputs::kMost]; // under window_lock, one per later output
+static_assert(FgBreakOutputs::kMost >= static_cast<unsigned>(kFgRouteMostGenerated),
+    "a break window for each later output the route takes");
 FgBreakOutputs outputs;                        // under window_lock
 BreakFrame window_frames[4];                   // under window_lock, by marker value
 uint64_t window_current = 0;                   // under window_lock: the frame being submitted, 0 while none
@@ -356,11 +359,13 @@ struct GateEntry {
     bool stamped = false;                      // its readiness stamp went on the queue in front of the Wait
     uint8_t note = 0;                          // a later Present's: how its hold ended (for the pair lines)
     uint8_t index = 0;                         // its place in the cycle: 0 the first generated frame's
-    uint8_t outputs = 2;                       // the cycle's Presents: 2 at 2x, 3 at 3x, 4 at 4x
+    uint8_t outputs = 2;                       // the cycle's Presents: 2 at 2x up to 6 at 6x
     uint32_t released = 0, issued = 0;         // the ordering's markers when it was armed (for the pair lines)
     uint32_t cycle = 0;                        // the presenting thread's count of its cycle (for the flip samples)
 };
-constexpr unsigned kGateRing = 16;
+// Five cycles of up to six Presents in flight (a full ring refuses the gate, gate_refused[3]); a power of two, so the
+// indices stay continuous across the counters' wrap.
+constexpr unsigned kGateRing = 32;
 constexpr int64_t kGateMostMs = 60;
 GateEntry gate_ring[kGateRing];                // one producer (the presenting thread), one consumer (the clock)
 std::atomic<uint32_t> gate_head{0}, gate_tail{0};
@@ -1401,12 +1406,12 @@ void AheadSleepUntil(int64_t target, int64_t limit) noexcept {
 // ── Flip gate (fg_present_ahead 3) ──
 // The presenting thread, for the Present `arm` describes: the readiness stamp and the gate's Wait on `queue`, in that
 // order (the stamp completes when the queue has done everything in front of the gate), and the entry the clock thread
-// lets the Wait go by. At 2x to 4x, while the clock runs, on a queue of the render queue's device.
+// lets the Wait go by. At 2x to 6x, while the clock runs, on a queue of the render queue's device.
 bool GateEnqueue(ID3D12CommandQueue* queue, const GateArm& arm) noexcept {
     if (g_fg_present_ahead.load(relaxed) < 3 || !gate_running.load(std::memory_order_acquire) ||
         RuntimeLifecycle_IsStopping() || arm.marker == 0) { gate_refused[0].fetch_add(1, relaxed); return false; }
-    // The generated frames per real one: a cycle here describes 1 to 3 of them (2x to 4x).
-    if (const int generated = multiplier.load(relaxed); generated < 1 || generated > 3) {
+    // The generated frames per real one: a cycle here describes 1 to 5 of them (2x to 6x).
+    if (const int generated = multiplier.load(relaxed); generated < 1 || generated > kFgRouteMostGenerated) {
         gate_refused[1].fetch_add(1, relaxed);
         return false;
     }
@@ -1784,7 +1789,7 @@ HRESULT STDMETHODCALLTYPE AheadRegister(ID3D12Fence* fence, UINT64 value, HANDLE
     if (match) ahead_wait.fence = nullptr;   // one answer per Wait
     const int generated = multiplier.load(relaxed);
     if (mode < 2 || !match || again || !ahead_event.load(relaxed) || RuntimeLifecycle_IsStopping() ||
-        generated < 1 || generated > 3 || g_fg_present_order_queue.load(relaxed) == nullptr)
+        generated < 1 || generated > kFgRouteMostGenerated || g_fg_present_order_queue.load(relaxed) == nullptr)
         return native(fence, value, event);
     // 3x and 4x: the thread waits and registers once more a frame for each later generation, right after the Present
     // before it; a frame's values follow one another and the next frame's first is 6 further on (N.165). Such a

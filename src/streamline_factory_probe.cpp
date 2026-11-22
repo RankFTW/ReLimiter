@@ -24,14 +24,21 @@ struct Anchor {
     // name ("unknown" when no module owns it).
     uint32_t foreign_slot = 0;
     char foreign_owner[64] = {};
+    // The interposer's CreateDXGIFactory1 resolved outside its image (another
+    // add-on's GetProcAddress hook or export table entry); foreign_owner names
+    // the module that answered.
+    bool foreign_export = false;
 };
 // Attempts: early (init_device), worker (the early attempt found no
 // interposer) and ready (once, after Streamline resolved its DLSS-G
 // functions, when no attempt before it produced an anchor). The factory
 // slots are the interposer's only while nothing hooked them after it: in
 // CONTROL Resonant RenoDX DLSS owned slot 10 at init_device and the SCSKiller
-// d3d12.dll proxy once Streamline was ready. An attempt made while Streamline
-// is ready then takes Streamline's initialization as the image's provenance.
+// d3d12.dll proxy once Streamline was ready. Likewise the factory export is
+// the interposer's only while no other add-on answers for it (Cyberpunk 2077
+// with RenoDX DLSS: export_rejected at both attempts). An attempt made while
+// Streamline is ready then takes Streamline's initialization as the image's
+// provenance.
 Anchor early, fallback, ready;
 std::atomic<bool> attempted{false}, finished{false};
 bool fallback_attempted = false, ready_attempted = false;
@@ -83,7 +90,19 @@ bool ReleaseFactory(IDXGIFactory2* factory) noexcept {
 // attempt, so its plugins need the swapchain proxy in this image.
 Anchor Bootstrap(HMODULE module, CreateFactory create, bool streamline_ready) noexcept {
     Anchor anchor; anchor.module = module;
-    if (!create || !OwnedBy(reinterpret_cast<void*>(create), module)) { anchor.outcome = "export_rejected"; return anchor; }
+    if (!create) { anchor.outcome = "export_rejected"; return anchor; }
+    if (!OwnedBy(reinterpret_cast<void*>(create), module)) {
+        // Another module answers for the interposer's factory export. Its factory
+        // says nothing about the interposer and calling it runs that module's
+        // code, so the export is never called. Once Streamline resolved its DLSS-G
+        // functions, its initialization selects the image, as when other hooks own
+        // the factory slots; before that the anchor waits for it.
+        anchor.foreign_export = true;
+        RecordOwner(reinterpret_cast<void*>(create), &anchor);
+        anchor.streamline_initialized = anchor.valid = streamline_ready;
+        anchor.outcome = streamline_ready ? "streamline_initialized" : "export_rejected";
+        return anchor;
+    }
     if (!Hooks_PinTargetModule(reinterpret_cast<void*>(create))) { anchor.outcome = "pin_failed"; return anchor; }
     IDXGIFactory2* factory = nullptr;
     const auto result = MakeFactory(create, &factory);
@@ -112,12 +131,27 @@ Anchor Bootstrap(HMODULE module, CreateFactory create, bool streamline_ready) no
     return anchor;
 }
 void Report(const Anchor& anchor, const char* stage) noexcept {
-    if (anchor.foreign_slot) {
+    if (anchor.foreign_export) {
+        LOG_INFO("Streamline GPU: factory anchor=%s stage=%s export_owner=%s", anchor.outcome, stage,
+            anchor.foreign_owner);
+    } else if (anchor.foreign_slot) {
         LOG_INFO("Streamline GPU: factory anchor=%s stage=%s slot=%u owner=%s", anchor.outcome, stage,
             anchor.foreign_slot, anchor.foreign_owner);
     } else {
         LOG_INFO("Streamline GPU: factory anchor=%s stage=%s", anchor.outcome, stage);
     }
+}
+// After the last attempt failed: the FG input route has no Streamline hooks in this process.
+void MarkUnavailable(const Anchor& anchor) noexcept {
+    char cause[160];
+    if ((anchor.foreign_export || anchor.foreign_slot) && anchor.foreign_owner[0] &&
+        std::strcmp(anchor.foreign_owner, "unknown") != 0) {
+        std::snprintf(cause, sizeof(cause), "ReLimiter could not hook Streamline's DXGI factory (%s, hooked by %s)",
+            anchor.outcome, anchor.foreign_owner);
+    } else {
+        std::snprintf(cause, sizeof(cause), "ReLimiter could not hook Streamline's DXGI factory (%s)", anchor.outcome);
+    }
+    StreamlineProxy_MarkUnavailable(cause);
 }
 void TryWorker(HMODULE module, CreateFactory create, bool streamline_ready) noexcept {
     if (early.absent && !fallback_attempted) {
@@ -132,6 +166,9 @@ void TryWorker(HMODULE module, CreateFactory create, bool streamline_ready) noex
     const auto& anchor = Current();
     if (anchor.valid && anchor.module == module) {
         StreamlineProxy_Install(module, anchor.table, anchor.methods, anchor.streamline_initialized);
+    } else if (!anchor.valid && (ready_attempted || attempted_ready)) {
+        // No attempt follows one made while Streamline is ready.
+        MarkUnavailable(anchor);
     }
 }
 }

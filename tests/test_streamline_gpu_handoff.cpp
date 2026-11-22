@@ -1157,6 +1157,19 @@ int main() {
     auto initialized = f::Bootstrap(GetModuleHandleW(nullptr),&Factory,true);
     CHECK(initialized.valid && initialized.streamline_initialized && initialized.foreign_slot == 15 &&
         std::strcmp(initialized.outcome,"streamline_initialized") == 0 && proxy.refs == 1);
+    // A factory export another module answers for is never called. Before Streamline is ready that rejects the
+    // anchor; once it is ready, Streamline's initialization selects the image (a user's Cyberpunk 2077 with the RenoDX
+    // DLSS add-on: export_rejected at both attempts, so frame generation was never paced).
+    const int foreign_calls = factory_calls;
+    const auto foreign = reinterpret_cast<f::CreateFactory>(reinterpret_cast<void*>(&GetTickCount64));
+    auto exported = f::Bootstrap(GetModuleHandleW(nullptr),foreign,false);
+    CHECK(!exported.valid && !exported.streamline_initialized && exported.foreign_export &&
+        std::strcmp(exported.outcome,"export_rejected") == 0 && exported.foreign_owner[0] &&
+        std::strcmp(exported.foreign_owner,"unknown") != 0);
+    exported = f::Bootstrap(GetModuleHandleW(nullptr),foreign,true);
+    CHECK(exported.valid && exported.streamline_initialized && exported.foreign_export && !exported.table &&
+        std::strcmp(exported.outcome,"streamline_initialized") == 0);
+    CHECK(factory_calls == foreign_calls && proxy.refs == 1);
     // The early rejection is retried once, and only once Streamline is ready.
     f::early = anchor; f::finished = true; f::ready_attempted = false; f::attempted_ready = false;
     const int calls = factory_calls;
@@ -1175,6 +1188,21 @@ int main() {
     f::TryWorker(GetModuleHandleW(nullptr),&Factory,true);
     f::TryWorker(GetModuleHandleW(nullptr),&Factory,true);
     CHECK(factory_calls == calls + 3 && !f::fallback.valid && !f::ready_attempted);
+    // A failed last attempt names its cause for the OSD; a pending attempt names nothing.
+    char cause[160] = {};
+    p::unavailable = false;
+    f::early = anchor; f::fallback_attempted = false; f::ready_attempted = false; f::attempted_ready = false;
+    f::TryWorker(GetModuleHandleW(nullptr),&Factory,false);
+    CHECK(!StreamlineProxy_Unavailable(cause,sizeof(cause)));
+    f::TryWorker(GetModuleHandleW(nullptr),&Factory,true);
+    CHECK(f::ready_attempted && !f::Current().valid && StreamlineProxy_Unavailable(cause,sizeof(cause)) &&
+        std::strcmp(cause,"ReLimiter could not hook Streamline's DXGI factory (methods_aliased)") == 0);
+    // So does a swapchain proxy install that fails.
+    p::unavailable = false; p::attempted = false; pin_ok = false;
+    StreamlineProxy_Install(GetModuleHandleW(nullptr),1,methods,false);
+    CHECK(StreamlineProxy_Unavailable(cause,sizeof(cause)) &&
+        std::strcmp(cause,"ReLimiter could not hook Streamline's swap chain (module_pin_failed)") == 0);
+    pin_ok = true;
     proxy_table[16] = reinterpret_cast<void*>(&FactoryC);
     // Once a selected feature changes away from the publicly hooked functions,
     // later resolver success must not revive authority from stale mode telemetry.

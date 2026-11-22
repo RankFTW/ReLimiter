@@ -139,10 +139,11 @@ static bool run_fg_authority_tests() {
         FrameGeneration_RouteRejection(false, true, 0, true, 1) != FgRouteRejection::Off ||
         FrameGeneration_RouteRejection(false, true, 3, true, 1) != FgRouteRejection::Dynamic ||
         FrameGeneration_RouteRejection(false, true, 1, false, 1) != FgRouteRejection::NotPresenting ||
-        FrameGeneration_RouteRejection(false, true, 1, true, 4) != FgRouteRejection::UnsupportedMultiplier ||
+        FrameGeneration_RouteRejection(false, true, 1, true, 6) != FgRouteRejection::UnsupportedMultiplier ||
         FrameGeneration_RouteRejection(false, false, 0, true, 0) != FgRouteRejection::UnsupportedMultiplier ||
         FrameGeneration_RouteRejection(false, true, 1, true, 1) != FgRouteRejection::None ||
-        FrameGeneration_RouteRejection(false, true, 2, true, 3) != FgRouteRejection::None)
+        FrameGeneration_RouteRejection(false, true, 2, true, 3) != FgRouteRejection::None ||
+        FrameGeneration_RouteRejection(false, true, 1, true, 5) != FgRouteRejection::None)
         fail("the route predicate");
     return ok;
 }

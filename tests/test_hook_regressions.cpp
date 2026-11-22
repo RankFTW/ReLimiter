@@ -1270,6 +1270,7 @@ bool BackgroundTasks_Start(BackgroundTaskProc, void*) noexcept {
 }
 #ifdef _WIN64
 bool HookStreamlinePCL(HMODULE) { ++s_synchronous_installs; return false; }
+std::atomic<bool> g_fg_presenting{false};
 void NGXHooks_TryInstall() { ++s_synchronous_installs; }
 #endif
 bool FrameTimeline_BeginPresentCall(

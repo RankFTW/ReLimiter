@@ -229,6 +229,9 @@ struct PacingCapabilities {
     bool gpu_queue_ready = false;
     bool fg_input_route_ready = false;
     bool fg_separate_presenter = false;
+    // Streamline's hooks for the FG input route could not be installed in this
+    // process (streamline_proxy_probe.h): the route can never qualify.
+    bool fg_route_blocked = false;
 };
 
 struct PacingRuntimeState {

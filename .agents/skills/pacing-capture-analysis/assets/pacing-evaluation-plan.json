@@ -71,6 +71,7 @@
           "fg_unqualified",
           "fg_route_unsupported",
           "fg_dynamic",
+          "fg_route_blocked",
           "architecture",
           "api"
         ]
@@ -94,6 +95,7 @@
           "fg_unqualified",
           "fg_route_unsupported",
           "fg_dynamic",
+          "fg_route_blocked",
           "architecture",
           "api"
         ]
@@ -117,6 +119,7 @@
           "fg_unqualified",
           "fg_route_unsupported",
           "fg_dynamic",
+          "fg_route_blocked",
           "architecture",
           "api"
         ]

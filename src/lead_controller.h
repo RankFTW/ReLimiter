@@ -9,8 +9,8 @@
 // dependencies. Owned and called only by the scheduler owner; not thread-safe.
 //
 // Storage is fixed and nothing allocates. sizeof(LeadController) is about
-// 187 KB (20 buckets of a 256-sample ring and a 2,048-bin histogram, four
-// release → Present call windows, four release → heavy GPU work windows, the
+// 264 KB (30 buckets of a 256-sample ring and a 2,048-bin histogram, six
+// release → Present call windows, six release → heavy GPU work windows, the
 // first-submission window and the start term's two windows of the same shape
 // for each of its two outputs, plus the pending-frame table): keep the
 // instance in static storage or on the heap, never on a thread stack.
@@ -37,7 +37,7 @@ constexpr uint32_t LEAD_WARM_SAMPLES = 32;
 // A GPU idle inside a frame's span of at least this (µs) shows the GPU waited
 // inside the frame's work for its own submissions (SampleUs).
 constexpr double LEAD_HANDOFF_GPU_IDLE_US = 1000.0;
-constexpr size_t LEAD_DIVISOR_BUCKETS = 4;         // FG divisor 1..4
+constexpr size_t LEAD_DIVISOR_BUCKETS = 6;         // FG divisor 1..6
 constexpr size_t LEAD_PENDING_CAPACITY = 32;       // frames being assembled, by grid index
 constexpr uint64_t LEAD_PENDING_EXPIRY_FRAMES = 8; // frames this far behind the newest release close
 constexpr uint64_t LEAD_PENDING_AHEAD_FRAMES = 8;  // events accepted this far ahead of it

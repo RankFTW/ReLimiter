@@ -8,8 +8,9 @@ void StreamlineFactoryProbe_TryEarly() noexcept;
 // Existing installer worker only, with its retained module reference. A
 // worker attempt follows when the early attempt found no interposer, and one
 // more when no attempt produced an anchor before Streamline resolved its
-// DLSS-G functions (streamline_ready): before slInit the interposer returns
-// the native factory.
+// DLSS-G functions or frame generation presented (streamline_ready): before
+// slInit the interposer returns the native factory. When that last attempt
+// fails too, the FG input route is marked unavailable with its cause.
 void StreamlineFactoryProbe_TryWorker(HMODULE interposer, bool streamline_ready) noexcept;
 // Existing installer worker; scalar diagnostics only.
 void StreamlineFactoryProbe_Drain(bool final = false) noexcept;

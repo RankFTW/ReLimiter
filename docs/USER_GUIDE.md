@@ -176,10 +176,11 @@ The main view shows one plain line under the FPS controls:
 | `Smooth: frames are held on the GPU to an even cadence` | Green | A GPU wait (`gpu_queue_wait` or `fg_input_wait`) is holding frames to the cap cadence. |
 | `Smooth: frames are held to an even cadence` | Green | Another output hold (`marker_hold`) is holding frames to the cap cadence. |
 | `Learning the game's frame timing...` | Amber | A hold is active but its lead is still warming up. It clears by itself after a few moments. |
-| `Getting ready...` | Amber | The GPU wait output has not qualified yet and nothing is held. Normal after starting the game, toggling FG or changing settings. |
+| `Getting ready...` | Amber | Frame generation is presenting and its GPU wait (`fg_input_wait`) has not qualified yet; nothing is held. Normal for a moment after starting the game, toggling FG or changing settings. |
 | `Capped: smooth pacing needs NVIDIA Reflex in the game` | Grey | The game is paced at Present calls without Reflex markers; the cap applies but frames are not held. |
 | `Capped: frame generation paces its own frames here (frames are not held)` | Grey | Frame generation presents its frames itself, from its own thread and queue, as DLSS Frame Generation does when hardware flip metering is not in use. ReLimiter holds the real frames there only once its own checks show that it can order the game's render queue behind the generated frame's Present, a moment after frame generation starts presenting; until then, or where it cannot, nothing is held and the cap still applies. |
 | `Capped: Dynamic frame generation paces its own frames (frames are not held)` | Grey | The game's Dynamic frame generation mode chooses how many frames it generates. ReLimiter caps the real frames (the game's render rate) and holds nothing after that; the displayed FPS can differ from the cap when the multiplier changes. |
+| `Capped: frame generation can't be held here (frames are not held)` | Grey | ReLimiter could not hook Streamline's DXGI factory or swap chain in this game, usually because another add-on or injector hooked them first in a way ReLimiter cannot follow. The `Cause:` line below it names the step that failed, and the module that hooked it when known; include it in a bug report. The cap still applies. |
 | `Idle cap active (background, FG-Off Cap or OLED Care)` | Grey | An idle cap is active; frames follow the cadence without an output hold. |
 | `No FPS cap set` | Grey | The FPS limiter has no cap for ReLimiter to pace. |
 | `Not pacing right now` | Grey | A cap is set but ReLimiter is not pacing, for example during Dynamic MFG passthrough or before a presenting swapchain exists. |
@@ -219,6 +220,7 @@ Below the status line itself (not under **Details**), `Dynamic frame generation:
 | `fg_unqualified` | Frame generation is presenting on DX12 with native Reflex markers, but its FG input route has not qualified yet; nothing is held. |
 | `fg_dynamic` | The game uses Dynamic frame generation. ReLimiter caps real frames; Dynamic mode, not ReLimiter, spaces the generated frames. |
 | `fg_route_unsupported` | Frame generation presents its frames from its own thread and queue (DLSS Frame Generation without hardware flip metering), so the FG input wait cannot hold them until ReLimiter has ordered the game's render queue behind the generated frame's Present; until then, or where it cannot, the cap applies and nothing is held. |
+| `fg_route_blocked` | ReLimiter could not hook Streamline's DXGI factory or swap chain in this game, so the FG input wait cannot qualify for the rest of the session. The status line's `Cause:` names the step that failed. |
 | `override`, `driver_limiter_unavailable` | The developer test mode `driver_limiter` is set: `override` while the NVIDIA driver's Reflex limiter holds the cap, `driver_limiter_unavailable` where it cannot apply and the game runs as it is. See [Developer Settings](#developer-settings). |
 
 Reasons from `architecture` to `no_gpu_queue` come with `marker_hold`: they name the first requirement of the GPU queue wait that is not met. They do not mean pacing has failed. Brief warm-up after starting the game, toggling FG or changing settings is normal.
@@ -416,13 +418,13 @@ The panel and OSD can show the detected multiplier and the corresponding render 
 | **Dynamic MFG driver override** | Leaves pacing to the driver; see the next section. |
 | **NVIDIA Smooth Motion** | Supports detection and the normal cap, without an FG input wait. |
 
-Detection and the FG input wait are separate. In an eligible mode, `source_only` with reason `fg_unqualified` means qualification is pending: the cap still applies, but nothing is held after the source wait. When frame generation presents from its own thread and queue, as DLSS Frame Generation does without hardware flip metering, the route qualifies only once ReLimiter has ordered the game's render queue behind the generated frame's Present. Until then the reason is `fg_route_unsupported` and the main view reads **Capped: frame generation paces its own frames here (frames are not held)**. Where the FG input wait cannot run, the reason names the limitation instead, for example `fg_dynamic` for Dynamic mode on DX12 or `api` on Vulkan.
+Detection and the FG input wait are separate. In an eligible mode, `source_only` with reason `fg_unqualified` means qualification is pending: the cap still applies, but nothing is held after the source wait. When frame generation presents from its own thread and queue, as DLSS Frame Generation does without hardware flip metering, the route qualifies only once ReLimiter has ordered the game's render queue behind the generated frame's Present. Until then the reason is `fg_route_unsupported` and the main view reads **Capped: frame generation paces its own frames here (frames are not held)**. Where the FG input wait cannot run, the reason names the limitation instead, for example `fg_dynamic` for Dynamic mode on DX12, `api` on Vulkan, or `fg_route_blocked` where ReLimiter could not hook Streamline in the game.
 
 ### FG Input Wait Requirements
 
 The FG input wait paces real frames, not individual generated outputs, against the same cadence as every other output point. It is available only in the 64-bit DX12 Streamline path, where ReLimiter qualifies the game's frame-generation handoff at runtime. Qualification needs:
 
-- frame generation set to **On** or **Auto** with a supported multiplier (2×, 3× or 4×);
+- frame generation set to **On** or **Auto** with a supported multiplier (2× to 6×);
 - exact native Reflex source markers;
 - matching device identity and a verified queue dependency.
 

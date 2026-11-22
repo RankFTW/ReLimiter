@@ -118,8 +118,13 @@ inline FgEffective FrameGeneration_ResolveState(const FgFacts& facts) noexcept {
     return effective;
 }
 
+// The most generated frames per real frame the FG input route takes: 5, frame generation up to 6x (the state above
+// never resolves more). The route's rules for more than one generated frame were measured at 3x and 4x (N.165)
+// and apply unchanged to 5x and 6x.
+constexpr int kFgRouteMostGenerated = 5;
+
 // Why the FG input route cannot take frames. Auto (2) and an unobserved mode
-// are accepted; the route keys each input to a multiplier of 2x to 4x.
+// are accepted; the route keys each input to a multiplier of 2x to 6x.
 enum class FgRouteRejection : uint8_t { None, Dmfg, Off, Dynamic, NotPresenting, UnsupportedMultiplier };
 
 inline FgRouteRejection FrameGeneration_RouteRejection(bool dmfg, bool mode_known, uint32_t mode,
@@ -128,7 +133,7 @@ inline FgRouteRejection FrameGeneration_RouteRejection(bool dmfg, bool mode_know
     if (mode_known && mode == 0) return FgRouteRejection::Off;
     if (mode == 3) return FgRouteRejection::Dynamic;
     if (!presenting) return FgRouteRejection::NotPresenting;
-    if (generated < 1 || generated > 3) return FgRouteRejection::UnsupportedMultiplier;
+    if (generated < 1 || generated > kFgRouteMostGenerated) return FgRouteRejection::UnsupportedMultiplier;
     return FgRouteRejection::None;
 }
 

@@ -12,6 +12,7 @@
 #include "correlator.h"
 #include "streamline_hooks.h"
 #include "streamline_gpu_handoff.h"
+#include "streamline_proxy_probe.h"
 #include "wake_guard.h"
 #include "csv_writer.h"
 #include "swapchain_manager.h"
@@ -309,6 +310,9 @@ static void DrawPacingSummaryLine(const PacingPipelineSnapshot& pipeline, bool h
     }
     if (const char* capped = PacingFallbackReason_CappedSummary(pipeline.reason)) {
         ImGui::TextColored(gray, "%s", capped);
+        char cause[160];
+        if (pipeline.reason == PacingFallbackReason::FgRouteBlocked && StreamlineProxy_Unavailable(cause, sizeof(cause)))
+            ImGui::TextColored(gray, "Cause: %s", cause);
         return;
     }
     switch (pipeline.reason) {
@@ -321,9 +325,8 @@ static void DrawPacingSummaryLine(const PacingPipelineSnapshot& pipeline, bool h
     case PacingFallbackReason::DriverLimiterUnavailable:
         ImGui::TextColored(gray, "Test mode driver_limiter: the NVIDIA limiter can't apply here (the game runs as it is)");
         return;
-    case PacingFallbackReason::NoNativeRoute:
-    case PacingFallbackReason::NoGpuQueue:
     case PacingFallbackReason::FgUnqualified:
+        // Only the FG input route is ever pending; every other source-only reason is final until the setup changes.
         if (!holding) {
             ImGui::TextColored(amber, "Getting ready...");
             return;
