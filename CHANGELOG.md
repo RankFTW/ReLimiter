@@ -1,5 +1,12 @@
 # Changelog
 
+## 4.0.2
+
+### Frame generation
+
+- **No doubled frames with DLSS Frame Generation at a frame-rate cap.** In a user's Alan Wake 2 with frame generation at 2x and a 110 fps cap, two frames in a row stayed on screen about twice as long as they should, around 23 times a minute. DLSS Frame Generation spaces its frames by the game's frame-start markers, and ReLimiter's wait for the start of a frame, which belongs in front of that marker, ran behind it on about one frame in 200: whenever another of the game's threads called into ReLimiter within a few microseconds of the Reflex Sleep. The wait now stays in front of the marker in that case.
+- **The frame generation wait comes back after it drops out.** In Hogwarts Legacy with DLSS Frame Generation the summary read "Getting ready..." for most of a session: frames were capped but not held. The FG input wait dropped out every few seconds, when two of the game's threads reached ReLimiter at the same moment or when frame generation finished a frame one step late, and the check that brings it back passed only at a moment that almost never occurs in that game. The two causes seen there no longer drop the wait, and the check now passes as soon as frame generation has completed a frame.
+
 ## 4.0.1
 
 ### Frame generation
