@@ -173,13 +173,16 @@ static uint64_t Source(bool complete = true) {
     if (complete) scope.Complete(S_OK);
     return value;
 }
+static void WorkerEvidence(bool callback = true) {
+    q::ObserveExecute(As<ID3D12CommandQueue>(&b),7,reinterpret_cast<ID3D12CommandList* const*>(1));
+    if (callback) StreamlineHandoff_Boundary({StreamlineBoundaryStage::Present,0x1000,reinterpret_cast<uint64_t>(&b),0,1});
+}
 static void Worker(uint64_t value, bool callback = true, bool failed = false) {
     // No source marker or proxy TLS on this thread. Exact fence keys establish
     // the relationship, even though outer Present has already returned.
     CHECK(!StreamlineInputScope::Current());
     CHECK(Fence(&b,&forward_fence,value,0x130,false) == S_OK);
-    q::ObserveExecute(As<ID3D12CommandQueue>(&b),7,reinterpret_cast<ID3D12CommandList* const*>(1));
-    if (callback) StreamlineHandoff_Boundary({StreamlineBoundaryStage::Present,0x1000,reinterpret_cast<uint64_t>(&b),0,1});
+    WorkerEvidence(callback);
     if (failed) host_result = E_FAIL;
     CHECK(Fence(&b,&back_fence,value+10000,0x140,true) == host_result);
     host_result = S_OK;
@@ -207,6 +210,165 @@ static void Warm() {
         h::epoch.load(),h::route.epoch,h::route.successes,h::route.device_checked,h::route.cycle.begun,h::route.cycle.finished,
         h::route.cycle.outer_done,h::route.cycle.complete,h::route.cycle.executions,h::route.cycle.callbacks,begins);
     CHECK(StreamlineHandoff_IsCurrent(h::epoch));
+}
+
+// Service only sees a cycle in flight. Its device check must depend on the binding's completed history,
+// not on the pass landing between a worker back Signal and the next source Signal.
+static void TestDeviceCheckDuringNextCycle() {
+    const auto binding = h::epoch.load();
+    const auto prior_begins = begins;
+    for (unsigned i = 0; i < h::RequiredCycles; ++i) {
+        const auto value = Source();
+        CHECK(!h::route.cycle.complete);
+        StreamlineHandoff_Service();
+        std::thread([=]{ Worker(value); }).join();
+        CHECK(h::route.cycle.complete && h::route.successes == i + 1);
+        CHECK(StreamlineHandoff_IsCurrent(binding) == (i + 1 == h::RequiredCycles));
+    }
+    CHECK(begins == prior_begins);
+    Cycle(); CHECK(begins == prior_begins + 1 && StreamlineHandoff_IsCurrent(binding));
+    Reset();
+}
+
+// Returns with the lock held by another thread. The caller releases and joins it before submitting more fences.
+static std::thread HoldRouteLock(std::promise<void>* release) {
+    std::promise<void> acquired;
+    auto held = acquired.get_future();
+    std::thread locker([acquired = std::move(acquired), resume = release->get_future()]() mutable {
+        AcquireSRWLockExclusive(&h::mutex);
+        acquired.set_value();
+        CHECK(resume.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+        ReleaseSRWLockExclusive(&h::mutex);
+    });
+    held.get();
+    return locker;
+}
+
+static void TestWorkerEvidenceUnderContention() {
+    const auto binding = h::epoch.load(), contentions = h::callback_contentions.load();
+    const auto value = Source();
+    std::thread([=] {
+        CHECK(Fence(&b,&forward_fence,value,0x130,false) == S_OK);
+        std::promise<void> release;
+        auto locker = HoldRouteLock(&release);
+        WorkerEvidence();
+        CHECK(h::epoch == binding && h::callback_contentions == contentions);
+        release.set_value(); locker.join();
+        CHECK(Fence(&b,&back_fence,value+10000,0x140,true) == S_OK);
+    }).join();
+    CHECK(h::epoch == binding && h::route.cycle.complete && !h::route.separate && h::route.successes == 1);
+
+    // The queue recursion guard does not mask Present callbacks inside the native back Signal.
+    const auto next = Source();
+    std::thread([=] {
+        CHECK(Fence(&b,&forward_fence,next,0x130,false) == S_OK);
+        WorkerEvidence();
+        const auto call = StreamlineHandoff_BeforeFence(As<ID3D12CommandQueue>(&b),As<ID3D12Fence>(&back_fence),next+10000,0x140,true);
+        CHECK(call.role == 4);
+        StreamlineHandoff_Boundary({StreamlineBoundaryStage::Present,0x1000,reinterpret_cast<uint64_t>(&b),0,1});
+        StreamlineHandoff_AfterFence(call,S_OK);
+    }).join();
+    CHECK(h::epoch != binding && std::strcmp(h::rejection.load(),"worker_present_after_back_signal") == 0);
+    Reset();
+}
+
+static void TestSourceAdmissionUnderContention() {
+    Warm();
+    const auto binding = h::epoch.load(), contentions = h::callback_contentions.load();
+    const auto prior_begins = begins;
+    std::promise<void> release;
+    auto locker = HoldRouteLock(&release);
+    Marker(); const auto value = frame;
+    {
+        StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),source_sync,0);
+        CHECK(scope.input.source == value && StreamlineHandoff_ClaimsInput());
+        CHECK(h::epoch == binding && h::callback_contentions == contentions);
+        release.set_value(); locker.join();
+        CHECK(Fence(&a,&forward_fence,value,0x110,true) == S_OK);
+        CHECK(Fence(&a,&back_fence,value+10000,0x120,false) == S_OK);
+        scope.Complete(S_OK);
+    }
+    std::thread([=]{ Worker(value); }).join();
+    CHECK(begins == prior_begins + 1 && h::route.cycle.complete && StreamlineHandoff_IsCurrent(binding));
+
+    // A fresh marker before retirement sees the old binding's key: drop only the scope, not another epoch.
+    StreamlineHandoff_Invalidate("test_invalidate_before_retire");
+    const auto revoked = h::epoch.load();
+    Marker(); {
+        StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),source_sync,0);
+        CHECK(scope.invalid && !scope.input.transaction && h::epoch == revoked);
+        scope.Complete(S_OK);
+    }
+    Reset();
+}
+
+static void TestLateWorkerCycle() {
+    const auto binding = h::epoch.load();
+    const auto prior_begins = begins;
+    // First both worker fences are late (no retained worker yet); then just the back Signal is late.
+    for (const bool waited : {false,true}) {
+        const auto late = Source();
+        std::promise<void> ready;
+        auto worker_ready = ready.get_future();
+        std::promise<uint64_t> next;
+        auto replacement = next.get_future();
+        std::thread worker([&] {
+            if (waited) {
+                CHECK(Fence(&b,&forward_fence,late,0x130,false) == S_OK);
+                WorkerEvidence();
+            }
+            ready.set_value();
+            const auto current = replacement.get();
+            if (waited) CHECK(Fence(&b,&back_fence,late+10000,0x140,true) == S_OK);
+            else Worker(late);
+            CHECK(h::epoch == binding && h::route.cycle.begun == 3 && h::route.cycle.finished == 3);
+            Worker(current);
+        });
+        worker_ready.get();
+        const auto current = Source();
+        CHECK(h::epoch == binding && !h::route.cycle.complete);
+        next.set_value(current); worker.join();
+        CHECK(h::route.cycle.complete && h::route.previous_frame == current && h::route.successes == (waited ? 2u : 1u));
+        StreamlineHandoff_Service();
+    }
+    for (unsigned i = 2; i < h::RequiredCycles; ++i) Cycle();
+    CHECK(begins == prior_begins && StreamlineHandoff_IsCurrent(binding));
+    Cycle(); CHECK(begins == prior_begins + 1);
+    Source(); Source(); CHECK(h::epoch == binding);
+    Source();
+    CHECK(!h::authorized && h::epoch != binding && std::strcmp(h::rejection.load(),"previous_cycle_incomplete") == 0);
+    Reset();
+
+    // A reused identity could make a late worker fence indistinguishable from the replacement's fence.
+    enum class Reused { Frame, Forward, Back };
+    for (const auto reused : {Reused::Frame, Reused::Forward, Reused::Back}) {
+        const auto late = Source(), original = h::epoch.load();
+        std::thread([=] {
+            // A different source thread has no local marker history: the binding must check the frame itself.
+            StreamlineHandoff_RecordMarker(reused == Reused::Frame ? late : late + 1,2,3,h::Now());
+            StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),source_sync,0);
+            CHECK(scope.input.transaction);
+            CHECK(Fence(&a,&forward_fence,reused == Reused::Forward ? late : late + 1,0x110,true) == S_OK);
+            if (reused == Reused::Back) CHECK(Fence(&a,&back_fence,late+10000,0x120,false) == S_OK);
+            CHECK(scope.invalid && h::epoch != original);
+            CHECK(std::strcmp(h::rejection.load(),reused == Reused::Frame ? "source_frame_not_newer" :
+                reused == Reused::Forward ? "forward_value_not_newer" : "back_value_not_newer") == 0);
+            scope.Complete(S_OK);
+        }).join();
+        Reset();
+    }
+
+    // Even with both source fences finished, the first scope still owns its completion slot until it returns.
+    const auto overlap = h::epoch.load();
+    Marker(); {
+        StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),source_sync,0);
+        CHECK(Fence(&a,&forward_fence,frame,0x110,true) == S_OK);
+        CHECK(Fence(&a,&back_fence,frame+10000,0x120,false) == S_OK);
+        std::thread([]{ Source(); }).join();
+        CHECK(h::epoch != overlap && std::strcmp(h::rejection.load(),"previous_cycle_incomplete") == 0);
+        scope.Complete(S_OK);
+    }
+    Reset();
 }
 
 static void TestCompletionContention() {
@@ -769,6 +931,10 @@ int main() {
     CHECK(order.size() >= 3 && order[0] == 'G' && order[1] == 'S' && order[2] == 'S'); // owned GPU work before host input Signal
     CHECK(h::route.successes == 4 && a.refs == 2 && b.refs == 2 && forward_fence.refs == 2 && back_fence.refs == 2);
     Reset();
+    TestDeviceCheckDuringNextCycle();
+    TestWorkerEvidenceUnderContention();
+    TestSourceAdmissionUnderContention();
+    TestLateWorkerCycle();
     TestCompletionContention();
     TestMaintenanceFenceOverlap();
     TestMaintenanceWorkerOverlap();
@@ -1088,8 +1254,7 @@ int main() {
     Reset();
     Marker(); h::marker.release -= Frequency();
     { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,0); CHECK(!scope.input.transaction); }
-    // Duplicate candidate signals, value regression and overlapping inputs fail
-    // closed; no first-signal or ordinal-only qualification.
+    // Duplicate candidate signals and value regression fail closed; an overlapping worker cycle is not a success.
     Marker(); {
         StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,0);
         Fence(&a,&forward_fence,frame,0x110,true); Fence(&a,&forward_fence,frame+1,0x110,true);
