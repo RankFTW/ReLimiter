@@ -42,6 +42,8 @@ static char s_ini_path[MAX_PATH] = {};
 static bool s_first_launch = false;
 static std::vector<OSDPreset> s_user_presets;
 static char s_shared_presets_path[MAX_PATH] = {};
+static OSDPreset s_default_preset = {};  // [OSD_Default_Preset] of the shared presets file; empty when not shared
+static constexpr const char* kDefaultPresetSection = "OSD_Default_Preset";
 static SRWLOCK s_owner_lock = SRWLOCK_INIT;
 
 void Config_LockOwner() noexcept { AcquireSRWLockExclusive(&s_owner_lock); }
@@ -61,11 +63,18 @@ struct PresetSaveSnapshot {
     std::array<char, MAX_PATH> path{};
 };
 
+// The default preset to write; an unoccupied preset clears the section.
+struct DefaultPresetSnapshot {
+    OSDPreset preset;
+    std::array<char, MAX_PATH> path{};
+};
+
 struct ConfigSaveBatch {
     std::optional<ConfigSaveSnapshot> config;
     // Separate mailboxes preserve edits to BOTH destinations during toggles.
     std::array<std::optional<PresetSaveSnapshot>, 2> presets;
-    bool Empty() const { return !config && !presets[0] && !presets[1]; }
+    std::optional<DefaultPresetSnapshot> default_preset;
+    bool Empty() const { return !config && !presets[0] && !presets[1] && !default_preset; }
 };
 
 static std::mutex s_save_mutex;
@@ -81,6 +90,7 @@ static thread_local DWORD s_ini_write_error = ERROR_SUCCESS;
 static void Config_StartWriter();
 static void RequestPresetSave();
 static void WritePresetToINI(int slot, const OSDPreset& p, const char* P);
+static void WritePresetSection(const char* S, const OSDPreset& p, const char* P);
 
 // Forward declaration — defined in OSD Presets section
 static const char* GetPresetsINIPath();
@@ -460,7 +470,7 @@ void LoadConfig(HMODULE hModule) {
     // Monitor Blackout — keybind loaded from shared file if shared_presets enabled
     g_config.blackout_key            = ReadINIString(S, "blackout_key", "", P);
 
-    // OLED Care — per-game settings, independent of shared OSD presets
+    // OLED Care — overridden from the shared file if shared_presets enabled (OSDPreset_LoadAll)
     g_config.oled_care_key           = ReadINIString(S, "oled_care_key", "", P);
     g_config.oled_care_all_monitors  = ReadINIBool(S, "oled_care_all_monitors", true, P);
     g_config.oled_care_idle_minutes  = ReadINIInt(S, "oled_care_idle_minutes", 0, P);
@@ -557,10 +567,6 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     WriteINIInt(S, "selected_monitor", config.selected_monitor, P);
     WriteINIBool(S, "focus_lock", config.focus_lock, P);
 
-    WriteINIString(S, "oled_care_key", config.oled_care_key.c_str(), P);
-    WriteINIBool(S, "oled_care_all_monitors", config.oled_care_all_monitors, P);
-    WriteINIInt(S, "oled_care_idle_minutes", config.oled_care_idle_minutes, P);
-
     // ── OSD ──
     WriteINIBool(S, "osd_enabled", config.osd_enabled, P);
     WriteINIDouble(S, "osd_x", config.osd_x, P);
@@ -570,7 +576,6 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     WriteINIBool(S, "osd_drop_shadow", config.osd_drop_shadow, P);
     WriteINIDouble(S, "osd_text_brightness", config.osd_text_brightness, P);
     WriteINIString(S, "osd_toggle_key", config.osd_toggle_key.c_str(), P);
-    WriteINIString(S, "osd_position_cycle_key", config.osd_position_cycle_key.c_str(), P);
 
     // ── OSD Elements ──
     WriteINIBool(S, "osd_show_fps", config.osd_show_fps, P);
@@ -602,17 +607,25 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
 
     // ── OSD Presets & Keybinds ──
     WriteINIBool(S, "shared_presets", config.shared_presets, P);
-    if (config.shared_presets) {
-        const char* SP = snapshot.presets_path.data();
-        if (SP[0] != '\0') {
-            WriteINIString("Presets", "prev_key", config.osd_preset_prev_key.c_str(), SP);
-            WriteINIString("Presets", "next_key", config.osd_preset_next_key.c_str(), SP);
-            WriteINIString("Presets", "blackout_key", config.blackout_key.c_str(), SP);
-        }
+    // With shared presets on, the cycling keys, Move OSD key, blackout key and OLED Care settings live in the shared
+    // file; otherwise in this game's INI.
+    const char* SP = snapshot.presets_path.data();
+    if (config.shared_presets && SP[0] != '\0') {
+        WriteINIString("Presets", "prev_key", config.osd_preset_prev_key.c_str(), SP);
+        WriteINIString("Presets", "next_key", config.osd_preset_next_key.c_str(), SP);
+        WriteINIString("Presets", "position_cycle_key", config.osd_position_cycle_key.c_str(), SP);
+        WriteINIString("Presets", "blackout_key", config.blackout_key.c_str(), SP);
+        WriteINIString("Presets", "oled_care_key", config.oled_care_key.c_str(), SP);
+        WriteINIBool("Presets", "oled_care_all_monitors", config.oled_care_all_monitors, SP);
+        WriteINIInt("Presets", "oled_care_idle_minutes", config.oled_care_idle_minutes, SP);
     } else {
         WriteINIString(S, "osd_preset_prev_key", config.osd_preset_prev_key.c_str(), P);
         WriteINIString(S, "osd_preset_next_key", config.osd_preset_next_key.c_str(), P);
+        WriteINIString(S, "osd_position_cycle_key", config.osd_position_cycle_key.c_str(), P);
         WriteINIString(S, "blackout_key", config.blackout_key.c_str(), P);
+        WriteINIString(S, "oled_care_key", config.oled_care_key.c_str(), P);
+        WriteINIBool(S, "oled_care_all_monitors", config.oled_care_all_monitors, P);
+        WriteINIInt(S, "oled_care_idle_minutes", config.oled_care_idle_minutes, P);
     }
 
     // ── Pacing pipeline ──
@@ -696,6 +709,10 @@ static bool WriteSaveBatch(const ConfigSaveBatch& batch) {
         for (int slot = 0; slot < OSD_MAX_PRESET_SLOTS; ++slot)
             WritePresetToINI(slot, presets->slots[slot], presets->path.data());
     }
+    if (batch.default_preset) {
+        ensure_directory(batch.default_preset->path.data());
+        WritePresetSection(kDefaultPresetSection, batch.default_preset->preset, batch.default_preset->path.data());
+    }
     if (s_ini_write_error != ERROR_SUCCESS) {
         LOG_ERROR("Config: INI persistence failed (error=%lu)", s_ini_write_error);
         return false;
@@ -709,6 +726,7 @@ static void MergeSaveBatch(ConfigSaveBatch* batch, ConfigSaveBatch&& newer) {
     if (newer.config) batch->config = std::move(newer.config);
     for (size_t i = 0; i < batch->presets.size(); ++i)
         if (newer.presets[i]) batch->presets[i] = std::move(newer.presets[i]);
+    if (newer.default_preset) batch->default_preset = std::move(newer.default_preset);
 }
 
 static DWORD WINAPI ConfigWriterMain(void*) {
@@ -1314,19 +1332,13 @@ int OSDPreset_AddSlot() {
     return static_cast<int>(s_user_presets.size()) - 1;
 }
 
-static void ReadPresetFromINI(int i, const char* P) {
-    char section[32];
-    snprintf(section, sizeof(section), "OSD_Preset_%d", i + 1);
-    const char* S = section;
-
+// Reads one preset section; false (and *out untouched) when the section has no name.
+static bool ReadPresetSection(const char* S, const char* P, OSDPreset* out) {
     std::string name = ReadINIString(S, "name", "", P);
-    if (name.empty()) return;
+    if (name.empty()) return false;
 
-    // Ensure vector is large enough
-    while (static_cast<int>(s_user_presets.size()) <= i)
-        s_user_presets.push_back({});
-
-    OSDPreset& p = s_user_presets[i];
+    OSDPreset& p = *out;
+    p = {};
     snprintf(p.name, sizeof(p.name), "%s", name.c_str());
     p.occupied              = true;
     p.osd_x                 = static_cast<float>(ReadINIDouble(S, "osd_x", 0.005, P));
@@ -1362,6 +1374,18 @@ static void ReadPresetFromINI(int i, const char* P) {
     p.show_dlss_resolution  = ReadINIBool(S, "show_dlss_resolution", false, P);
     p.show_dlss_presets     = ReadINIBool(S, "show_dlss_presets", false, P);
     p.show_dlss_versions    = ReadINIBool(S, "show_dlss_versions", false, P);
+    return true;
+}
+
+static void ReadPresetFromINI(int i, const char* P) {
+    char section[32];
+    snprintf(section, sizeof(section), "OSD_Preset_%d", i + 1);
+    OSDPreset preset;
+    if (!ReadPresetSection(section, P, &preset)) return;
+    // Ensure vector is large enough
+    while (static_cast<int>(s_user_presets.size()) <= i)
+        s_user_presets.push_back({});
+    s_user_presets[i] = preset;
 }
 
 void OSDPreset_LoadAll() {
@@ -1377,6 +1401,7 @@ void OSDPreset_LoadAll() {
     const char* P = GetPresetsINIPath();
 
     s_user_presets.clear();
+    s_default_preset = {};
 
     // Scan up to OSD_MAX_PRESET_SLOTS sections
     for (int i = 0; i < OSD_MAX_PRESET_SLOTS; i++) {
@@ -1391,6 +1416,22 @@ void OSDPreset_LoadAll() {
         if (!next.empty()) g_config.osd_preset_next_key = next;
         std::string blackout = ReadINIString("Presets", "blackout_key", "", P);
         if (!blackout.empty()) g_config.blackout_key = blackout;
+        std::string position = ReadINIString("Presets", "position_cycle_key", "", P);
+        if (!position.empty()) g_config.osd_position_cycle_key = position;
+        std::string oled = ReadINIString("Presets", "oled_care_key", "", P);
+        if (!oled.empty()) g_config.oled_care_key = oled;
+        // A missing key keeps this game's value, so the first shared save seeds the file from it.
+        g_config.oled_care_all_monitors =
+            ReadINIBool("Presets", "oled_care_all_monitors", g_config.oled_care_all_monitors, P);
+        g_config.oled_care_idle_minutes = Clamp(
+            ReadINIInt("Presets", "oled_care_idle_minutes", g_config.oled_care_idle_minutes, P), 0, 120);
+        OLEDCare_SetConfig(g_config.oled_care_all_monitors, g_config.oled_care_idle_minutes);
+
+        // The default preset sets this game's OSD layout at every launch.
+        if (ReadPresetSection(kDefaultPresetSection, P, &s_default_preset)) {
+            OSDPreset_ApplyToConfig(s_default_preset);
+            LOG_INFO("OSD default preset applied: \"%s\"", s_default_preset.name);
+        }
     }
 
     // Ensure at least the initial 3 slots exist
@@ -1406,8 +1447,10 @@ void OSDPreset_SaveSlot(int slot) {
 static void WritePresetToINI(int slot, const OSDPreset& p, const char* P) {
     char section[32];
     snprintf(section, sizeof(section), "OSD_Preset_%d", slot + 1);
-    const char* S = section;
+    WritePresetSection(section, p, P);
+}
 
+static void WritePresetSection(const char* S, const OSDPreset& p, const char* P) {
     // Clear the section first to remove stale keys
     WriteINIString(S, nullptr, nullptr, P);
 
@@ -1456,4 +1499,34 @@ void OSDPreset_DeleteSlot(int slot) {
     EnsureMinSlots();
     // Includes empty trailing slots, so deletion cannot resurrect stale INI sections.
     RequestPresetSave();
+}
+
+bool OSDPreset_HasDefault() { return s_default_preset.occupied; }
+
+const OSDPreset& OSDPreset_GetDefault() { return s_default_preset; }
+
+static void RequestDefaultPresetSave() {
+    if (s_ini_path[0] == '\0' || s_shared_presets_path[0] == '\0') return;
+    DefaultPresetSnapshot snapshot;
+    snapshot.preset = s_default_preset;
+    snprintf(snapshot.path.data(), snapshot.path.size(), "%s", s_shared_presets_path);
+    {
+        std::lock_guard<std::mutex> lock(s_save_mutex);
+        s_pending_save.default_preset = std::move(snapshot);
+    }
+    s_save_wakeup.notify_one();
+}
+
+void OSDPreset_SaveDefault(const OSDPreset& p) {
+    if (!g_config.shared_presets) return;
+    s_default_preset = p;
+    s_default_preset.occupied = true;
+    RequestDefaultPresetSave();
+}
+
+// Shared mode only, like Save: with the presets local, no game may clear the default the other games load.
+void OSDPreset_ClearDefault() {
+    if (!g_config.shared_presets) return;
+    s_default_preset = {};
+    RequestDefaultPresetSave();
 }

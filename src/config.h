@@ -248,6 +248,13 @@ int OSDPreset_GetCount();
 // Add a new empty preset slot. Returns the new slot index, or -1 if at max.
 int OSDPreset_AddSlot();
 
+// Default preset ([OSD_Default_Preset] of the shared presets file, shared mode only): applied to the config by
+// OSDPreset_LoadAll at every launch. Save/Clear update memory on the UI thread and queue the write.
+bool OSDPreset_HasDefault();
+const OSDPreset& OSDPreset_GetDefault();
+void OSDPreset_SaveDefault(const OSDPreset& p);
+void OSDPreset_ClearDefault();
+
 // Returns true if no INI file existed before LoadConfig ran (first launch).
 bool Config_IsFirstLaunch();
 

@@ -2281,7 +2281,9 @@ const IniKey non_default_ini[] = {
 constexpr size_t non_default_ini_count = sizeof(non_default_ini) / sizeof(non_default_ini[0]);
 static_assert(non_default_ini_count == 60, "the contract lists 60 further keys");
 bool IsKeybindKey(const std::string& key) {
-    return key == "osd_preset_prev_key" || key == "osd_preset_next_key" || key == "blackout_key";
+    return key == "osd_preset_prev_key" || key == "osd_preset_next_key" || key == "blackout_key" ||
+           key == "osd_position_cycle_key" || key == "oled_care_key" || key == "oled_care_all_monitors" ||
+           key == "oled_care_idle_minutes";
 }
 // The keys of the [FrameLimiter] section the build reads and writes: the config_key lines of
 // tests/data/pacing_schema.txt (next to this file), which tests/test_pacing_schedule.py compares with the settings the
@@ -2375,39 +2377,101 @@ void TestIniWritesExactlyTheKeysThatExist() {
     CHECK(SectionFields(local_path, "FrameLimiter") == saved);
 }
 
-// With shared presets the keybinds (preset cycling, blackout) live in the shared file's [Presets] section: they are loaded
-// from it over the local INI's copy, never written to the local INI, and changes go to the shared file; with the presets
-// local the keys are in the local INI and the shared file is not touched.
+// With shared presets the keybinds (preset cycling, Move OSD, blackout, OLED Care) and the OLED Care settings live in
+// the shared file's [Presets] section: they are loaded from it over the local INI's copy, never written to the local
+// INI, and changes go to the shared file; with the presets local the keys are in the local INI and the shared file is
+// not touched.
 void TestSharedPresetsKeepTheKeybindsInTheSharedFile() {
-    const Fields seeded_shared{{"prev_key", "F1"}, {"next_key", "F2"}, {"blackout_key", "F3"}};
-    const std::vector<DiskEntry> shared_keys{{shared_path, "Presets", "prev_key", "F1"},
-        {shared_path, "Presets", "next_key", "F2"}, {shared_path, "Presets", "blackout_key", "F3"}};
+    const Fields seeded_shared{{"prev_key", "F1"}, {"next_key", "F2"}, {"position_cycle_key", "F4"},
+        {"blackout_key", "F3"}, {"oled_care_key", "F6"}, {"oled_care_all_monitors", "false"},
+        {"oled_care_idle_minutes", "7"}};
+    std::vector<DiskEntry> shared_keys;
+    for (const auto& field : seeded_shared) shared_keys.push_back({shared_path, "Presets", field.first.c_str(), field.second.c_str()});
     extra_seed = shared_keys;
     Reset(false, false, {{"config_version", "6"}, {"shared_presets", "true"}, {"osd_preset_prev_key", "stale"},
-        {"osd_preset_next_key", "stale"}, {"blackout_key", "stale"}});
+        {"osd_preset_next_key", "stale"}, {"blackout_key", "stale"}, {"osd_position_cycle_key", "stale"},
+        {"oled_care_key", "stale"}, {"oled_care_all_monitors", "true"}, {"oled_care_idle_minutes", "30"}});
     CHECK(g_config.osd_preset_prev_key == "F1" && g_config.osd_preset_next_key == "F2" && g_config.blackout_key == "F3");
+    CHECK(g_config.osd_position_cycle_key == "F4" && g_config.oled_care_key == "F6");
+    CHECK(!g_config.oled_care_all_monitors && g_config.oled_care_idle_minutes == 7);
     CHECK(HasExactlyKeys(SectionFields(local_path, "FrameLimiter"), ExpectedIniKeys(true)));
     CHECK(FieldIs(SectionFields(local_path, "FrameLimiter"), "shared_presets", "true"));
     CHECK(SectionFields(shared_path, "Presets") == seeded_shared);
     g_config.osd_preset_prev_key = "F5";
+    g_config.osd_position_cycle_key = "F8";
+    g_config.oled_care_idle_minutes = 12;
     RequestSaveConfig();
     ReleaseStart();CHECK(OwnerShutdown());
     CheckWorkerWrites();
     CHECK(Value(shared_path, "Presets", "prev_key") == "F5");
     CHECK(Value(shared_path, "Presets", "next_key") == "F2" && Value(shared_path, "Presets", "blackout_key") == "F3");
+    CHECK(Value(shared_path, "Presets", "position_cycle_key") == "F8");
+    CHECK(Value(shared_path, "Presets", "oled_care_idle_minutes") == "12");
+    CHECK(Value(shared_path, "Presets", "oled_care_all_monitors") == "false");
     CHECK(HasExactlyKeys(SectionFields(local_path, "FrameLimiter"), ExpectedIniKeys(true)));
 
     extra_seed = shared_keys;
     Reset(false, false, {{"config_version", "6"}, {"osd_preset_prev_key", "L1"}, {"osd_preset_next_key", "L2"},
-        {"blackout_key", "L3"}});
+        {"blackout_key", "L3"}, {"osd_position_cycle_key", "L4"}, {"oled_care_key", "L6"},
+        {"oled_care_idle_minutes", "9"}});
     CHECK(g_config.osd_preset_prev_key == "L1" && g_config.osd_preset_next_key == "L2" && g_config.blackout_key == "L3");
+    CHECK(g_config.osd_position_cycle_key == "L4" && g_config.oled_care_key == "L6");
+    CHECK(g_config.oled_care_all_monitors && g_config.oled_care_idle_minutes == 9);
     CHECK(HasExactlyKeys(SectionFields(local_path, "FrameLimiter"), ExpectedIniKeys(false)));
     CHECK(Value(local_path, "FrameLimiter", "osd_preset_prev_key") == "L1");
     CHECK(Value(local_path, "FrameLimiter", "osd_preset_next_key") == "L2");
     CHECK(Value(local_path, "FrameLimiter", "blackout_key") == "L3");
+    CHECK(Value(local_path, "FrameLimiter", "osd_position_cycle_key") == "L4");
+    CHECK(Value(local_path, "FrameLimiter", "oled_care_key") == "L6");
+    CHECK(Value(local_path, "FrameLimiter", "oled_care_idle_minutes") == "9");
     CHECK(SectionFields(shared_path, "Presets") == seeded_shared);
     ReleaseStart();CHECK(OwnerShutdown());
     CHECK(SectionFields(shared_path, "Presets") == seeded_shared);
+}
+
+// The default preset of the shared file sets the OSD layout at every launch with shared presets on, over the local
+// INI's; Save and Clear write and remove its section in the shared file; with the presets local it is neither applied
+// nor offered, and Clear leaves the other games' default alone.
+void TestSharedDefaultPresetAppliesAtLaunch() {
+    const std::vector<DiskEntry> seeded_default{{shared_path, "OSD_Default_Preset", "name", "Default"},
+        {shared_path, "OSD_Default_Preset", "osd_x", "0.9"}, {shared_path, "OSD_Default_Preset", "osd_scale", "1.5"},
+        {shared_path, "OSD_Default_Preset", "show_gpu_temp", "true"}};
+    extra_seed = seeded_default;
+    Reset(false, false, {{"config_version", "6"}, {"shared_presets", "true"}, {"osd_show_fps", "true"},
+        {"osd_x", "0.1"}});
+    CHECK(OSDPreset_HasDefault() && std::strcmp(OSDPreset_GetDefault().name, "Default") == 0);
+    CHECK(!g_config.osd_show_fps && g_config.osd_show_gpu_temp);
+    CHECK(g_config.osd_x == 0.9f && g_config.osd_scale == 1.5f);
+    // The rewritten local INI carries the applied layout.
+    CHECK(Value(local_path, "FrameLimiter", "osd_show_fps") == "false");
+
+    g_config.osd_show_ram = true;
+    OSDPreset update = OSDPreset_FromConfig();
+    std::snprintf(update.name, sizeof(update.name), "%s", "Mine");
+    OSDPreset_SaveDefault(update);
+    ReleaseStart();CHECK(OwnerShutdown());
+    CheckWorkerWrites();
+    CHECK(Value(shared_path, "OSD_Default_Preset", "name") == "Mine");
+    CHECK(Value(shared_path, "OSD_Default_Preset", "show_ram") == "true");
+    CHECK(SectionFields(local_path, "OSD_Default_Preset").empty());
+
+    extra_seed = seeded_default;
+    Reset(false, false, {{"config_version", "6"}, {"shared_presets", "true"}});
+    OSDPreset_ClearDefault();
+    CHECK(!OSDPreset_HasDefault());
+    ReleaseStart();CHECK(OwnerShutdown());
+    CheckWorkerWrites();
+    CHECK(SectionFields(shared_path, "OSD_Default_Preset").empty());
+
+    extra_seed = seeded_default;
+    Reset(false, false, {{"config_version", "6"}, {"osd_show_fps", "true"}, {"osd_x", "0.1"}});
+    CHECK(!OSDPreset_HasDefault());
+    CHECK(g_config.osd_show_fps && !g_config.osd_show_gpu_temp && g_config.osd_x == 0.1f);
+    OSDPreset_SaveDefault(OSDPreset_FromConfig());
+    OSDPreset_ClearDefault();
+    CHECK(!OSDPreset_HasDefault());
+    ReleaseStart();CHECK(OwnerShutdown());
+    CHECK(Value(shared_path, "OSD_Default_Preset", "name") == "Default");
 }
 
 // The log level of the INI is kept at start and applied; the telemetry (CSV) switch is never carried over a start, but a
@@ -2808,6 +2872,7 @@ int main() {
     TestRetiredKeysIgnoredAndDropped();
     TestIniWritesExactlyTheKeysThatExist();
     TestSharedPresetsKeepTheKeybindsInTheSharedFile();
+    TestSharedDefaultPresetAppliesAtLaunch();
     TestStartupKeepsLogLevelAndDisablesCsv();
     TestEachRemovedKeyAloneIsDroppedAndNeverSaved();
     TestOnlyTheListedKeysAreLive();

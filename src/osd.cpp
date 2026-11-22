@@ -890,6 +890,35 @@ static void DrawSettingsImpl(reshade::api::effect_runtime* runtime, bool editabl
             }
         }
 
+        // ── Default preset (shared mode only) ──
+        // Applied automatically at game launch for every game.
+        if (g_config.shared_presets) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("|");
+            ImGui::SameLine();
+            if (OSDPreset_HasDefault()) {
+                ImGui::TextDisabled("Default: %s", OSDPreset_GetDefault().name);
+                ImGui::SameLine();
+                if (ImGui::Button("Update##default_preset")) {
+                    OSDPreset p = OSDPreset_FromConfig();
+                    snprintf(p.name, sizeof(p.name), "%s", OSDPreset_GetDefault().name);
+                    OSDPreset_SaveDefault(p);
+                }
+                HelpTip("Update the default preset with the current OSD layout. Applied automatically on launch for every game.");
+                ImGui::SameLine();
+                if (ImGui::Button("Clear##default_preset"))
+                    OSDPreset_ClearDefault();
+                HelpTip("Remove the default preset. Games will use their own saved OSD layout.");
+            } else {
+                if (ImGui::Button("Set as Default##default_preset")) {
+                    OSDPreset p = OSDPreset_FromConfig();
+                    snprintf(p.name, sizeof(p.name), "Default");
+                    OSDPreset_SaveDefault(p);
+                }
+                HelpTip("Save the current OSD layout as the default. It will be applied automatically on launch for every game using the shared presets file.");
+            }
+        }
+
         // ── Preset cycling keybinds ──
         {
             // The present callback applies cycle requests, even with the OSD hidden.

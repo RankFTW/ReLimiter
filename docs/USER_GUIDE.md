@@ -353,7 +353,9 @@ Save up to 16 custom presets, including their names, visible readings, position 
 
 The cycle includes Min, Med, Full and your custom presets.
 
-Enable **Shared Presets** to use the same presets across games. They are stored in `%LOCALAPPDATA%/RHI/ReLimiter_Presets/presets.ini`.
+Enable **Shared Presets** to use the same presets across games. They are stored in `%LOCALAPPDATA%/RHI/ReLimiter_Presets/presets.ini`, together with the preset cycling keys, the Move OSD key, the blackout key and the OLED Care settings (key, All Monitors, Idle Minutes).
+
+With Shared Presets on, **Set as Default** saves the current OSD layout as the default preset, which is applied automatically every time any game launches. **Update** replaces it with the current layout and **Clear** removes it.
 
 ---
 
