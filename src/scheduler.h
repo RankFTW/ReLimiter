@@ -14,7 +14,16 @@
 // suspends it.
 
 namespace scheduler_detail {
-inline std::atomic_flag g_owner = ATOMIC_FLAG_INIT;
+// The owner word: 0 free, kOwnerHeld while a guard holds it, kOwnerAwaited on top once the Sleep
+// hook's reservation waits for the release (SchedulerOwner_Await). The release that finds the bit
+// calls the waker, a plain function pointer the scheduler installs (this header stays free of
+// Windows). Both sides change the word with one atomic read-modify-write, so a release either
+// sees the bit or happened before it could be set: no wake is lost.
+inline constexpr uint32_t kOwnerHeld = 1;
+inline constexpr uint32_t kOwnerAwaited = 2;
+using OwnerWaker = void (*)() noexcept;
+inline std::atomic<uint32_t> g_owner{0};
+inline std::atomic<OwnerWaker> g_owner_waker{nullptr};
 }
 
 // Nonblocking admission guard for the scheduler owner's single-writer domain
@@ -24,12 +33,19 @@ inline std::atomic_flag g_owner = ATOMIC_FLAG_INIT;
 // provider/game unchanged. The guard deliberately rejects reentrancy.
 class SchedulerOwnerGuard final {
 public:
-    SchedulerOwnerGuard() noexcept
-        : acquired_(!OwnerFlag().test_and_set(std::memory_order_acquire)) {}
+    SchedulerOwnerGuard() noexcept {
+        uint32_t free_word = 0;
+        acquired_ = scheduler_detail::g_owner.compare_exchange_strong(free_word,
+            scheduler_detail::kOwnerHeld, std::memory_order_acquire, std::memory_order_relaxed);
+    }
 
     ~SchedulerOwnerGuard() noexcept {
-        if (acquired_)
-            OwnerFlag().clear(std::memory_order_release);
+        if (!acquired_) return;
+        const uint32_t held = scheduler_detail::g_owner.exchange(0, std::memory_order_acq_rel);
+        if ((held & scheduler_detail::kOwnerAwaited) == 0) return;
+        if (const scheduler_detail::OwnerWaker waker =
+                scheduler_detail::g_owner_waker.load(std::memory_order_acquire))
+            waker();
     }
 
     SchedulerOwnerGuard(const SchedulerOwnerGuard&) = delete;
@@ -40,12 +56,25 @@ public:
     explicit operator bool() const noexcept { return acquired_; }
 
 private:
-    static std::atomic_flag& OwnerFlag() noexcept {
-        return scheduler_detail::g_owner;
-    }
-
     bool acquired_ = false;
 };
+
+// The owner's one waiter, the Sleep hook's reservation (Scheduler_AwaitOwner): marks a held owner
+// so that its release calls the waker. False: the owner is free now, nothing to wait for. Any
+// thread that does not hold the owner; never blocks. Every other producer keeps skipping its work
+// when the owner is taken.
+inline bool SchedulerOwner_Await() noexcept {
+    uint32_t word = scheduler_detail::g_owner.load(std::memory_order_acquire);
+    while (word != 0 && (word & scheduler_detail::kOwnerAwaited) == 0) {
+        if (scheduler_detail::g_owner.compare_exchange_weak(word, word | scheduler_detail::kOwnerAwaited,
+                std::memory_order_acq_rel, std::memory_order_acquire))
+            return true;
+    }
+    return word != 0;
+}
+inline void SchedulerOwner_SetWaker(scheduler_detail::OwnerWaker waker) noexcept {
+    scheduler_detail::g_owner_waker.store(waker, std::memory_order_release);
+}
 
 // User-configurable target FPS (0 = VRR ceiling cap)
 extern std::atomic<int> g_user_target_fps;
@@ -115,12 +144,22 @@ struct SchedulerUnifiedReservation {
 enum class SchedulerUnifiedReserve : uint8_t {
     Reserved,  // wait (limit, then the start wait) and publish with Scheduler_UnifiedPublishSleep
     Duplicate, // a second Sleep for the same index: no wait, no publication (flag 0x8000 at the marker)
-    Busy,      // the owner was taken: no reservation, no wait (flag 0x4000 at the marker)
+    Busy,      // the owner was taken: no reservation (flag 0x4000 at the marker); target_qpc is the start estimate
+               // (0 = none). The Sleep hook waits for the owner until then (Scheduler_AwaitOwner) and reserves again
     Inactive,  // not a unified frame (no plan can be made): forward the Sleep untouched
 };
 // Sleep hook, presenting device, caller does NOT hold the owner: takes the owner
-// without waiting. Reserved fills *out.
+// without waiting. Reserved fills *out. Busy fills only out->target_qpc, with the law's start estimate
+// for the next frame (UnifiedPacer::StartEstimate, published by the owner): the frame is not expected
+// to start before it, so it is how long the hook may wait for the owner without holding the frame.
 SchedulerUnifiedReserve Scheduler_UnifiedReserve(int64_t arrival_qpc, SchedulerUnifiedReservation* out) noexcept;
+// Sleep hook after a Busy reservation, caller does NOT hold the owner: one bounded wait toward
+// `target_qpc` (PreSleepWaitUntil's limits) that also ends when the owner is released. True: released,
+// or free already, so the next reservation plans the exact start from the Sleep's own arrival. False:
+// the wait ended at the target or on its own (cancelled, failed, stopping; the clock tells which). A
+// true return may be spurious (a release signalled after an earlier wait gave up): the reservation
+// that follows answers it. Without the release event this is the plain wait to the target.
+bool Scheduler_AwaitOwner(int64_t target_qpc) noexcept;
 // Sleep hook after the start wait, no owner: publishes the hard-limit statistics (one
 // token-tagged slot, written only for a newer token under a try-acquire seqlock) and the
 // mailbox word (token << 34 | outcome << 32 | R − A; never over a newer token's word).

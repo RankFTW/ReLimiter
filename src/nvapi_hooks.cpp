@@ -1180,7 +1180,8 @@ static void ObserveAsyncMarkerThread(uint32_t type, IUnknown* queue) noexcept {
 // RenderSubmitEnd(N) and SimulationStart(N+1) can be emitted concurrently.
 // Tail diagnostics must not take the single scheduler owner and make the
 // actual enforcement marker fail admission. Only the two possible release
-// markers need immediate scheduler ownership. PresentStart runs its output
+// markers need immediate scheduler ownership, and RenderSubmitStart only while
+// it is or can become the enforcement marker (Hook_SetLatencyMarker). PresentStart runs its output
 // executor lock-free on the exact plan key and queues its marker-log entry.
 static bool IsImmediateTimingMarker(NV_LATENCY_MARKER_TYPE type) noexcept {
     return type == SIMULATION_START || type == RENDERSUBMIT_START;
@@ -1527,14 +1528,18 @@ static void UnifiedWaitForChange(UnifiedWaitPrimitives& primitives, uint64_t obs
     }
 }
 
-// What the Sleep hook's wait needs beyond the hard limit's environment: the tick rate and one
-// bounded wait toward a target (PreSleepWaitUntil in production). A scripted environment
-// drives the whole flow in the tests.
+// What the Sleep hook's wait needs beyond the hard limit's environment: the tick rate, one
+// bounded wait toward a target (PreSleepWaitUntil in production) and that wait with the
+// scheduler owner's release as a second way out (Scheduler_AwaitOwner). A scripted
+// environment drives the whole flow in the tests.
 class UnifiedSleepEnv : public UnifiedLimitEnv {
 public:
     virtual int64_t Frequency() noexcept = 0;
     // Returns when the wait ended: at the target, or earlier (cancelled, failed, stopping).
     virtual void StartWait(int64_t target_qpc) noexcept = 0;
+    // The same wait, ended also by the release of the scheduler owner: true then (or when the
+    // owner is free already). False: it ended as StartWait does.
+    virtual bool OwnerWait(int64_t target_qpc) noexcept = 0;
 
 protected:
     ~UnifiedSleepEnv() = default;
@@ -1558,6 +1563,7 @@ public:
     }
     int64_t Frequency() noexcept override { return GetQPCFrequency(); }
     void StartWait(int64_t target_qpc) noexcept override { (void)PreSleepWaitUntil(target_qpc); }
+    bool OwnerWait(int64_t target_qpc) noexcept override { return Scheduler_AwaitOwner(target_qpc); }
 
 private:
     uint64_t Index() noexcept override { return g_up_ready_index.load(std::memory_order_acquire); }
@@ -1577,22 +1583,46 @@ struct UnifiedSleepWaitResult {
     UnifiedLimitResult limit;
 };
 
-// The start wait to T first, in bounded chunks, ended early only by a cancellation, a failure
-// or the shutdown (R < T: Failed); the hard limit at E, the moment after the wait reached T
-// (the arrival when the frame is already late), never before T; R = the clock after it; the
-// unfinished frames re-read at R (inactive stays -1).
-static UnifiedSleepWaitResult UnifiedSleepWait(
-    UnifiedSleepEnv& env, const SchedulerUnifiedReservation& reservation) noexcept {
-    UnifiedSleepWaitResult result;
-    const int64_t target = reservation.target_qpc;
+// The end of one chunk of a wait from `now` toward `target`.
+static int64_t UnifiedWaitChunkTarget(UnifiedSleepEnv& env, int64_t now, int64_t target) noexcept {
     const int64_t frequency = env.Frequency();
     const int64_t chunk_ticks = frequency > 0 ? frequency / kUnifiedStartWaitChunkDivisor : 0;
-    const bool wait_needed = target > env.Now();
+    return chunk_ticks > 0 && target - now > chunk_ticks ? now + chunk_ticks : target;
+}
+
+// One wait toward a start target, in bounded chunks. It returns before the target only when a chunk
+// ended early (cancelled, failed or stopping).
+static void UnifiedWaitToTarget(UnifiedSleepEnv& env, int64_t target) noexcept {
     for (int64_t now = env.Now(); now < target; now = env.Now()) {
-        const int64_t chunk_target = chunk_ticks > 0 && target - now > chunk_ticks ? now + chunk_ticks : target;
+        const int64_t chunk_target = UnifiedWaitChunkTarget(env, now, target);
         env.StartWait(chunk_target);
         if (env.Now() < chunk_target) break; // cancelled, failed or stopping: R < T
     }
+}
+
+// The scheduler owner's release, awaited until a deadline in the same chunks. True: released before
+// the deadline. False: the deadline was reached, or a chunk ended on its own.
+static bool UnifiedAwaitOwner(UnifiedSleepEnv& env, int64_t deadline) noexcept {
+    for (int64_t now = env.Now(); now < deadline; now = env.Now()) {
+        const int64_t chunk_target = UnifiedWaitChunkTarget(env, now, deadline);
+        if (env.OwnerWait(chunk_target)) return true;
+        if (env.Now() < chunk_target) break;
+    }
+    return false;
+}
+
+// The start wait to T first, in bounded chunks, ended early only by a cancellation, a failure
+// or the shutdown (R < T: Failed); the hard limit at E, the moment after the wait reached T
+// (the arrival when the frame is already late), never before T; R = the clock after it; the
+// unfinished frames re-read at R (inactive stays -1). `held`: this Sleep arrived before T and
+// waited for the scheduler owner before it could reserve, so a release at or after T is a
+// completed start wait whatever is left of it.
+static UnifiedSleepWaitResult UnifiedSleepWait(
+    UnifiedSleepEnv& env, const SchedulerUnifiedReservation& reservation, bool held) noexcept {
+    UnifiedSleepWaitResult result;
+    const int64_t target = reservation.target_qpc;
+    const bool wait_needed = held || target > env.Now();
+    UnifiedWaitToTarget(env, target);
     result.limit.outstanding = -1;
     result.limit.ready_age_ticks = -1;
     if (env.Now() >= target) {
@@ -1610,14 +1640,31 @@ static UnifiedSleepWaitResult UnifiedSleepWait(
 }
 
 // Reserve (owner, nonblocking), the wait above, then the mailbox publication. A duplicate
-// Sleep, a busy owner and an inactive pipeline wait for nothing and publish nothing: the
-// Sleep is simply forwarded.
-static void UnifiedSleepStart(int64_t arrival_qpc) noexcept {
+// Sleep and an inactive pipeline wait for nothing and publish nothing: the Sleep is simply
+// forwarded. A busy owner (another thread's marker or Present holds it for a moment) must not
+// move the start wait behind the game's SIMULATION_START: Streamline stamps that marker before
+// it reaches the marker hook and DLSS-G sets its flip metering batch time from the spacing of
+// those stamps, so a wait at the marker shows two frames at the wrong time. The Sleep waits for
+// the owner's release instead and reserves then, with its own arrival: the reservation plans
+// the exact T and waits to it like any other. The law's start estimate bounds that wait, so a
+// holder that keeps the owner cannot hold the frame past its expected start; at the estimate
+// the Sleep reserves once more. No estimate ahead (the frame is late, or the law has no
+// origin), or the owner still taken at the estimate: forwarded, the marker plans.
+static void UnifiedSleepStart(UnifiedSleepEnv& env, int64_t arrival_qpc) noexcept {
     SchedulerUnifiedReservation reservation;
-    if (Scheduler_UnifiedReserve(arrival_qpc, &reservation) != SchedulerUnifiedReserve::Reserved) return;
-    UnifiedLimitClock clock;
-    const UnifiedSleepWaitResult waited = UnifiedSleepWait(clock, reservation);
-    Scheduler_UnifiedPublishSleep(reservation, waited.outcome, waited.release_qpc, arrival_qpc, waited.limit);
+    SchedulerUnifiedReserve status = Scheduler_UnifiedReserve(arrival_qpc, &reservation);
+    bool waited = false;
+    while (status == SchedulerUnifiedReserve::Busy && reservation.target_qpc > env.Now()) {
+        const bool released = UnifiedAwaitOwner(env, reservation.target_qpc);
+        waited = true;
+        status = Scheduler_UnifiedReserve(arrival_qpc, &reservation);
+        if (!released) break; // the estimate, or the wait ended on its own: that was the last reservation
+    }
+    if (status != SchedulerUnifiedReserve::Reserved) return;
+    const bool held = waited && reservation.target_qpc > arrival_qpc;
+    const UnifiedSleepWaitResult waited_start = UnifiedSleepWait(env, reservation, held);
+    Scheduler_UnifiedPublishSleep(reservation, waited_start.outcome, waited_start.release_qpc, arrival_qpc,
+        waited_start.limit);
 }
 
 // Self-check on the genuine Sleep call: a driver that paces on its own (the control
@@ -1831,7 +1878,8 @@ static NvAPI_Status __cdecl Hook_Sleep(IUnknown* pDev) {
             QueryPerformanceCounter(&sleep_entry);
             Scheduler_RecordReflexSleep(sleep_entry.QuadPart);
             if (unified) {
-                UnifiedSleepStart(sleep_entry.QuadPart);
+                UnifiedLimitClock clock;
+                UnifiedSleepStart(clock, sleep_entry.QuadPart);
             }
         }
         if (bypass) {
@@ -1966,7 +2014,49 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
         return forward();
     }
     if (!FeedbackIsPresenting(marker_device.identity, &marker_params)) return forward();
-    if (!IsImmediateTimingMarker(marker_params.markerType)) {
+
+    // Resolve the configured trigger before source filtering. RTSS markers are
+    // normally ignored, but some games expose a partial direct NvAPI stream
+    // while RTSS supplies the driver-visible SIMULATION_START. Admit only that
+    // missing marker after direct-marker warm-up; RTSS alone must never select
+    // the marker path or drive enforcement.
+    static const NV_LATENCY_MARKER_TYPE s_configured_enforcement_marker =
+        g_config.enforcement_marker == "RenderSubmitStart"
+            ? RENDERSUBMIT_START
+            : SIMULATION_START;
+    static std::atomic<NV_LATENCY_MARKER_TYPE> s_enforcement_marker{
+        s_configured_enforcement_marker };
+    static NvApiMarkerPolicy s_marker_policy;
+    static NvApiMarkerPromotion s_marker_promotion;
+    static std::atomic<int> s_enforcement_hits{ 0 };
+    static std::atomic<int> s_render_submit_hits{ 0 };
+    static std::atomic<bool> s_fallback_applied{ false };
+    static std::atomic<uint32_t> s_marker_policy_epoch{ 0 };
+    // RENDERSUBMIT_START of a planned frame is a stage event for the lead
+    // (the simulation → render queue), before the scheduler-owner guard: it
+    // runs on the render thread, often while the next SIMULATION_START owns
+    // the scheduler, and the push never blocks.
+    if (marker_params.markerType == RENDERSUBMIT_START && !from_rtss && !PCL_MarkersFlowing()) {
+        LARGE_INTEGER submit_qpc{};
+        QueryPerformanceCounter(&submit_qpc);
+        PresentGate_OnFrameMarker(PacingPlanKey{PacingIdentityDomain::NvApiFrame,
+            marker_device.identity.producer_epoch,
+            FrameTimeline_CurrentControllerGeneration(), marker_params.frameID},
+            PacingStageEventKind::RenderSubmitStart, submit_qpc.QuadPart);
+    }
+    // RENDERSUBMIT_START(N) arrives from the render thread at the moment the game thread calls the
+    // Sleep and SIMULATION_START of frame N + 1, which both need the scheduler owner. It claims the
+    // owner only while it is, or can still become, the enforcement marker: configured as it, chosen
+    // by the fallback, or before this producer lifetime admitted its first SIMULATION_START (the
+    // fallback fires only with none). Otherwise it is an observation like the tail markers: queued
+    // here, logged when the next owner drains. The words are written under the owner; a read that
+    // races a producer change queues an observation the drain drops by its epoch.
+    const bool render_submit_deferred = marker_params.markerType == RENDERSUBMIT_START &&
+        s_configured_enforcement_marker == SIMULATION_START &&
+        s_enforcement_marker.load(std::memory_order_relaxed) == SIMULATION_START &&
+        s_enforcement_hits.load(std::memory_order_relaxed) > 0 &&
+        s_marker_policy_epoch.load(std::memory_order_acquire) == marker_device.identity.producer_epoch;
+    if (!IsImmediateTimingMarker(marker_params.markerType) || render_submit_deferred) {
         // RTSS tail markers were never eligible. Keep that filter before the
         // queue; only direct, validated current-device observations enter it.
         if (from_rtss) return forward();
@@ -2033,18 +2123,6 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
                 frame_key.frame_id, present_start_forward_qpc.QuadPart);
         return forward();
     }
-    // RENDERSUBMIT_START of a planned frame is a stage event for the lead
-    // (the simulation → render queue), before the scheduler-owner guard: it
-    // runs on the render thread, often while the next SIMULATION_START owns
-    // the scheduler, and the push never blocks.
-    if (marker_params.markerType == RENDERSUBMIT_START && !from_rtss && !PCL_MarkersFlowing()) {
-        LARGE_INTEGER submit_qpc{};
-        QueryPerformanceCounter(&submit_qpc);
-        PresentGate_OnFrameMarker(PacingPlanKey{PacingIdentityDomain::NvApiFrame,
-            marker_device.identity.producer_epoch,
-            FrameTimeline_CurrentControllerGeneration(), marker_params.frameID},
-            PacingStageEventKind::RenderSubmitStart, submit_qpc.QuadPart);
-    }
     SchedulerOwnerGuard scheduler_owner;
     if (!scheduler_owner) {
         LogMarkerRejection(MarkerRejection::SchedulerOwner, dev, nullptr, &marker_params);
@@ -2054,24 +2132,6 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
         LogMarkerRejection(MarkerRejection::OwnerStaleToken, dev, nullptr, &marker_params);
         return forward();
     }
-
-    // Resolve the configured trigger before source filtering. RTSS markers are
-    // normally ignored, but some games expose a partial direct NvAPI stream
-    // while RTSS supplies the driver-visible SIMULATION_START. Admit only that
-    // missing marker after direct-marker warm-up; RTSS alone must never select
-    // the marker path or drive enforcement.
-    static const NV_LATENCY_MARKER_TYPE s_configured_enforcement_marker =
-        g_config.enforcement_marker == "RenderSubmitStart"
-            ? RENDERSUBMIT_START
-            : SIMULATION_START;
-    static std::atomic<NV_LATENCY_MARKER_TYPE> s_enforcement_marker{
-        s_configured_enforcement_marker };
-    static NvApiMarkerPolicy s_marker_policy;
-    static NvApiMarkerPromotion s_marker_promotion;
-    static std::atomic<int> s_enforcement_hits{ 0 };
-    static std::atomic<int> s_render_submit_hits{ 0 };
-    static std::atomic<bool> s_fallback_applied{ false };
-    static std::atomic<uint32_t> s_marker_policy_epoch{ 0 };
     const uint32_t marker_policy_epoch =
         marker_device.identity.producer_epoch;
     const uint32_t previous_marker_policy_epoch =

@@ -486,6 +486,13 @@ public:
 
     uint64_t LifecycleBase() const noexcept { return lifecycle_base_; }
     bool HasOrigin() const noexcept { return has_origin_; }
+    // The start the law expects for the frame after the newest committed one, before that frame is
+    // planned: O(n) + I(n) in whole ticks, the wait target the next plan gets while the interval does
+    // not change. 0 without an origin (the law restarts at the next frame). A Sleep hook that finds the
+    // owner taken waits to it and reserves then (Scheduler_UnifiedReserve), so the frame's start is
+    // still waited for before the game sends its marker. When the interval rises the reservation waits
+    // the rest; when it falls that one start is late by what it fell.
+    int64_t StartEstimate() const noexcept { return has_origin_ ? start_estimate_qpc_ : 0; }
 
     // ── Start ──
 
@@ -746,6 +753,7 @@ private:
     bool has_origin_ = false;
     UnifiedTime origin_{};          // O(n − 1) after the newest commit
     int64_t last_release_qpc_ = 0;  // R(newest committed)
+    int64_t start_estimate_qpc_ = 0; // O + I of the newest commit, whole ticks (StartEstimate)
     uint64_t last_committed_ = 0;
 
     // The reservation stored by Reserve, and the start CommitRelease commits.

@@ -74,6 +74,105 @@ void TestOwnerGuardContention()
                 "exactly one concurrent producer acquired ownership");
 }
 
+std::atomic<int> g_owner_wakes{0};
+HANDLE g_owner_released = nullptr;
+
+void TestOwnerAwait()
+{
+    std::printf("Test: the release of an awaited scheduler owner calls the waker\n");
+    g_owner_wakes.store(0);
+    SchedulerOwner_SetWaker([]() noexcept { g_owner_wakes.fetch_add(1, std::memory_order_relaxed); });
+
+    ASSERT_TRUE(!SchedulerOwner_Await(), "a free owner is not awaited");
+    {
+        SchedulerOwnerGuard owner;
+        ASSERT_TRUE(static_cast<bool>(owner), "the owner is still free after that");
+    }
+    ASSERT_TRUE(g_owner_wakes.load() == 0, "a release nobody awaited wakes nobody");
+    {
+        SchedulerOwnerGuard owner;
+        ASSERT_TRUE(SchedulerOwner_Await() && SchedulerOwner_Await(), "a held owner is awaited");
+        SchedulerOwnerGuard nested;
+        ASSERT_TRUE(!static_cast<bool>(nested), "an awaited owner still rejects admission");
+    }
+    ASSERT_TRUE(g_owner_wakes.load() == 1, "the release of an awaited owner wakes once");
+    {
+        SchedulerOwnerGuard owner;
+        ASSERT_TRUE(static_cast<bool>(owner), "the owner is free after the awaited release");
+    }
+    ASSERT_TRUE(g_owner_wakes.load() == 1, "the release after it was not awaited");
+    SchedulerOwner_SetWaker(nullptr);
+}
+
+// The Sleep hook's side of the handoff, without its timer: try, else wait for the release.
+bool AcquireAfterRelease(HANDLE released, int* critical)
+{
+    for (;;) {
+        {
+            SchedulerOwnerGuard owner;
+            if (owner) {
+                ++*critical;
+                return true;
+            }
+        }
+        ResetEvent(released);
+        if (!SchedulerOwner_Await()) continue;
+        if (WaitForSingleObject(released, 10'000) != WAIT_OBJECT_0) return false; // a lost wake
+    }
+}
+
+void TestOwnerHandoff()
+{
+    std::printf("Test: every release of the scheduler owner reaches its waiter\n");
+    constexpr int kRounds = 20000;
+    g_owner_wakes.store(0);
+    g_owner_released = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    SchedulerOwner_SetWaker([]() noexcept {
+        g_owner_wakes.fetch_add(1, std::memory_order_relaxed);
+        SetEvent(g_owner_released);
+    });
+    std::atomic<int> held_round{0}; // the holder has the owner for this round
+    std::atomic<int> done_round{0}; // the waiter had it in this round
+    std::atomic<bool> lost{false};
+    int critical = 0;               // written only under the owner
+    int holder_failures = 0;
+
+    // Each round the holder releases once and then leaves the owner alone until the waiter had it:
+    // a wake lost in the race between the release and the waiter's mark leaves the waiter parked.
+    std::thread waiter([&] {
+        for (int round = 1; round <= kRounds; ++round) {
+            while (held_round.load(std::memory_order_acquire) != round)
+                std::this_thread::yield();
+            const bool acquired = AcquireAfterRelease(g_owner_released, &critical);
+            if (!acquired) lost.store(true, std::memory_order_release);
+            done_round.store(round, std::memory_order_release);
+            if (!acquired) return;
+        }
+    });
+    for (int round = 1; round <= kRounds && !lost.load(std::memory_order_acquire); ++round) {
+        {
+            SchedulerOwnerGuard owner;
+            if (owner) ++critical;
+            else ++holder_failures;
+            held_round.store(round, std::memory_order_release);
+            // The release meets the waiter's first attempt at a different moment each round.
+            for (int spin = round % 4; spin > 0; --spin)
+                std::this_thread::yield();
+        }
+        while (done_round.load(std::memory_order_acquire) != round)
+            std::this_thread::yield();
+    }
+    waiter.join();
+
+    ASSERT_TRUE(!lost.load(), "no release was missed by the waiter");
+    ASSERT_TRUE(holder_failures == 0, "the holder finds the owner free at each round");
+    ASSERT_TRUE(critical == 2 * kRounds, "holder and waiter each held the owner once per round");
+    ASSERT_TRUE(g_owner_wakes.load() > 0, "releases were awaited");
+    SchedulerOwner_SetWaker(nullptr);
+    CloseHandle(g_owner_released);
+    g_owner_released = nullptr;
+}
+
 void TestMarkerLogExactLookupAndExpiry()
 {
     std::printf("Test: fixed MarkerLog exact lookup, update, and expiry\n");
@@ -132,6 +231,8 @@ int main()
     std::printf("=== Scheduler CTD-Safety Tests ===\n\n");
     TestOwnerGuardSequentialAndNested();
     TestOwnerGuardContention();
+    TestOwnerAwait();
+    TestOwnerHandoff();
     TestMarkerLogExactLookupAndExpiry();
     TestMarkerLogConcurrentAccess();
 

@@ -1713,6 +1713,32 @@ namespace
         }
     }
 
+    // The start estimate a Sleep waits to when it finds the owner taken: after every commit it is
+    // the wait target the next reservation gets while the interval does not change (here the cap's,
+    // which has a fraction of a tick), so a frame held to it is not held again; a late release moves
+    // it with the origin; a restart of the law leaves none.
+    void TestStartEstimate()
+    {
+        Driver fresh;
+        CHECK(fresh.law.StartEstimate() == 0); // no origin: nothing to wait for
+
+        Primed p;
+        Driver& d = p.driver;
+        for (int frame = 0; frame < 6; ++frame) {
+            const int64_t estimate = d.law.StartEstimate();
+            FrameSpec spec{};
+            if (frame == 3)
+                spec.after_target_ticks = Ticks(2000.0); // released late: the origin follows it
+            const FrameResult result = d.Frame(spec);
+            CHECK(estimate != 0 && UnifiedPacer_TargetTicks(result.start.target) == estimate);
+        }
+        // The 250 ms gap rule restarts the law at a reservation: no estimate until the next commit.
+        UnifiedStart start{};
+        CHECK(d.law.Reserve(d.grid, 1, d.last_release + Ticks(300000.0), d.terms, &start) ==
+            UnifiedReserveStatus::Reserved);
+        CHECK((start.flags & kUpReset) != 0 && d.law.StartEstimate() == 0);
+    }
+
     void TestResolveMissingDuplicateAndEarlyWord()
     {
         // Missing: no Sleep ran; the law plans T(n) at the marker.
@@ -3269,6 +3295,7 @@ int main()
     TestLimitInputsAndOutstanding();
     TestResolveCompletedAndLate();
     TestResolveFailedRunningSuperseded();
+    TestStartEstimate();
     TestResolveMissingDuplicateAndEarlyWord();
     TestResets();
     TestUsedReportStream();

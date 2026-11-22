@@ -166,8 +166,8 @@ The hook confirms that the call's frame ID and the game's SetLatencyMarker frame
 | `0x0400` | fewer than 16 service samples (pairs) in the newest 32 frames with a used report |
 | `0x0800` | driver paces (self-check) |
 | `0x1000` | reset (the first frame, a controller-generation change or 250 ms gap, a cap/N/regime reset, or a failed marker-site wait: see below) |
-| `0x2000` | started at the marker |
-| `0x4000` | owner busy at the Sleep |
+| `0x2000` | started at the marker: no usable Sleep reservation, so the marker planned the start and its wait, if any, ran after the game's SIMULATION_START was forwarded (`source_marker_qpc` precedes `source_release_qpc` by that wait, and the driver's and frame generation's start of the frame is that much early) |
+| `0x4000` | owner busy at the Sleep: another thread held the scheduler owner at the Sleep hook's reservation. From 2026-11-22 the Sleep then waits for the owner's release, at most to the law's start estimate, and reserves again: the frame has its exact T and its Sleep columns like any other (`pre_sleep_*`, `source_flags` bit 2) and no `0x2000`. Both flags together mean the owner was still taken at the estimate, or no estimate lay ahead (the frame was late, or the law had no origin). In captures of earlier builds every `0x4000` frame also carries `0x2000`: the Sleep was forwarded without a wait and the marker waited the whole start wait (Alan Wake 2 with DLSS-G: 0.5% of frames, each followed by two doubled display intervals, because DLSS-G sets its flip metering batch time, `flip_time_per_batch_us`, from the spacing of the SIMULATION_START markers) |
 | `0x8000` | duplicate Sleep |
 | `0x10000` | Sleep wait failed |
 | `0x20000` | Sleep wait still running at the marker |

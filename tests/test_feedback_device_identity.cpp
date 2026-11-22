@@ -165,6 +165,7 @@ uint64_t s_test_presenting_sequence = 0;
 ActiveAPI s_test_api = ActiveAPI::None;
 std::atomic<unsigned> s_forwarded_markers{0};
 unsigned s_tail_markers = 0;
+unsigned s_render_submit_starts = 0; // RENDERSUBMIT_START entries of the marker log (immediate or drained)
 int64_t s_first_tail_timestamp = 0;
 int64_t s_last_tail_timestamp = 0;
 uint64_t s_simulation_start_id[8]{};
@@ -211,6 +212,8 @@ bool s_unified_active = false;                 // Scheduler_UnifiedActive
 SchedulerUnifiedReserve s_unified_reserve_result = SchedulerUnifiedReserve::Inactive;
 SchedulerUnifiedReservation s_unified_reservation{}; // handed out on Reserved
 unsigned s_unified_reserve_calls = 0;
+// The next reservations find the owner taken, one per entry, each given that start estimate.
+std::vector<int64_t> s_unified_busy_estimates;
 int64_t s_unified_reserve_arrival = 0;
 unsigned s_unified_publishes = 0;              // Scheduler_UnifiedPublishSleep
 SchedulerUnifiedReservation s_unified_published{};
@@ -900,6 +903,10 @@ public:
     unsigned limit_waits = 0;
     int64_t longest_start_wait = 0;
     bool start_wait_fails = false;
+    std::vector<int64_t> owner_releases; // the scheduler owner's releases, in order of time
+    size_t next_owner_release = 0;
+    unsigned owner_waits = 0;
+    bool owner_wait_fails = false;
 
     int64_t Now() noexcept override { return now; }
     uint64_t ReadyIndex() noexcept override { return index; }
@@ -925,6 +932,20 @@ public:
         ++start_waits;
         if (target_qpc - now > longest_start_wait) longest_start_wait = target_qpc - now;
         Advance(start_wait_fails ? now + 100 : target_qpc); // a failure returns early
+    }
+    // True at the owner's next release before the target, else at the target as StartWait.
+    bool OwnerWait(int64_t target_qpc) noexcept override {
+        ++owner_waits;
+        if (owner_wait_fails) {
+            Advance(now + 100); // a failure returns early
+            return false;
+        }
+        if (next_owner_release < owner_releases.size() && owner_releases[next_owner_release] < target_qpc) {
+            Advance(owner_releases[next_owner_release++]);
+            return true;
+        }
+        Advance(target_qpc);
+        return false;
     }
 };
 
@@ -1090,7 +1111,7 @@ void TestUnifiedSleepHook() {
         env.index = 5;
         env.ready_qpc = arrival;
         env.completions = {{arrival + 20'000, 8, arrival + 20'000}};
-        const auto result = UnifiedSleepWait(env, scripted_reservation(env, 10, arrival + 80'000, 200'000));
+        const auto result = UnifiedSleepWait(env, scripted_reservation(env, 10, arrival + 80'000, 200'000), false);
         CHECK(result.outcome == UnifiedSleepOutcome::Completed && result.release_qpc == arrival + 80'000);
         CHECK(result.limit.flags == 0 && result.limit.outstanding == 1);
         CHECK(env.start_waits == 1 && env.limit_waits == 0 && result.limit.wait_ticks == 0);
@@ -1103,7 +1124,7 @@ void TestUnifiedSleepHook() {
         const int64_t arrival = env.now;
         env.index = 5;
         env.ready_qpc = arrival;
-        const auto result = UnifiedSleepWait(env, scripted_reservation(env, 10, arrival - 10'000, 100'000));
+        const auto result = UnifiedSleepWait(env, scripted_reservation(env, 10, arrival - 10'000, 100'000), false);
         CHECK(result.outcome == UnifiedSleepOutcome::Late && env.start_waits == 0);
         CHECK((result.limit.flags & (kUpLimitWaited | kUpLimitTimeout)) == (kUpLimitWaited | kUpLimitTimeout));
         CHECK(result.release_qpc == arrival + 100'000 && result.limit.wait_ticks == 100'000);
@@ -1116,7 +1137,7 @@ void TestUnifiedSleepHook() {
         const int64_t arrival = env.now;
         env.index = 5;
         env.ready_qpc = arrival;
-        const auto result = UnifiedSleepWait(env, scripted_reservation(env, 9, arrival - 10'000, 100'000));
+        const auto result = UnifiedSleepWait(env, scripted_reservation(env, 9, arrival - 10'000, 100'000), false);
         CHECK(result.outcome == UnifiedSleepOutcome::Late && env.start_waits == 0);
         CHECK(result.limit.flags == 0 && env.limit_waits == 0 && result.limit.wait_ticks == 0);
         CHECK(result.release_qpc == arrival && result.limit.outstanding == 3);
@@ -1128,7 +1149,7 @@ void TestUnifiedSleepHook() {
         env.index = 5;
         env.ready_qpc = arrival;
         env.completions = {{arrival + 20'000, 8, arrival + 20'000}};
-        const auto result = UnifiedSleepWait(env, scripted_reservation(env, 10, arrival - 10'000, 5'000'000));
+        const auto result = UnifiedSleepWait(env, scripted_reservation(env, 10, arrival - 10'000, 5'000'000), false);
         CHECK((result.limit.flags & kUpLimitTimeout) == 0 && (result.limit.flags & kUpLimitWaited) != 0);
         CHECK(result.release_qpc == arrival + 20'000 && result.limit.wait_ticks == 20'000);
         CHECK(result.limit.outstanding == 1 && env.limit_waits == 1);
@@ -1139,7 +1160,7 @@ void TestUnifiedSleepHook() {
         const int64_t arrival = env.now;
         env.index = 5;
         env.ready_qpc = stale ? arrival - 3 * 100'000 : 0;
-        const auto result = UnifiedSleepWait(env, scripted_reservation(env, 10, arrival - 10'000, 100'000));
+        const auto result = UnifiedSleepWait(env, scripted_reservation(env, 10, arrival - 10'000, 100'000), false);
         CHECK((result.limit.flags & kUpLimitInactive) != 0 && result.limit.outstanding == -1);
         CHECK(env.limit_waits == 0 && result.limit.wait_ticks == 0 && result.release_qpc == arrival);
     }
@@ -1150,7 +1171,7 @@ void TestUnifiedSleepHook() {
         const int64_t arrival = env.now;
         env.index = 6;
         env.ready_qpc = arrival;
-        const auto result = UnifiedSleepWait(env, scripted_reservation(env, 7, arrival + 6'000'000, 10'000'000));
+        const auto result = UnifiedSleepWait(env, scripted_reservation(env, 7, arrival + 6'000'000, 10'000'000), false);
         CHECK(env.start_waits == 3 && env.longest_start_wait == 2'500'000);
         CHECK(result.outcome == UnifiedSleepOutcome::Completed && result.release_qpc == arrival + 6'000'000);
     }
@@ -1162,10 +1183,117 @@ void TestUnifiedSleepHook() {
         env.index = 5;
         env.ready_qpc = arrival;
         env.start_wait_fails = true;
-        const auto result = UnifiedSleepWait(env, scripted_reservation(env, 10, arrival + 6'000'000, 100'000));
+        const auto result = UnifiedSleepWait(env, scripted_reservation(env, 10, arrival + 6'000'000, 100'000), false);
         CHECK(env.start_waits == 1 && result.outcome == UnifiedSleepOutcome::Failed);
         CHECK(result.release_qpc < arrival + 6'000'000 && result.limit.flags == 0 &&
               result.limit.outstanding == -1 && env.limit_waits == 0);
+    }
+    // A busy owner at the reservation (another thread's marker holds it for a moment). The Sleep
+    // waits for the owner's release, bounded by the law's start estimate, and reserves then with
+    // its own arrival: the start wait stays in front of the game's marker and runs to the exact T.
+    const auto busy_start = [&](ScriptedSleepEnv* env, std::vector<int64_t> estimates, int64_t target) {
+        env->index = 9; // nothing unfinished in front of grid 10
+        env->ready_qpc = env->now;
+        s_unified_reservation = scripted_reservation(*env, 10, target, 200'000);
+        s_unified_busy_estimates = std::move(estimates);
+        reserves = s_unified_reserve_calls;
+        publishes = s_unified_publishes;
+        UnifiedSleepStart(*env, env->now);
+        s_unified_busy_estimates.clear();
+    };
+    // Released at once: R is T whether the interval stayed, fell or rose since the estimate.
+    for (const int64_t target : {int64_t{80'000}, int64_t{70'000}, int64_t{90'000}}) {
+        ScriptedSleepEnv env;
+        const int64_t arrival = env.now;
+        env.owner_releases = {arrival + 50};
+        busy_start(&env, {arrival + 80'000}, arrival + target);
+        CHECK(s_unified_reserve_calls == reserves + 2 && s_unified_reserve_arrival == arrival);
+        CHECK(env.owner_waits == 1 && env.start_waits == 1 && s_unified_publishes == publishes + 1);
+        CHECK(s_unified_arrival_qpc == arrival && s_unified_outcome == UnifiedSleepOutcome::Completed &&
+              s_unified_release_qpc == arrival + target);
+    }
+    // Released after T but before the estimate: released there, and the Sleep held the frame to it,
+    // a completed start wait.
+    {
+        ScriptedSleepEnv env;
+        const int64_t arrival = env.now;
+        env.owner_releases = {arrival + 75'000};
+        busy_start(&env, {arrival + 80'000}, arrival + 70'000);
+        CHECK(env.owner_waits == 1 && env.start_waits == 0 && s_unified_publishes == publishes + 1);
+        CHECK(s_unified_outcome == UnifiedSleepOutcome::Completed && s_unified_release_qpc == arrival + 75'000);
+    }
+    // The frame had arrived after its T (the interval fell that far): a late arrival, not a held start.
+    {
+        ScriptedSleepEnv env;
+        const int64_t arrival = env.now;
+        env.owner_releases = {arrival + 50};
+        busy_start(&env, {arrival + 80'000}, arrival - 10);
+        CHECK(env.owner_waits == 1 && env.start_waits == 0 && s_unified_publishes == publishes + 1);
+        CHECK(s_unified_outcome == UnifiedSleepOutcome::Late && s_unified_release_qpc == arrival + 50);
+    }
+    // Taken again by the time the Sleep reserves: it waits for the next release.
+    {
+        ScriptedSleepEnv env;
+        const int64_t arrival = env.now;
+        env.owner_releases = {arrival + 50, arrival + 400};
+        busy_start(&env, {arrival + 80'000, arrival + 80'000}, arrival + 80'000);
+        CHECK(s_unified_reserve_calls == reserves + 3 && env.owner_waits == 2 && env.start_waits == 1);
+        CHECK(s_unified_outcome == UnifiedSleepOutcome::Completed && s_unified_release_qpc == arrival + 80'000);
+    }
+    // A release more than one wait chunk (250 ms) away: the wait for it continues across chunks.
+    {
+        ScriptedSleepEnv env;
+        const int64_t arrival = env.now;
+        env.owner_releases = {arrival + 3'000'000};
+        busy_start(&env, {arrival + 6'000'000}, arrival + 6'000'000);
+        CHECK(s_unified_reserve_calls == reserves + 2 && env.owner_waits == 2 && env.start_waits == 2);
+        CHECK(s_unified_outcome == UnifiedSleepOutcome::Completed && s_unified_release_qpc == arrival + 6'000'000);
+    }
+    // The owner kept through the estimate: the Sleep reserves there once more. T at or before the
+    // estimate is released at the estimate, a completed start wait; a later T is waited for.
+    for (const int64_t target : {int64_t{80'000}, int64_t{70'000}, int64_t{90'000}}) {
+        ScriptedSleepEnv env;
+        const int64_t arrival = env.now;
+        busy_start(&env, {arrival + 80'000}, arrival + target);
+        CHECK(s_unified_reserve_calls == reserves + 2 && env.owner_waits == 1);
+        CHECK(env.start_waits == (target > 80'000 ? 1u : 0u) && s_unified_publishes == publishes + 1);
+        CHECK(s_unified_outcome == UnifiedSleepOutcome::Completed &&
+              s_unified_release_qpc == arrival + (target > 80'000 ? target : 80'000));
+    }
+    // Still taken at the estimate: nothing reserved or published, no further wait.
+    {
+        ScriptedSleepEnv env;
+        const int64_t arrival = env.now;
+        busy_start(&env, {arrival + 80'000, arrival + 80'000, arrival + 80'000}, arrival + 80'000);
+        CHECK(s_unified_reserve_calls == reserves + 2 && env.owner_waits == 1 && env.now == arrival + 80'000);
+        CHECK(env.start_waits == 0 && s_unified_publishes == publishes);
+    }
+    // Taken again after a release, and the law has no estimate any more (it was reset): forwarded.
+    {
+        ScriptedSleepEnv env;
+        const int64_t arrival = env.now;
+        env.owner_releases = {arrival + 50};
+        busy_start(&env, {arrival + 80'000, 0}, arrival + 80'000);
+        CHECK(s_unified_reserve_calls == reserves + 2 && env.owner_waits == 1 && env.now == arrival + 50);
+        CHECK(s_unified_publishes == publishes);
+    }
+    // The wait for the owner ends on its own (cancelled, failed, stopping): one more reservation,
+    // never a loop of them.
+    {
+        ScriptedSleepEnv env;
+        const int64_t arrival = env.now;
+        env.owner_wait_fails = true;
+        busy_start(&env, {arrival + 80'000, arrival + 80'000, arrival + 80'000}, arrival + 80'000);
+        CHECK(s_unified_reserve_calls == reserves + 2 && env.owner_waits == 1 && env.now == arrival + 100);
+        CHECK(s_unified_publishes == publishes);
+    }
+    // No estimate ahead (the law has no origin, or the frame is already late): forwarded at once.
+    for (const int64_t ahead : {int64_t{0}, int64_t{-1}}) {
+        ScriptedSleepEnv env;
+        const int64_t arrival = env.now;
+        busy_start(&env, {ahead == 0 ? 0 : arrival + ahead}, arrival + 80'000);
+        CHECK(s_unified_reserve_calls == reserves + 1 && env.owner_waits == 0 && env.start_waits == 0);
+        CHECK(env.now == arrival && s_unified_publishes == publishes);
     }
 
     // The limit's own wait never asks for more than its budget (scripted clock, 10 MHz).
@@ -3095,6 +3223,55 @@ void TestFrameMarkerStageEvents() {
     NvAPI_ClearFeedbackDevice();
 }
 
+// RENDERSUBMIT_START of frame N comes from the render thread while the game thread starts frame
+// N + 1 (its Sleep and SIMULATION_START need the scheduler owner). Once this producer lifetime has
+// admitted a SIMULATION_START it never claims the owner: its marker-log entry is queued and arrives
+// with the next owner, a busy owner loses nothing, and its stage event still reaches the lead. A
+// game that sends no SIMULATION_START keeps the fallback: there it claims the owner and is enforced.
+void TestRenderSubmitStartAdmission() {
+    FakeDevice device;
+    CHECK(NvAPI_CaptureFeedbackDevice(&device));
+    s_orig_set_latency_marker = ForwardMarker;
+    s_enforced_ids.clear();
+    s_replay_enforcement = true;
+    s_render_submit_starts = 0;
+
+    // No SIMULATION_START in this lifetime: logged at once, and enforced after the warm-up.
+    for (uint64_t id = 1; id <= 250; ++id) SendMarker(&device, 3000 + id, RENDERSUBMIT_START);
+    CHECK(s_render_submit_starts == 250);
+    CHECK(!s_enforced_ids.empty() && s_enforced_ids.back() == 3250);
+
+    // A new lifetime with SIMULATION_START: that marker is enforced, RENDERSUBMIT_START is not.
+    NvAPI_ClearFeedbackDevice();
+    CHECK(NvAPI_CaptureFeedbackDevice(&device));
+    s_enforced_ids.clear();
+    s_render_submit_starts = 0;
+    SendMarker(&device, 3301, SIMULATION_START);
+    {
+        SchedulerOwnerGuard owner;
+        CHECK(owner);
+        std::thread render([&] { SendMarker(&device, 3301, RENDERSUBMIT_START); });
+        render.join();
+    }
+    CHECK(s_render_submit_starts == 0);
+    SendMarker(&device, 3302, SIMULATION_START);
+    CHECK(s_render_submit_starts == 1); // not lost to the busy owner
+    // A free owner is not claimed either; the stage event is pushed at the marker itself.
+    DrainStageEvents();
+    PublishPlan(Key(3302), PacingRung::GpuQueueWait, 2'000.0);
+    SendMarker(&device, 3302, RENDERSUBMIT_START);
+    PacingStageEvent event{};
+    CHECK(FramePlan_PopStageEvent(&event) && event.kind == PacingStageEventKind::RenderSubmitStart &&
+          event.key.frame_id == 3302);
+    CHECK(s_render_submit_starts == 1);
+    SendMarker(&device, 3303, SIMULATION_START);
+    CHECK(s_render_submit_starts == 2);
+    CHECK((s_enforced_ids == std::vector<uint64_t>{3301, 3302, 3303}));
+    s_replay_enforcement = false;
+    DrainStageEvents();
+    NvAPI_ClearFeedbackDevice();
+}
+
 void ReplayDawnwalker(const char* path) {
     std::ifstream file(path);
     CHECK(file.good());
@@ -3169,6 +3346,7 @@ void MarkerLog::Record(uint32_t type, int64_t ts, uint64_t id) noexcept {
         s_simulation_start_qpc[id % 8] = ts;
     }
     if (type == RENDERSUBMIT_END) s_last_render_submit_end_qpc = ts;
+    if (type == RENDERSUBMIT_START) ++s_render_submit_starts;
     if (!IsImmediateTimingMarker(static_cast<NV_LATENCY_MARKER_TYPE>(type))) {
         if (s_tail_markers == 0) s_first_tail_timestamp = ts;
         ++s_tail_markers;
@@ -3221,6 +3399,14 @@ bool Scheduler_UnifiedActive() noexcept {
 SchedulerUnifiedReserve Scheduler_UnifiedReserve(int64_t arrival_qpc, SchedulerUnifiedReservation* out) noexcept {
     ++s_unified_reserve_calls;
     s_unified_reserve_arrival = arrival_qpc;
+    if (!s_unified_busy_estimates.empty()) {
+        if (out) {
+            *out = SchedulerUnifiedReservation{};
+            out->target_qpc = s_unified_busy_estimates.front();
+        }
+        s_unified_busy_estimates.erase(s_unified_busy_estimates.begin());
+        return SchedulerUnifiedReserve::Busy;
+    }
     if (s_unified_reserve_result == SchedulerUnifiedReserve::Reserved && out) *out = s_unified_reservation;
     return s_unified_reserve_result;
 }
@@ -3247,6 +3433,8 @@ bool PreSleepWaitUntil(int64_t target_qpc) {
     }
     return true;
 }
+// The production clock's wait for the owner; the scripted environment has its own.
+bool Scheduler_AwaitOwner(int64_t) noexcept { return false; }
 void PacingTelemetry_PushWait(const PacingWaitRecord&) noexcept {} // async marker hook timing; not asserted here
 void PublishReflexControllerResidence(uint64_t, uint32_t, double residence_us) noexcept {
     ++s_residence_publications;
@@ -3301,6 +3489,7 @@ int main(int argc, char** argv) {
     TestReentrantRevalidation();
     TestRealAddressReuse();
     TestDiagnosticAdmission();
+    TestRenderSubmitStartAdmission();
     TestCpuLatency();
     TestMarkerForwardOrder();
     TestSourceAdmissionWithBusyTail();

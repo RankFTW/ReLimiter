@@ -27,6 +27,14 @@ namespace
         return ticks * 1000000.0 / static_cast<double>(frequency);
     }
 
+    // T = origin + interval, held exactly: whole ticks and the fraction of a tick carried.
+    UnifiedTime TargetAfter(const UnifiedTime& origin, double interval_us, int64_t frequency) noexcept
+    {
+        const double x = origin.frac + TicksFromUs(interval_us, frequency);
+        const double whole = std::floor(x);
+        return UnifiedTime{origin.base + static_cast<int64_t>(whole), x - whole};
+    }
+
     double Median3(double a, double b, double c) noexcept
     {
         return std::max(std::min(a, b), std::min(std::max(a, b), c));
@@ -530,6 +538,7 @@ void UnifiedPacer::Reset(uint64_t lifecycle_base, uint32_t controller_generation
     has_origin_ = false;
     origin_ = UnifiedTime{};
     last_release_qpc_ = 0;
+    start_estimate_qpc_ = 0;
     last_committed_ = 0;
     reservation_ = UnifiedStart{};
     pending_ = UnifiedStart{};
@@ -1303,10 +1312,7 @@ bool UnifiedPacer::BuildStart(uint64_t grid_index, uint32_t controller_generatio
         out.release_now = true;
         flags |= kUpReset;
     } else {
-        const double x = origin_.frac + TicksFromUs(interval_us, frequency_);
-        const double whole = std::floor(x);
-        out.target.base = origin_.base + static_cast<int64_t>(whole);
-        out.target.frac = x - whole;
+        out.target = TargetAfter(origin_, interval_us, frequency_);
         out.release_now = arrival_qpc >= out.target.base;
     }
     out.flags = flags;
@@ -1436,6 +1442,7 @@ bool UnifiedPacer::CommitRelease(uint64_t grid_index, int64_t release_qpc, uint3
         return false;
 
     const UnifiedTime target = pending_.target;
+    const double interval_us = pending_.interval_us;
     pending_ = UnifiedStart{}; // committed exactly once
 
     // O(n) = max(T(n), R(n)); T is held exactly, R is a whole tick. R ≥ T means
@@ -1445,6 +1452,7 @@ bool UnifiedPacer::CommitRelease(uint64_t grid_index, int64_t release_qpc, uint3
     origin_ = release_not_before_target ? UnifiedTime{release_qpc, 0.0} : target;
     has_origin_ = true;
     last_release_qpc_ = release_qpc;
+    start_estimate_qpc_ = UnifiedPacer_TargetTicks(TargetAfter(origin_, interval_us, frequency_));
     last_committed_ = grid_index;
 
     if (Entry* entry = Touch(grid_index)) {

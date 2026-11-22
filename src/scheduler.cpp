@@ -372,6 +372,14 @@ bool s_logged_ordered_behind_wait = false;
 // retired Sleep cannot overwrite another frame's slot), and the marker uses a snapshot only
 // when its token and sequence validate, else it discards it.
 std::atomic<uint64_t> s_up_mailbox{0};
+// The law's start estimate for the next frame (UnifiedPacer::StartEstimate, 0 = none), published by
+// the owner after every unified plan and reset and read by a Sleep hook that found the owner taken:
+// how long that Sleep may wait for the owner.
+std::atomic<int64_t> s_up_start_estimate{0};
+// The owner's release, for that Sleep (Scheduler_AwaitOwner): an auto-reset event the guard's waker
+// sets when the released owner was awaited. Created once, with the unified key; never closed (a
+// release on another thread may still set it).
+std::atomic<HANDLE> s_owner_released{nullptr};
 PacingPendingWarning s_up_owner_busy, s_up_duplicate_sleep;
 constexpr uint32_t kUpStatsSlots = 4;
 struct UnifiedSleepStats {
@@ -497,6 +505,7 @@ static void ResetUnifiedLaw() noexcept
     if (!s_source_stage.UnifiedEnabled()) return;
     s_source_stage.ResetUnified(FrameTimeline_CurrentControllerGeneration());
     s_up_mailbox.store(0, std::memory_order_release);
+    s_up_start_estimate.store(0, std::memory_order_release);
     s_up_owner_busy.Clear();
     s_up_duplicate_sleep.Clear();
 }
@@ -793,10 +802,16 @@ static void ApplyUnifiedKeyTransition(const PacingPipelineConfig& config) noexce
     if (key_changed && !s_up_key) LogQueueLawSummary("unified pacer off"); // s_up_key is the new value: the key went off
     s_source_stage.SetUnifiedEnabled(s_up_key, FrameTimeline_CurrentControllerGeneration());
     s_up_mailbox.store(0, std::memory_order_release);
+    s_up_start_estimate.store(0, std::memory_order_release);
     s_up_owner_busy.Clear();
     s_up_duplicate_sleep.Clear();
     // The waker is installed before the publication starts (frame_plan.cpp stays free of Windows).
     FramePlan_SetReadyWaker([](const void* address) noexcept { WakeByAddressAll(const_cast<void*>(address)); });
+    if (s_owner_released.load(std::memory_order_relaxed) == nullptr)
+        s_owner_released.store(CreateEventW(nullptr, FALSE, FALSE, nullptr), std::memory_order_release);
+    SchedulerOwner_SetWaker([]() noexcept {
+        if (const HANDLE released = s_owner_released.load(std::memory_order_acquire)) SetEvent(released);
+    });
     g_up_ready_publish.store(s_up_key, std::memory_order_relaxed);
     s_source_stage.ResetBuckets();
     s_driver_sleep_index = 0;
@@ -1390,7 +1405,11 @@ static SourceStageFrame RunPlanned(
     }
     g_effective_interval_us.store(input.interval_us, std::memory_order_relaxed);
     const SourceStageFrame frame = s_source_stage.RunPlannedFrame(request, &s_clock);
-    if (unified && frame.planned) g_effective_interval_us.store(frame.plan.interval_us, std::memory_order_relaxed);
+    if (unified) {
+        if (frame.planned) g_effective_interval_us.store(frame.plan.interval_us, std::memory_order_relaxed);
+        // After the commit, and after a restart of the law inside the frame (0: no origin).
+        s_up_start_estimate.store(s_source_stage.Unified().StartEstimate(), std::memory_order_release);
+    }
     const int64_t release = frame.planned ? frame.release_qpc : QpcNow();
 
     // A consumed Sleep-hook start wait is the pre-Sleep wait of the record.
@@ -1575,6 +1594,8 @@ SchedulerUnifiedReserve Scheduler_UnifiedReserve(int64_t arrival_qpc, SchedulerU
     SchedulerOwnerGuard owner;
     if (!owner) {
         if (PacingTelemetry_Active()) s_up_owner_busy.Record(arrival_qpc);
+        *out = SchedulerUnifiedReservation{};
+        out->target_qpc = s_up_start_estimate.load(std::memory_order_acquire);
         return SchedulerUnifiedReserve::Busy;
     }
     // The reservation's I_gpu comes from the records drained now, including those the probe
@@ -1592,7 +1613,10 @@ SchedulerUnifiedReserve Scheduler_UnifiedReserve(int64_t arrival_qpc, SchedulerU
     }
     if (status != UnifiedReserveStatus::Reserved) return SchedulerUnifiedReserve::Inactive;
     // A reset inside the law (generation change, 250 ms gap) clears the mailbox word too.
-    if ((start.flags & kUpReset) != 0) s_up_mailbox.store(0, std::memory_order_release);
+    if ((start.flags & kUpReset) != 0) {
+        s_up_mailbox.store(0, std::memory_order_release);
+        s_up_start_estimate.store(0, std::memory_order_release);
+    }
     out->token = start.token;
     out->grid_index = start.grid_index;
     out->lifecycle_base = start.lifecycle_base;
@@ -1600,6 +1624,20 @@ SchedulerUnifiedReserve Scheduler_UnifiedReserve(int64_t arrival_qpc, SchedulerU
     out->interval_ticks = start.interval_ticks;
     out->flags = start.flags;
     return SchedulerUnifiedReserve::Reserved;
+}
+
+bool Scheduler_AwaitOwner(int64_t target_qpc) noexcept
+{
+    const HANDLE released = s_owner_released.load(std::memory_order_acquire);
+    if (released == nullptr) {
+        (void)PreSleepWaitUntil(target_qpc);
+        return false;
+    }
+    // A signal an earlier release left would end this wait at once. One that still arrives after
+    // the reset is a spurious wake, answered by the caller's next reservation.
+    ResetEvent(released);
+    if (!SchedulerOwner_Await()) return true;
+    return PreSleepWaitUntilOr(target_qpc, released) == PreSleepWaitEnd::Woken;
 }
 
 void Scheduler_UnifiedPublishSleep(const SchedulerUnifiedReservation& reservation,

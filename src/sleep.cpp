@@ -38,8 +38,12 @@ static HANDLE CreateHighResolutionTimer() noexcept {
 }
 
 bool PreSleepWaitUntil(int64_t target_qpc) {
-    if (RuntimeLifecycle_IsStopping()) return false;
-    if (s_pre_sleep_busy.test_and_set(std::memory_order_acquire)) return false;
+    return PreSleepWaitUntilOr(target_qpc, nullptr) == PreSleepWaitEnd::Target;
+}
+
+PreSleepWaitEnd PreSleepWaitUntilOr(int64_t target_qpc, void* wake) {
+    if (RuntimeLifecycle_IsStopping()) return PreSleepWaitEnd::Failed;
+    if (s_pre_sleep_busy.test_and_set(std::memory_order_acquire)) return PreSleepWaitEnd::Failed;
     struct BusyScope {
         ~BusyScope() { s_pre_sleep_busy.clear(std::memory_order_release); }
     } busy;
@@ -47,7 +51,8 @@ bool PreSleepWaitUntil(int64_t target_qpc) {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     const double remaining_us = qpc_to_us(target_qpc - now.QuadPart);
-    if (!std::isfinite(remaining_us) || remaining_us <= 0.0 || remaining_us > 500'000.0) return false;
+    if (!std::isfinite(remaining_us) || remaining_us <= 0.0 || remaining_us > 500'000.0)
+        return PreSleepWaitEnd::Failed;
 
     // The timer ends PRE_SLEEP_SPIN_LEAD_US before the target (no timer when less is left)
     // and the hardware spin the marker-site wait uses (TryOwnSleep) finishes it, so the
@@ -56,20 +61,21 @@ bool PreSleepWaitUntil(int64_t target_qpc) {
     const double timer_us = remaining_us - PRE_SLEEP_SPIN_LEAD_US;
     if (timer_us > 0.0) {
         const HANDLE timer = s_pre_sleep_timer.load(std::memory_order_acquire);
-        if (!timer) return false;
+        if (!timer) return PreSleepWaitEnd::Failed;
         LARGE_INTEGER due;
         due.QuadPart = -static_cast<int64_t>(timer_us * 10.0); // 100 ns units
-        if (!SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) return false;
-        const HANDLE stop_event = RuntimeLifecycle_GetStopEvent();
+        if (!SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) return PreSleepWaitEnd::Failed;
         const DWORD timeout_ms = static_cast<DWORD>(timer_us / 1000.0) + 100;
-        DWORD result = WAIT_FAILED;
-        if (stop_event) {
-            const HANDLE waits[] = { timer, stop_event };
-            result = WaitForMultipleObjects(2, waits, FALSE, timeout_ms);
-        } else {
-            result = WaitForSingleObject(timer, timeout_ms);
-        }
-        if (result != WAIT_OBJECT_0 || RuntimeLifecycle_IsStopping()) return false;
+        // The timer first: when it and `wake` are both signalled the wait went to its target.
+        HANDLE waits[3] = { timer };
+        DWORD count = 1;
+        if (const HANDLE stop_event = RuntimeLifecycle_GetStopEvent()) waits[count++] = stop_event;
+        const DWORD wake_index = count;
+        if (wake) waits[count++] = static_cast<HANDLE>(wake);
+        const DWORD result = WaitForMultipleObjects(count, waits, FALSE, timeout_ms);
+        if (RuntimeLifecycle_IsStopping()) return PreSleepWaitEnd::Failed;
+        if (wake && result == WAIT_OBJECT_0 + wake_index) return PreSleepWaitEnd::Woken;
+        if (result != WAIT_OBJECT_0) return PreSleepWaitEnd::Failed;
     }
 
     // Same pin and spin as TryOwnSleep's second phase. A timer that returned
@@ -78,7 +84,7 @@ bool PreSleepWaitUntil(int64_t target_qpc) {
         GetCurrentThread(), static_cast<DWORD_PTR>(1) << GetCurrentProcessorNumber());
     HWSpin(target_qpc);
     if (old_affinity != 0) SetThreadAffinityMask(GetCurrentThread(), old_affinity);
-    return !RuntimeLifecycle_IsStopping();
+    return RuntimeLifecycle_IsStopping() ? PreSleepWaitEnd::Failed : PreSleepWaitEnd::Target;
 }
 
 void CloseSleepTimer() {

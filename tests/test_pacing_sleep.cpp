@@ -1,6 +1,7 @@
 // Link production sleep.cpp and wake_guard.cpp. Only unrelated lifecycle,
 // logging, TSC conversion and hardware-spin integration are stubbed here.
-// These tests never wait; real timer/spin/shutdown timing needs live validation.
+// These tests never wait, apart from one 2 ms timer wait; real timer/spin/shutdown timing needs
+// live validation.
 #include "pacing_sleep.h"
 #include "sleep.h"
 #include "wake_guard.h"
@@ -88,6 +89,31 @@ int main()
     CHECK(!PreSleepWaitUntil(now.QuadPart + us_to_qpc(PRE_SLEEP_SPIN_LEAD_US / 2.0)) && spin_calls == 2);
     stopping = false;
     stop_during_spin = false;
+
+    // PreSleepWaitUntilOr: a signalled wake ends the timer phase at once; the timer still ends it
+    // at the target when the wake stays silent; inside the spin lead the wake is not watched;
+    // the guards are PreSleepWaitUntil's.
+    InitSleepTimer();
+    const HANDLE wake = CreateEventW(nullptr, TRUE, TRUE, nullptr); // manual reset, signalled
+    spin_calls = 0;
+    QueryPerformanceCounter(&now);
+    CHECK(PreSleepWaitUntilOr(now.QuadPart + GetQPCFrequency() / 4, wake) == PreSleepWaitEnd::Woken &&
+          spin_calls == 0);
+    QueryPerformanceCounter(&now);
+    CHECK(PreSleepWaitUntilOr(now.QuadPart + us_to_qpc(PRE_SLEEP_SPIN_LEAD_US / 2.0), wake) ==
+              PreSleepWaitEnd::Target && spin_calls == 1);
+    CHECK(PreSleepWaitUntilOr(now.QuadPart - 1, wake) == PreSleepWaitEnd::Failed && spin_calls == 1);
+    QueryPerformanceCounter(&now);
+    CHECK(PreSleepWaitUntilOr(now.QuadPart + GetQPCFrequency(), wake) == PreSleepWaitEnd::Failed);
+    ResetEvent(wake);
+    QueryPerformanceCounter(&now);
+    CHECK(PreSleepWaitUntilOr(now.QuadPart + us_to_qpc(3000.0), wake) == PreSleepWaitEnd::Target &&
+          spin_calls == 2);
+    stopping = true;
+    CHECK(PreSleepWaitUntilOr(now.QuadPart + GetQPCFrequency() / 4, wake) == PreSleepWaitEnd::Failed);
+    stopping = false;
+    CloseHandle(wake);
+    CloseSleepTimer();
 
     std::printf("pacing sleep: %d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;

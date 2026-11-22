@@ -21,3 +21,10 @@ bool TryOwnSleep(int64_t target_qpc);
 // value would be a hand configuration.
 constexpr double PRE_SLEEP_SPIN_LEAD_US = 1000.0;
 bool PreSleepWaitUntil(int64_t target_qpc);
+
+// PreSleepWaitUntil with one more way out of its timer phase: `wake`, an event handle (null: none).
+// Target: the call returned at the target. Woken: `wake` was signalled while the timer ran (the
+// timer stays armed; the next pre-Sleep wait sets it again). Failed: every case PreSleepWaitUntil
+// returns false for. The spin of the last PRE_SLEEP_SPIN_LEAD_US does not watch `wake`.
+enum class PreSleepWaitEnd : uint8_t { Target, Woken, Failed };
+PreSleepWaitEnd PreSleepWaitUntilOr(int64_t target_qpc, void* wake);
