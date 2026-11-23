@@ -153,7 +153,8 @@ namespace
             (sizeof(void*) != 8 || left.gpu_queue_probe_source == right.gpu_queue_probe_source) &&
             left.unified_queue_upstream == right.unified_queue_upstream &&
             (sizeof(void*) != 8 || left.unified_queue_margin_end == right.unified_queue_margin_end) &&
-            left.unified_queue_allow_us == right.unified_queue_allow_us;
+            left.unified_queue_allow_us == right.unified_queue_allow_us &&
+            left.fg_lead_extra_us == right.fg_lead_extra_us;
     }
 
     // ── Initial publication (must run first) ──
@@ -1029,6 +1030,7 @@ namespace
         config.gpu_probes = false;
         config.unified_queue_rank = 100;
         config.unified_queue_allow_us = -5;
+        config.fg_lead_extra_us = 9000;
         config.unified_hold_share = nan;
         PacingPipeline_SetConfig(config);
         const PacingPipelineConfig stored = PacingPipeline_GetConfig();
@@ -1037,6 +1039,7 @@ namespace
         CHECK(!stored.gpu_probes);
         CHECK(stored.unified_queue_rank == kPacingUnifiedQueueRankMax);
         CHECK(stored.unified_queue_allow_us == 0);
+        CHECK(stored.fg_lead_extra_us == kPacingFgLeadExtraMaxUs && kPacingFgLeadExtraMaxUs == 4000);
         CHECK(stored.unified_hold_share == 0.0);
 
         // The kept fields round-trip through the seqlock; a test mode takes the owner from the unified pacer.
@@ -1046,6 +1049,7 @@ namespace
         config.unified_queue_rank = 3;
         config.unified_queue_need_frames = 7;
         config.unified_queue_allow_us = 1500;
+        config.fg_lead_extra_us = 1500;
         PacingPipeline_SetConfig(config);
         CHECK(SameConfig(PacingPipeline_GetConfig(), config));
         CHECK(!PacingPipeline_GetConfig().unified);
@@ -1264,6 +1268,21 @@ namespace
         const PacingPipelineSnapshot read = PacingPipeline_Read();
         CHECK(read.rung == PacingRung::FgInputWait && read.auto_rung == PacingRung::FgInputWait);
         CHECK(PacingPipeline_SameResult(read, held));
+
+        // The FG input wait's extra lead (developer key fg_lead_extra_us, the Smooth position's lever) is added to
+        // the allowance of that rung only, clamped, and a change is a new result.
+        PacingPipelineConfig extra{};
+        extra.fg_lead_extra_us = 1500;
+        const PacingPipelineSnapshot longer = Resolve(extra, QualifiedDx12(), ActiveFg());
+        CHECK(held.allowance_us == 500.0 && longer.allowance_us == 2000.0);
+        CHECK(!PacingPipeline_SameResult(longer, held));
+        CHECK(Resolve(extra, QualifiedDx12(), ActiveVrr()).allowance_us == 500.0); // GPU queue wait
+        CHECK(Resolve(extra, VulkanPcl(), ActiveVrr()).allowance_us == 500.0);     // marker hold
+        CHECK(Resolve(extra, PresentBased(), ActiveVrr()).allowance_us == 500.0);  // source only
+        extra.fg_lead_extra_us = 90000;
+        CHECK(Resolve(extra, QualifiedDx12(), ActiveFg()).allowance_us == 500.0 + kPacingFgLeadExtraMaxUs);
+        extra.fg_lead_extra_us = -3;
+        CHECK(Resolve(extra, QualifiedDx12(), ActiveFg()).allowance_us == 500.0);
     }
 
     template <typename Enum, typename TextOf>
@@ -1417,42 +1436,52 @@ namespace
         CHECK(SameConfig(PacingPipeline_GetConfig(), PacingPipelineConfig{}));
     }
 
-    // The pacing preference resolves to the queue-based pacer's rank and hold share. Each lever moves only for its own
-    // position and only while its developer key is at the default: a developer value that differs from its own default wins,
-    // and the two levers are independent. The texts round-trip.
+    // The pacing preference resolves to the queue-based pacer's rank and hold share and the FG input wait's extra lead.
+    // Each lever moves only for its own position and only while its developer key is at the default: a developer value
+    // that differs from its own default wins, and the levers are independent. The texts round-trip.
     void TestPacingPreferenceMapping()
     {
         const int rank_default = kPacingUnifiedQueueRankDefault;
         const double share_default = kPacingUnifiedHoldShareDefault;
-        const auto resolve = [](PacingPreference preference, int rank, double share) {
-            return PacingPipeline_ResolvePreference(preference, rank, share);
+        const int lead_default = kPacingFgLeadExtraDefaultUs;
+        const auto resolve = [](PacingPreference preference, int rank, double share, int lead = kPacingFgLeadExtraDefaultUs) {
+            return PacingPipeline_ResolvePreference(preference, rank, share, lead);
         };
         // The three positions with the developer keys at their defaults.
         CHECK(resolve(PacingPreference::Balanced, rank_default, share_default).queue_rank == rank_default);
         CHECK(resolve(PacingPreference::Balanced, rank_default, share_default).hold_share == share_default);
+        CHECK(resolve(PacingPreference::Balanced, rank_default, share_default).lead_extra_us == lead_default);
         CHECK(resolve(PacingPreference::Latency, rank_default, share_default).queue_rank == kPacingPreferenceLatencyRank);
         CHECK(resolve(PacingPreference::Latency, rank_default, share_default).hold_share == share_default);
+        CHECK(resolve(PacingPreference::Latency, rank_default, share_default).lead_extra_us == lead_default);
         CHECK(resolve(PacingPreference::Smooth, rank_default, share_default).queue_rank == rank_default);
         CHECK(resolve(PacingPreference::Smooth, rank_default, share_default).hold_share == kPacingPreferenceSmoothHoldShare);
+        CHECK(resolve(PacingPreference::Smooth, rank_default, share_default).lead_extra_us == kPacingPreferenceSmoothLeadExtraUs);
         CHECK(kPacingPreferenceLatencyRank == 4 && kPacingPreferenceSmoothHoldShare == 1.0 / 32.0);
         CHECK(kPacingPreferenceSmoothHoldShare <= kPacingUnifiedHoldShareMax);
+        CHECK(kPacingPreferenceSmoothLeadExtraUs >= 0 && kPacingPreferenceSmoothLeadExtraUs <= kPacingFgLeadExtraMaxUs);
         // A developer key that differs from its default wins over every position.
         for (const PacingPreference preference : {PacingPreference::Latency, PacingPreference::Balanced, PacingPreference::Smooth}) {
             CHECK(resolve(preference, 3, share_default).queue_rank == 3);
             CHECK(resolve(preference, 6, 0.0625).queue_rank == 6);
             CHECK(resolve(preference, rank_default, 0.0625).hold_share == 0.0625);
             CHECK(resolve(preference, 6, 0.0625).hold_share == 0.0625);
+            CHECK(resolve(preference, rank_default, share_default, 1500).lead_extra_us == 1500);
         }
         // The levers are independent: Latency leaves a developer share, Smooth leaves a developer rank, and a
-        // developer rank does not stop Smooth's share (nor a developer share Latency's rank).
+        // developer rank does not stop Smooth's share (nor a developer share Latency's rank); a developer extra lead
+        // leaves Smooth's share, and a developer share Smooth's extra lead.
         CHECK(resolve(PacingPreference::Latency, rank_default, 0.0625).queue_rank == kPacingPreferenceLatencyRank);
         CHECK(resolve(PacingPreference::Latency, rank_default, 0.0625).hold_share == 0.0625);
         CHECK(resolve(PacingPreference::Smooth, 6, share_default).queue_rank == 6);
         CHECK(resolve(PacingPreference::Smooth, 6, share_default).hold_share == kPacingPreferenceSmoothHoldShare);
         CHECK(resolve(PacingPreference::Latency, 6, share_default).queue_rank == 6);
+        CHECK(resolve(PacingPreference::Smooth, rank_default, share_default, 1500).hold_share == kPacingPreferenceSmoothHoldShare);
+        CHECK(resolve(PacingPreference::Smooth, rank_default, 0.0625).lead_extra_us == kPacingPreferenceSmoothLeadExtraUs);
         // A value out of the enum behaves as the default position.
         CHECK(resolve(static_cast<PacingPreference>(9), rank_default, share_default).queue_rank == rank_default);
         CHECK(resolve(static_cast<PacingPreference>(9), rank_default, share_default).hold_share == share_default);
+        CHECK(resolve(static_cast<PacingPreference>(9), rank_default, share_default).lead_extra_us == lead_default);
 
         PacingPreference parsed = PacingPreference::Balanced;
         for (const PacingPreference preference : {PacingPreference::Latency, PacingPreference::Balanced, PacingPreference::Smooth}) {

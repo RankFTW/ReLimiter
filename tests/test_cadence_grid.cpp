@@ -2210,6 +2210,66 @@ namespace
         CHECK(floored && target == unified);
     }
 
+    // The FG input wait's developer keys of the floor (CadenceGridFloorOptions): the default changes nothing; a slack
+    // divisor makes the slack that share of the displayed interval (never above the late tolerance), and the
+    // commanded interval replaces the display-side one. Unified frames 1..3 as above, at 2x (D = 2), frame 1 late.
+    void TestFgFloorOptions()
+    {
+        const double commanded_us = 20000.0;
+        const double display_us = 16667.0;
+        const int64_t commanded = RoundTicks(Ticks(commanded_us));
+        const int64_t display = RoundTicks(Ticks(display_us));
+        const int64_t h1 = kStartQpc + 100000;
+        CadenceGrid grid;
+        for (int index = 0; index < 3; ++index) {
+            CadenceGridPlanAtInput plan = AtInput(kStartQpc + index * commanded, commanded_us,
+                h1 + index * commanded, 0.0, kStartQpc + index * commanded);
+            plan.display_interval_us = display_us;
+            CHECK(grid.PlanAt(plan).valid);
+        }
+        const CadenceGridSnapshot& snapshot = grid.Snapshot();
+        const int64_t t1 = TargetOf(grid, 1);
+        const int64_t t2 = TargetOf(grid, 2);
+        const int64_t o1 = t1 + 100000;
+        CadenceGridOutputTracker tracker;
+        CHECK(tracker.Record(kGeneration, 1, o1));
+        const auto tolerance = [](int64_t interval_ticks) {
+            return CadenceGrid_LateToleranceTicks(static_cast<double>(interval_ticks) / 2.0, kFrequency);
+        };
+        const auto resolve = [&](CadenceGridFloorOptions options, bool display_floor = true) {
+            int64_t target = 0;
+            bool floored = false;
+            CHECK(CadenceGrid_ResolveOutputTarget(snapshot, kGeneration, 2, tracker, &target, &floored, 2.0,
+                display_floor, 0.0, options));
+            CHECK(floored);
+            return target;
+        };
+        // The default is the floor as it is.
+        int64_t plain = 0;
+        CHECK(CadenceGrid_ResolveOutputTarget(snapshot, kGeneration, 2, tracker, &plain, nullptr, 2.0, true));
+        CHECK(plain == o1 + display - tolerance(display) / 2);
+        CHECK(resolve({}) == plain);
+        // A slack divisor: that share of the displayed interval, half the floor's interval here.
+        CHECK(resolve({100, false}) == o1 + display - display / 2 / 100);
+        CHECK(resolve({400, false}) == o1 + display - display / 2 / 400);
+        CHECK(resolve({25, false}) > plain && resolve({400, false}) > resolve({100, false}));
+        // Never above the late tolerance.
+        CHECK(resolve({1, false}) == o1 + display - tolerance(display));
+        // The commanded interval, with either slack and whatever display_floor says.
+        CHECK(resolve({0, true}) == o1 + commanded - tolerance(commanded) / 2);
+        CHECK(resolve({100, true}) == o1 + commanded - commanded / 2 / 100);
+        CHECK(resolve({100, true}, false) == resolve({100, true}));
+        CHECK(resolve({100, false}, false) == o1 + commanded - commanded / 2 / 100);
+        // A frame behind one that passed on its target is not floored, at the smallest slack either.
+        CadenceGridOutputTracker on_time;
+        CHECK(on_time.Record(kGeneration, 1, t1));
+        int64_t target = 0;
+        bool floored = true;
+        CHECK(CadenceGrid_ResolveOutputTarget(snapshot, kGeneration, 2, on_time, &target, &floored, 2.0, true, 0.0,
+            CadenceGridFloorOptions{1000, true}));
+        CHECK(!floored && target == t2);
+    }
+
     // Hold credit (key unified_pacer): under the live key (display_floor) and a finite advance > 0
     // the resolved target (nominal or floored) is exactly the advance earlier; *floored unchanged.
     // Key off, 0, negative and non-finite advances resolve as today; no clock is involved.
@@ -2917,6 +2977,7 @@ int main(int argc, char** argv)
     TestPlanAtDisplaySideFloor();
     TestClearDisplayFloorAtCutover();
     TestDisplayFloorGatedAtUseAndClearedEverywhere();
+    TestFgFloorOptions();
     TestAdvanceResolve();
     TestSilentRebaseContinuity();
     TestSegmentHistoryDepth();

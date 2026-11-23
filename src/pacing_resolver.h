@@ -22,11 +22,12 @@
 
 // User key `pacing_preference`: one setting with three positions that trade latency for even frames in the
 // queue-based pacer (64-bit DirectX 12). INI text: latency | balanced | smooth (default balanced, today's
-// behaviour). PacingPipeline_ResolvePreference turns the position into the queue law's rank and hold share.
+// behaviour). PacingPipeline_ResolvePreference turns the position into the queue law's rank, the hold share and the
+// FG input wait's extra lead.
 enum class PacingPreference : uint8_t {
     Latency = 0,  // the queue law regulates a smaller margin (rank kPacingPreferenceLatencyRank): less work waits for the GPU
     Balanced = 1, // the defaults: rank kPacingUnifiedQueueRankDefault, hold share kPacingUnifiedHoldShareDefault
-    Smooth = 2,   // holds without a cap: hold share kPacingPreferenceSmoothHoldShare (acts only with frame generation)
+    Smooth = 2,   // with frame generation: holds without a cap (hold share kPacingPreferenceSmoothHoldShare) and more lead at a cap (kPacingPreferenceSmoothLeadExtraUs)
     Count
 };
 
@@ -102,6 +103,21 @@ constexpr bool kPacingGpuWaitStartLimitDefault = true;
 // for the game's render thread (the FG input wait always does). False keeps that wait in the samples, the developer's
 // off switch.
 constexpr bool kPacingLeadQueueCorrectionDefault = true;
+// Developer key fg_late_spacing_slack (default 100; cadence_grid.h, CadenceGridFloorOptions): the slack of the FG
+// input wait's output spacing floor as a share of the displayed interval, 1/this. A frame behind a late one is held
+// to the spacing, and the cadence gives the lateness back by the slack a frame; that standing delay is itself lead,
+// so fewer frames are late (2.3% to 1.0 to 1.6%). Measured at a reachable cap with frame generation 2x and hardware
+// flip metering against the earlier eighth (0), record N.211: Phantom Blade Zero at 104, 1% low +2.9 fps, changes of
+// the displayed interval over 4 ms 9.7 to 3.2 per 1000, PC latency +1.8 ms; Gears at 90, +1.9 fps, 9.8 to 5.6,
+// +1.0 ms; the frame rate unchanged. 400 gave +4.2 and +2.9 fps for +2.6 and +3.1 ms; 25 +2.9 and +1.4 for +0.6
+// and +0.1. 0 keeps the eighth (250 us at least).
+constexpr int kPacingFgLateSpacingSlackDefault = 100;
+// Developer key fg_lead_extra_us (default 0, at most kPacingFgLeadExtraMaxUs): extra allowance, in µs, of the FG
+// input wait's lead. Every frame starts that much earlier against its output target, so fewer finish behind it, and
+// a capped game's PC latency rises by the same amount. PacingPipeline_Resolve adds it to the snapshot's allowance on
+// the FG input wait rung only (no other rung's lead changes); the Smooth position sets it (below).
+constexpr int kPacingFgLeadExtraDefaultUs = 0;
+constexpr int kPacingFgLeadExtraMaxUs = 4000;
 
 // ── Constants of the removed pacing settings ──
 // Each fixes the value of a setting that no longer exists. Under the unified pacer it is what
@@ -115,23 +131,46 @@ constexpr bool kPacingLeadSpikeFloor = true;                                    
 // The pacing preference's levers (see PacingPipeline_ResolvePreference).
 constexpr int kPacingPreferenceLatencyRank = 4;
 constexpr double kPacingPreferenceSmoothHoldShare = 1.0 / 32.0;
+// The Smooth position's second lever (Config_ApplyPacingPipeline; the developer key fg_late_spacing_commanded turns the
+// same thing on in any position): the FG input wait's output spacing floor keeps the commanded interval, so the frames
+// the hold share holds while the GPU sets the pace are spaced as well. Measured on top of the share with frame
+// generation 2x and hardware flip metering, no cap, record N.211: Gears 1% low +3.7 fps, hitches 23.5 to 17.0 a
+// minute, displayed change 0.47 to 0.33 ms, for 1.2% of the frame rate and 1.9 ms; Phantom Blade Zero hitches 46.7
+// to 38.6, 1% low +0.8, the change level, for 0.8% and 0.9 ms. At a reachable cap it acts only in the moments the
+// GPU binds (Gears at 90: +0.8 ms, the lows level).
+constexpr bool kPacingPreferenceSmoothFloorCommanded = true;
+
+// The Smooth position's third lever (PacingPipeline_ResolvePreference; the developer key fg_lead_extra_us sets the
+// same in any position): extra lead for the FG input wait, the slack a frame's CPU side gets before its output
+// target (the frames late at a cap are late on the game's CPU side, record N.211 finding 1241). Owner, 2026-11-23:
+// one to two milliseconds are acceptable in Smooth where the gain is significant. Measured under Smooth with frame
+// generation 2x and hardware flip metering, three rounds a game (finding 1244): at a reachable cap 1000 gave
+// Phantom Blade Zero at 104 1% low +1.1 ± 0.4 fps, hitches 8.6 to 7.1 a minute, displayed change 0.28 to 0.24 ms,
+// late frames 1.3 to 1.2%, for +1.4 ± 0.7 ms of PC latency; Gears at 90 1% low +2.2 ± 0.9 fps, hitches 15.7 to 11.3,
+// for +0.25 ± 0.07 ms. 2000 gave no more (+0.7 ± 0.6 and +1.1 ± 1.3 fps) for +2.5 and +0.6 ms. With no cap 2000
+// changed nothing in either game (frame rate, lows, latency all inside the noise).
+constexpr int kPacingPreferenceSmoothLeadExtraUs = 1000;
 
 struct PacingPreferenceResolution {
     int queue_rank;
     double hold_share;
+    int lead_extra_us;
 };
 
-// The queue law's rank and hold share the pipeline carries. A developer key that differs from its own default
-// decides its own value whatever the preference; a developer key at its default inherits the preference. The two
-// levers are independent: Latency changes only the rank, Smooth only the share, Balanced neither.
+// The queue law's rank, the hold share and the FG input wait's extra lead the pipeline carries. A developer key that
+// differs from its own default decides its own value whatever the preference; a developer key at its default inherits
+// the preference. The levers are independent: Latency changes only the rank, Smooth the share and the extra lead,
+// Balanced none.
 constexpr PacingPreferenceResolution PacingPipeline_ResolvePreference(PacingPreference preference,
-    int developer_rank, double developer_hold_share) noexcept
+    int developer_rank, double developer_hold_share, int developer_lead_extra_us) noexcept
 {
-    PacingPreferenceResolution resolved{ developer_rank, developer_hold_share };
+    PacingPreferenceResolution resolved{ developer_rank, developer_hold_share, developer_lead_extra_us };
     if (preference == PacingPreference::Latency && developer_rank == kPacingUnifiedQueueRankDefault)
         resolved.queue_rank = kPacingPreferenceLatencyRank;
     if (preference == PacingPreference::Smooth && developer_hold_share == kPacingUnifiedHoldShareDefault)
         resolved.hold_share = kPacingPreferenceSmoothHoldShare;
+    if (preference == PacingPreference::Smooth && developer_lead_extra_us == kPacingFgLeadExtraDefaultUs)
+        resolved.lead_extra_us = kPacingPreferenceSmoothLeadExtraUs;
     return resolved;
 }
 
@@ -208,6 +247,9 @@ struct PacingPipelineConfig {
     // clamps it and forces 0 on Win32.
     int unified_queue_margin_end = kPacingUnifiedQueueMarginEndDefault;
     int unified_queue_allow_us = kPacingUnifiedQueueAllowDefaultUs;
+    // Key fg_lead_extra_us [0, kPacingFgLeadExtraMaxUs] µs (developer; the effective value, so the Smooth position's
+    // lever too): PacingPipeline_Resolve adds it to the allowance of the FG input wait rung's lead. ClampConfig clamps.
+    int fg_lead_extra_us = kPacingFgLeadExtraDefaultUs;
 };
 
 // ── Inputs ──
@@ -263,6 +305,8 @@ struct PacingPipelineSnapshot {
     PacingRung auto_rung = PacingRung::SourceOnly;
     PacingFallbackReason reason = PacingFallbackReason::Passthrough;
     double lead_quantile = 0.99; // q of the lead controller: L = Q_q(X) + allowance (lead_coverage, default 99)
+    // The lead controller's allowance: L = Q_q(X) + allowance. The base on every rung; the FG input wait rung adds
+    // the configuration's fg_lead_extra_us.
     double allowance_us = 500.0; // defaults: On, so the initial snapshot equals default passthrough
     bool gpu_probes = true;
     bool observe_fg_inputs = false; // unqualified DX12 NvAPI route: keep collecting handoff evidence

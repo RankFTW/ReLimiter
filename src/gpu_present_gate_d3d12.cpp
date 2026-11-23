@@ -68,9 +68,11 @@ struct Ticket {
     // fg_late_spacing: T(n) without the spacing floor at the decision (0 =
     // switch off). At T(n) the worker checks once whether the game's render
     // thread has left this frame's Present; while it has not, no floor holds
-    // the frame past T(n) (floor_blocked).
+    // the frame past T(n) (floor_blocked). floor_passed: the late-pass floor
+    // ran ahead of the Signal's time and moved nothing, so it is not repeated
+    // in front of the Signal.
     int64_t floor_base_qpc=0;
-    bool floor_checked=false,floor_blocked=false;
+    bool floor_checked=false,floor_blocked=false,floor_passed=false;
     uint64_t fg_epoch=0,fg_binding=0;
     GpuTimestampSlot* post_slot=nullptr;
     GpuReadinessSample post_sample{};
@@ -601,6 +603,19 @@ void DrainFgReadback(Queue& queue,int64_t* next,bool before_signal) noexcept {
         measurement.state.store(TicketState::Free,std::memory_order_release);
     }
 }
+// The FG input wait's keys of the spacing floor (instrumentation_state.h). They act where hardware flip metering
+// spaces the flips: the driver accepted a batch of two or more frames in the last 500 ms
+// (g_flip_metering_accepted_qpc, the test the telemetry uses). Where DLSS-G presents from its own thread the flip
+// gate keeps the spacing at the flips themselves, and the floor in front of it keeps the earlier eighth and the
+// display-side interval: measured there the hundredth bought nothing and cost latency (Phantom Blade Zero at a cap
+// of 104, 2026-11-23, three rounds: 1% low -2.0 +- 2.3 fps, displayed change 0.250 to 0.263 ms, PC latency
+// +0.8 +- 0.6 ms).
+CadenceGridFloorOptions FgFloorOptions() noexcept {
+    const int64_t accepted=g_flip_metering_accepted_qpc.load(std::memory_order_relaxed);
+    if(accepted<=0 || Qpc()-accepted>frequency/2)return {};
+    return {g_fg_late_spacing_slack.load(std::memory_order_relaxed),
+        g_fg_late_spacing_commanded.load(std::memory_order_relaxed)};
+}
 // fg_late_spacing, when an FG input's Signal is due: read back the FG inputs
 // whose GPU work has finished, so a previous frame that reached its wait
 // after its Signal is recorded where it passed, and resolve the output
@@ -611,29 +626,31 @@ void DrainFgReadback(Queue& queue,int64_t* next,bool before_signal) noexcept {
 // plan's lead limit (Ticket::lead_limit_qpc, as Decide; never below the nominal
 // target), and only once the input callback has recorded this frame's output
 // (it arms the wait first), so the raised record is the one the next frame's
-// floor reads.
+// floor reads. Returns whether the floor was resolved (moved or not): false
+// while that record is not there yet or no grid could be read, so the worker
+// tries again instead of taking the frame's floor as settled.
 bool fg_late_floor_logged=false;
-void FloorAfterLatePass(Queue& queue,Ticket& ticket,int64_t* next) noexcept {
+bool FloorAfterLatePass(Queue& queue,Ticket& ticket,int64_t* next) noexcept {
     const auto generation=ticket.key.controller_generation;
     const auto index=ticket.trace.grid_index;
     int64_t recorded=0;
-    if(!g_cadence_output_tracker.Find(generation,index,&recorded))return;
+    if(!g_cadence_output_tracker.Find(generation,index,&recorded))return false;
     DrainFgReadback(queue,next,true);
     CadenceGridSnapshot snapshot;
     int64_t target=0;
     const bool key=PacingPipeline_Unified();
     if(!g_cadence_grid_publication.Read(&snapshot) ||
         !CadenceGrid_ResolveOutputTarget(snapshot,generation,index,g_cadence_output_tracker,&target,nullptr,
-            ticket.fg_divisor,key,key?ticket.hold_advance_us:0.0))return;
+            ticket.fg_divisor,key,key?ticket.hold_advance_us:0.0,FgFloorOptions()))return false;
     if(ticket.lead_limit_qpc>0 && target>ticket.lead_limit_qpc) {
         int64_t nominal=0;
         CadenceGrid_TargetOf(snapshot,generation,index,&nominal);
         target=(std::max)(ticket.lead_limit_qpc,nominal);
     }
-    if(target<=ticket.trace.target_qpc)return;
+    if(target<=ticket.trace.target_qpc)return true;
     const double interval_us=ticket.trace.interval_qpc>0
         ?static_cast<double>(ticket.trace.interval_qpc)*1e6/static_cast<double>(frequency):0.0;
-    if(target-Qpc()>GpuPresent_HorizonTicks(interval_us,frequency))return;
+    if(target-Qpc()>GpuPresent_HorizonTicks(interval_us,frequency))return true;
     if(!fg_late_floor_logged) {
         fg_late_floor_logged=true;
         LOG_INFO("GPU Present gate: FG late-frame spacing moved a Signal %.2f ms later (the previous real frame passed its wait late)",
@@ -642,6 +659,7 @@ void FloorAfterLatePass(Queue& queue,Ticket& ticket,int64_t* next) noexcept {
     ticket.trace.phase_adjust_qpc+=target-ticket.trace.target_qpc;
     ticket.trace.target_qpc=target;
     g_cadence_output_tracker.RecordLater(generation,index,target);
+    return true;
 }
 // fg_late_spacing, once at the frame's grid target T(n): in Streamline's
 // cycle a hold past T(n) while the game's render thread is still inside this
@@ -681,12 +699,28 @@ int64_t Service() noexcept {
             const auto state=ticket.state.load(std::memory_order_acquire);
             if(state==TicketState::Armed || state==TicketState::Submitted) {
                 const auto now=Qpc();const bool current=Current(ticket) && !queue.retired.load(std::memory_order_acquire) && !failed.load();
-                // fg_late_spacing: the render-thread check at T(n), then the
-                // late-pass floor when the (possibly moved) Signal is due.
+                // fg_late_spacing: the render-thread check at T(n), and the
+                // late-pass floor just ahead of the (possibly moved) Signal's
+                // time: inside the worker's final spin (two of its 50 us
+                // chunks), so the Signal is issued at its time and not behind
+                // the pass's readback and resolution (with the pass in front of
+                // it the Signal was 14 us late at the median and 34 us at the
+                // 99th percentile, 2026-11-23). A pass that moved the Signal
+                // runs again ahead of the new time, and so does one that could
+                // not resolve yet (the ticket is armed before the input
+                // callback records its output); a worker that wakes past the
+                // time runs it there, as before. The price: a previous frame
+                // whose late pass is read back inside those 100 us is seen by
+                // the next frame's pass, not by this one's.
                 const bool spacing=!ticket.signalled && current && ticket.fg && ticket.floor_base_qpc>0 &&
                     kPacingFgLateSpacing;
                 if(spacing && !ticket.floor_checked && now>=ticket.floor_base_qpc)CheckRenderThread(ticket,now);
-                if(spacing && !ticket.floor_blocked && now>=ticket.trace.target_qpc)FloorAfterLatePass(queue,ticket,&next);
+                if(spacing && !ticket.floor_blocked && !ticket.floor_passed &&
+                    now>=ticket.trace.target_qpc-frequency/10000) {
+                    const auto before=ticket.trace.target_qpc;
+                    const bool resolved=FloorAfterLatePass(queue,ticket,&next);
+                    ticket.floor_passed=resolved && ticket.trace.target_qpc==before;
+                }
                 if(!ticket.signalled && (!current || now>=ticket.trace.target_qpc)) {
                     ticket.trace.worker_wake_qpc=worker_wake_qpc;
                     ticket.trace.worker_service_qpc=now;
@@ -1002,7 +1036,7 @@ bool Enqueue(const EnqueueRequest& request,GpuPresentTrace* trace) noexcept {
     ticket.native_swapchain=span->native_swapchain;ticket.source=context.source_frame;
     ticket.key=request.key;
     ticket.fg=request.fg;ticket.fg_multiplier=request.fg_multiplier;ticket.fg_divisor=request.fg_divisor;
-    ticket.floor_base_qpc=request.floor_base_qpc;ticket.floor_checked=ticket.floor_blocked=false;
+    ticket.floor_base_qpc=request.floor_base_qpc;ticket.floor_checked=ticket.floor_blocked=ticket.floor_passed=false;
     ticket.fg_binding=request.fg_binding;
     ticket.hold_advance_us=request.hold_advance_us;
     ticket.lead_limit_qpc=request.lead_limit_qpc;
@@ -1126,7 +1160,7 @@ OutputDecision Decide(const PacingFramePlan& plan,int64_t now,bool displayed_sla
     if(!g_cadence_grid_publication.Read(&snapshot) ||
         !CadenceGrid_ResolveOutputTarget(snapshot,plan.key.controller_generation,plan.grid_index,
             g_cadence_output_tracker,&decision.target,&floored,displayed_slack?plan.fg_divisor:1.0,
-            key,key?plan.hold_advance_us:0.0)) {
+            key,key?plan.hold_advance_us:0.0,displayed_slack?FgFloorOptions():CadenceGridFloorOptions{})) {
         decision.status=PacingPlanStatus::Stale;decision.gate=GpuPresentStatus::PlanStale;decision.target=0;
         return decision;
     }

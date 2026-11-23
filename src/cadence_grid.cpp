@@ -363,7 +363,8 @@ bool ResolveOutputTargetImpl(
     int64_t* target_qpc,
     bool* floored,
     double display_divisor,
-    bool display_floor) noexcept
+    bool display_floor,
+    CadenceGridFloorOptions options) noexcept
 {
     if (floored != nullptr) *floored = false;
     int64_t target = 0;
@@ -387,15 +388,23 @@ bool ResolveOutputTargetImpl(
     // grid and the nominal target keep the commanded I(n): a hold may delay the next frame's
     // GPU work only while the GPU has slack, so the floor must not space outputs wider than the
     // display-side interval when the hardware term binds.
+    // options (the FG input wait's developer keys, measured against that rule): commanded_interval
+    // floors at the commanded I all the same, and slack_divisor > 0 replaces the slack.
     const CadenceGridSegment& segment = *SegmentFor(snapshot, grid_index);
-    const double interval_ticks = display_floor && segment.floor_interval_ticks > 0.0
-        ? segment.floor_interval_ticks
-        : segment.interval_ticks;
+    const double interval_ticks =
+        display_floor && !options.commanded_interval && segment.floor_interval_ticks > 0.0
+            ? segment.floor_interval_ticks
+            : segment.interval_ticks;
     const double displayed_ticks = std::isfinite(display_divisor) && display_divisor > 1.0
         ? interval_ticks / display_divisor
         : interval_ticks;
-    const int64_t slack_ticks =
-        CadenceGrid_LateToleranceTicks(displayed_ticks, snapshot.qpc_frequency) / 2;
+    const int64_t tolerance_ticks = CadenceGrid_LateToleranceTicks(displayed_ticks, snapshot.qpc_frequency);
+    // A key's slack is never above the late tolerance (so a divisor below 4 gives the tolerance itself); the
+    // quotient is capped before the cast.
+    const int64_t slack_ticks = options.slack_divisor > 0
+        ? (std::min)(tolerance_ticks, static_cast<int64_t>(std::isfinite(displayed_ticks) && displayed_ticks > 0.0
+            ? (std::min)(displayed_ticks / options.slack_divisor, kMaximumSpanTicks) : 0.0))
+        : tolerance_ticks / 2;
     ExactQpc floor_exact{};
     if (previous_output_qpc > kMaximumQpc ||
         !MakeExact(previous_output_qpc,
@@ -421,10 +430,11 @@ bool CadenceGrid_ResolveOutputTarget(
     bool* floored,
     double display_divisor,
     bool display_floor,
-    double advance_us) noexcept
+    double advance_us,
+    CadenceGridFloorOptions options) noexcept
 {
     if (!ResolveOutputTargetImpl(snapshot, controller_generation, grid_index, tracker, target_qpc,
-            floored, display_divisor, display_floor)) {
+            floored, display_divisor, display_floor, options)) {
         return false;
     }
     // Hold credit (unified owner): a debt is repaid by releasing the frame earlier by the

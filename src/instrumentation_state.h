@@ -44,6 +44,18 @@ inline std::atomic<bool> g_gpu_wait_late_guard{false};
 // at each plan. Its own initial value stays false as the present-first switch's does: nothing is limited before
 // the configuration is published.
 inline std::atomic<bool> g_gpu_wait_start_limit{false};
+// Developer keys of the FG input wait's output spacing floor (cadence_grid.h, CadenceGridFloorOptions).
+// fg_late_spacing_slack: the divisor of the displayed interval that gives the floor's slack (default 100,
+// kPacingFgLateSpacingSlackDefault), 0 for the earlier eighth. fg_late_spacing_commanded (default off): the floor's
+// interval is the commanded one where it is the display-side one. Published by Config_ApplyPacingPipeline; read by
+// the executor at each resolution of an FG input's target. Their own initial values are the earlier floor, as the
+// neighbours' are off: nothing changes before the configuration is published.
+inline std::atomic<int> g_fg_late_spacing_slack{0};
+inline std::atomic<bool> g_fg_late_spacing_commanded{false};
+// Developer keys for Hook_SetFlipConfig: scale DLSS-G's batch time (percent) or replace the frames per batch.
+// Config_ApplyPacingPipeline publishes both; zero leaves the corresponding driver input unchanged.
+inline std::atomic<int> g_fg_flip_batch_percent{0};
+inline std::atomic<int> g_fg_flip_batch_frames{0};
 // Developer key lead_queue_correction (default on, kPacingLeadQueueCorrectionDefault; lead_controller.h, the game's
 // simulation → render queue): the GPU queue wait's lead samples of frames planned on present-first ordering leave
 // out the time a finished frame waited for the game's render thread. Published by Config_ApplyPacingPipeline; read

@@ -2362,11 +2362,13 @@ static NvAPI_Status __cdecl Hook_SetAsyncFrameMarker(IUnknown* queue, NV_ASYNC_F
 }
 
 #ifdef _WIN64
-// ── Hook: SetFlipConfig — pass-through observation ──
+// ── Hook: SetFlipConfig — hardware flip metering ──
 // DLSS Frame Generation calls NvAPI_D3D12_SetFlipConfig before the first Present
 // of each batch so the display engine spaces that batch's flips (hardware flip
-// metering). The hook never alters the call or its result. It logs the first
-// configuration and each change of the batch size, the presented frames, the
+// metering). Only the developer keys fg_flip_batch_percent and fg_flip_batch_frames
+// change the call: they scale the batch time or replace the frame count in a copy.
+// Only the driver's feedback is written back; its status is returned unchanged.
+// The hook logs the first effective configuration and each change of the batch size, the presented frames, the
 // driver's status and its feedback (not the batch time, which follows the frame
 // rate), at most kFlipConfigLogLimit times, so a log shows whether metering was
 // asked for and what the driver answered.
@@ -2391,6 +2393,11 @@ static bool SafeReadFlipConfig(const NV_FLIP_CONFIG* config, NV_FLIP_CONFIG* out
     __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+static bool SafeWriteFlipFeedback(NV_FLIP_CONFIG* config, NvU32 mask) noexcept {
+    __try { config->flipConfigFeedbackMask = mask; return true; }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 static const char* FlipConfigFeedbackText(NvU32 mask) noexcept {
     switch (mask) {
     case 0: return "ok";
@@ -2403,14 +2410,33 @@ static const char* FlipConfigFeedbackText(NvU32 mask) noexcept {
 
 static NvAPI_Status __cdecl Hook_SetFlipConfig(IUnknown* queue, UINT source, NV_FLIP_CONFIG* config) {
     RuntimeCallbackGuard callback;
-    // The call's time for the pacing CSV (flip_config_qpc), read before the
-    // driver sees it; nothing of the call changes.
+    // The call's time for the pacing CSV (flip_config_qpc), read before the driver sees it.
     LARGE_INTEGER call_qpc{};
     QueryPerformanceCounter(&call_qpc);
-    const NvAPI_Status result = SafeInvokeSetFlipConfig(queue, source, config);
-    const uint64_t call = s_flip_config_calls.fetch_add(1, std::memory_order_relaxed) + 1;
-    NV_FLIP_CONFIG seen{};
-    if (callback.IsStopping() || !config || !SafeReadFlipConfig(config, &seen)) return result;
+    const int percent = g_fg_flip_batch_percent.load(std::memory_order_relaxed);
+    const int frames = g_fg_flip_batch_frames.load(std::memory_order_relaxed);
+    uint64_t call;
+    const auto invoke = [&](NV_FLIP_CONFIG* batch) {
+        const NvAPI_Status status = SafeInvokeSetFlipConfig(queue, source, batch);
+        call = s_flip_config_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+        return status;
+    };
+    NV_FLIP_CONFIG seen;
+    NvAPI_Status result;
+    // Do not give a future driver a short stack copy when the version word advertises a larger structure. The batch
+    // time is "<= 0 if unknown" (nvapi.h): only a known one is scaled; the frame count is replaced either way.
+    if ((percent | frames) != 0 && !callback.IsStopping() && config && SafeReadFlipConfig(config, &seen) &&
+        (seen.version >> 16) >= 2 && (seen.version & 0xffffu) == sizeof(seen) &&
+        seen.nFramesPerBatch >= 2 && (frames != 0 || seen.timePerBatchMs > 0.0f)) {
+        if (percent != 0 && seen.timePerBatchMs > 0.0f) seen.timePerBatchMs *= static_cast<float>(percent) / 100.0f;
+        if (frames != 0) seen.nFramesPerBatch = static_cast<NvU32>(frames);
+        result = invoke(&seen);
+        SafeWriteFlipFeedback(config, seen.flipConfigFeedbackMask);
+        if (callback.IsStopping()) return result;
+    } else {
+        result = invoke(config);
+        if (callback.IsStopping() || !config || !SafeReadFlipConfig(config, &seen)) return result;
+    }
     const NvU32 struct_version = seen.version >> 16;
     const bool v2 = struct_version >= 2;
     // The newest call that enabled metering, with its batch time in µs (0 when

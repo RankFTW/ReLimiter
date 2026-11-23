@@ -1004,6 +1004,103 @@ void TestExecutor() {
         const auto epoch=PlanKey(52).producer_epoch;
         CHECK(RenderHandoff_LeftPresent(domain,epoch,51) && RenderHandoff_LeftPresent(domain,epoch,52));
         CHECK(!RenderHandoff_LeftPresent(domain,epoch,53) && !RenderHandoff_LeftPresent(domain,epoch+1,52));
+        // The late-pass floor is resolved ahead of the Signal's time, not at it. The frame before passed its wait
+        // 4,000 ticks late; this frame's wait (the render thread has left, target T(n)) has its Signal moved by the
+        // floor when the worker runs 100 us ahead of T(n), so at the moved time only the Signal is left to issue.
+        // The floor's slack key (fg_late_spacing_slack) counts only where hardware flip metering is at work, that is
+        // while the driver accepted a metered batch in the last 500 ms: there the frame is held closer to the spacing
+        // (a hundredth of the displayed interval); without metering, or with a stale acceptance, the earlier eighth.
+        struct FloorCase { uint64_t index; int slack_key; int64_t accepted_before; };
+        int64_t floor_offsets[3]={};size_t floor_case=0;
+        for(const FloorCase& test:{FloorCase{54,0,0},FloorCase{56,100,5000},FloorCase{58,100,600000}}) {
+            const uint64_t index=test.index;
+            const bool metered=test.accepted_before>0 && test.accepted_before<500000;
+            g_fg_late_spacing_slack=test.slack_key;
+            g_flip_metering_accepted_qpc=test.accepted_before?GridTarget(index)-test.accepted_before:0;
+            PublishRung(PacingRung::GpuQueueWait);
+            fake_clock=GridTarget(index)-5000;heartbeat=fake_clock;
+            PublishPlan(index,index,PacingRung::GpuQueueWait);
+            outcome=ExecuteFrame(index);
+            CHECK(outcome.execution==GpuPresentExecution::WaitCommitted);
+            ExpectStage(index,index,PacingStageEventKind::PresentCall,fake_clock);
+            Ticket* held=nullptr;
+            for(auto& ticket:queue.tickets)if(ticket.trace.ticket==outcome.trace.ticket)held=&ticket;
+            CHECK(held!=nullptr);
+            fg_context=true;PublishRung(PacingRung::FgInputWait);
+            held->fg=true;held->fg_multiplier=g_fg_multiplier.load();held->fg_epoch=fg_epoch.load();held->fg_binding=0;
+            held->fg_divisor=2.0;held->floor_base_qpc=GridTarget(index);
+            held->floor_checked=held->floor_blocked=held->floor_passed=false;
+            held->trace.target_qpc=GridTarget(index);
+            CHECK(g_cadence_output_tracker.Record(generation_now,index,GridTarget(index)));
+            CHECK(g_cadence_output_tracker.Record(generation_now,index-1,GridTarget(index-1)+4000));
+            RenderHandoff_PublishPresentEnd(domain,epoch,index,GridTarget(index));
+            CadenceGridSnapshot snapshot;int64_t moved=0;
+            CHECK(g_cadence_grid_publication.Read(&snapshot) && CadenceGrid_ResolveOutputTarget(snapshot,generation_now,
+                index,g_cadence_output_tracker,&moved,nullptr,2.0,PacingPipeline_Unified(),0.0,
+                CadenceGridFloorOptions{metered?test.slack_key:0,false}));
+            CHECK(moved>GridTarget(index)+1000);
+            floor_offsets[floor_case++]=moved-GridTarget(index);
+            fake_clock=GridTarget(index)-1000;heartbeat=fake_clock;
+            Service();
+            CHECK(held->trace.target_qpc==GridTarget(index)); // a millisecond ahead: the pass has not run
+            fake_clock=GridTarget(index)-100;heartbeat=fake_clock;
+            Service();
+            CHECK(!held->signalled && held->trace.target_qpc==moved);
+            fake_clock=GridTarget(index);heartbeat=fake_clock;
+            CHECK(Service()==moved && !held->signalled);
+            fake_clock=moved;heartbeat=fake_clock;Service();
+            CHECK(held->signalled);
+            PacingGateRecord gate;
+            CHECK(NextSignalled(GpuPresentStatus::Released,&gate) && gate.signal_before_qpc==moved);
+            ExpectRecorded(index,moved);
+            ExpectStage(index,index,PacingStageEventKind::OutputRelease,moved,PacingPlanStatus::Held,PacingRung::FgInputWait);
+            ExpectNoStage();
+            fg_context=false;
+        }
+        g_fg_late_spacing_slack=0;g_flip_metering_accepted_qpc=0;
+        CHECK(floor_offsets[1]>floor_offsets[0] && floor_offsets[2]==floor_offsets[0]);
+        // A worker that reaches the last 100 us before the input callback has recorded the frame's own output (the
+        // wait is armed first) has not resolved the floor: it tries again, and the floor moves the Signal once the
+        // record is there.
+        {
+            constexpr uint64_t index=60;
+            PublishRung(PacingRung::GpuQueueWait);
+            fake_clock=GridTarget(index)-5000;heartbeat=fake_clock;
+            PublishPlan(index,index,PacingRung::GpuQueueWait);
+            outcome=ExecuteFrame(index);
+            CHECK(outcome.execution==GpuPresentExecution::WaitCommitted);
+            ExpectStage(index,index,PacingStageEventKind::PresentCall,fake_clock);
+            Ticket* held=nullptr;
+            for(auto& ticket:queue.tickets)if(ticket.trace.ticket==outcome.trace.ticket)held=&ticket;
+            CHECK(held!=nullptr);
+            fg_context=true;PublishRung(PacingRung::FgInputWait);
+            held->fg=true;held->fg_multiplier=g_fg_multiplier.load();held->fg_epoch=fg_epoch.load();held->fg_binding=0;
+            held->fg_divisor=2.0;held->floor_base_qpc=GridTarget(index);
+            held->floor_checked=held->floor_blocked=held->floor_passed=false;
+            held->trace.target_qpc=GridTarget(index);
+            CHECK(g_cadence_output_tracker.Record(generation_now,index-1,GridTarget(index-1)+4000));
+            // The frame's own record is not there yet: its slot holds another index.
+            CHECK(g_cadence_output_tracker.Record(generation_now,index+CadenceGridOutputTracker::kSlotCount,GridTarget(index)));
+            int64_t unrecorded=0;
+            CHECK(!g_cadence_output_tracker.Find(generation_now,index,&unrecorded));
+            RenderHandoff_PublishPresentEnd(domain,epoch,index,GridTarget(index));
+            fake_clock=GridTarget(index)-100;heartbeat=fake_clock;
+            Service();
+            CHECK(!held->signalled && held->trace.target_qpc==GridTarget(index));
+            CHECK(g_cadence_output_tracker.Record(generation_now,index,GridTarget(index)));
+            fake_clock=GridTarget(index)-50;heartbeat=fake_clock;
+            Service();
+            CHECK(!held->signalled && held->trace.target_qpc>GridTarget(index)+1000);
+            const auto moved=held->trace.target_qpc;
+            fake_clock=moved;heartbeat=fake_clock;Service();
+            CHECK(held->signalled);
+            PacingGateRecord gate;
+            CHECK(NextSignalled(GpuPresentStatus::Released,&gate) && gate.signal_before_qpc==moved);
+            ExpectRecorded(index,moved);
+            ExpectStage(index,index,PacingStageEventKind::OutputRelease,moved,PacingPlanStatus::Held,PacingRung::FgInputWait);
+            ExpectNoStage();
+            fg_context=false;
+        }
     }
 
     // A CPU Signal that fails keeps its obligation (retried; the Wait stays undischarged). A fence that reports

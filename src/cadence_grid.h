@@ -209,6 +209,14 @@ extern CadenceGridOutputTracker g_cadence_output_tracker;
 // When snapped, a floored target moves to the first edge at or after the
 // floor. *floored (optional) is true when the floor won. False (Stale)
 // exactly when CadenceGrid_TargetOf is false.
+// options (the FG input wait's developer keys; the default changes nothing):
+// slack_divisor > 0 makes the slack (I / D) / slack_divisor, with no least
+// value; commanded_interval keeps the floor's I the segment's commanded
+// interval where display_floor would take the display-side one.
+struct CadenceGridFloorOptions {
+    int slack_divisor = 0;
+    bool commanded_interval = false;
+};
 bool CadenceGrid_ResolveOutputTarget(
     const CadenceGridSnapshot& snapshot,
     uint32_t controller_generation,
@@ -218,7 +226,8 @@ bool CadenceGrid_ResolveOutputTarget(
     bool* floored,
     double display_divisor = 1.0,
     bool display_floor = false,
-    double advance_us = 0.0) noexcept;
+    double advance_us = 0.0,
+    CadenceGridFloorOptions options = {}) noexcept;
 
 // ── Owner ──
 

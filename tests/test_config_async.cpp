@@ -454,8 +454,9 @@ void CheckPipelineMatchesConfig() {
     // Keys unified_hold_share and unified_queue_rank reach the pipeline as the effective pair the pacing preference resolves
     // with them (g_config keeps the raw values); the hold share is 64-bit only, forced to the default (0) on Win32.
     const PacingPreferenceResolution effective = PacingPipeline_ResolvePreference(
-        g_config.pacing_preference, g_config.unified_queue_rank, g_config.unified_hold_share);
+        g_config.pacing_preference, g_config.unified_queue_rank, g_config.unified_hold_share, g_config.fg_lead_extra_us);
     CHECK(pipeline.unified_hold_share == (is64 ? effective.hold_share : 0.0));
+    CHECK(pipeline.fg_lead_extra_us == effective.lead_extra_us);
     // The queue law forces the probe on and feeds the law while the unified pacer owns pacing (64-bit only);
     // the probe key is a 64-bit measurement; the user's values stay in g_config.
     const bool law_in_use = g_config.unified_queue_law && pipeline.unified;
@@ -1303,6 +1304,12 @@ void TestPacingPreference() {
         CHECK(pipeline.unified_hold_share ==
             (test.expected == PacingPreference::Smooth && sizeof(void*) == 8 ? kPacingPreferenceSmoothHoldShare
                                                                               : kPacingUnifiedHoldShareDefault));
+        // Smooth's second lever (the FG input wait's floor at the commanded interval) and the floor's slack default.
+        CHECK(g_fg_late_spacing_commanded.load() == (test.expected == PacingPreference::Smooth));
+        CHECK(g_fg_late_spacing_slack.load() == kPacingFgLateSpacingSlackDefault && kPacingFgLateSpacingSlackDefault == 100);
+        // Smooth's third lever (the FG input wait's extra lead) reaches the pipeline; no other position sets it.
+        CHECK(pipeline.fg_lead_extra_us ==
+            (test.expected == PacingPreference::Smooth ? kPacingPreferenceSmoothLeadExtraUs : kPacingFgLeadExtraDefaultUs));
         CHECK(Config_DeveloperOverrides() == 0); // a user setting, not a developer override
         ReleaseStart();CHECK(OwnerShutdown());
     }
@@ -1344,6 +1351,20 @@ void TestPacingPreference() {
     CHECK(Config_SetLiveKey("pacing_preference", "balanced", error, sizeof(error)));
     CHECK(PacingPipeline_GetConfig().unified_queue_rank == kPacingUnifiedQueueRankDefault);
     CheckPipelineMatchesConfig();
+    // Back at balanced the floor keeps the display-side interval; the developer key turns the commanded one on there,
+    // and the slack key reaches the executor's value (0: the earlier eighth).
+    CHECK(!g_fg_late_spacing_commanded.load());
+    CHECK(Config_SetLiveKey("fg_late_spacing_commanded", "true", error, sizeof(error)) && g_fg_late_spacing_commanded.load());
+    CHECK(Config_SetLiveKey("fg_late_spacing_commanded", "false", error, sizeof(error)) && !g_fg_late_spacing_commanded.load());
+    CHECK(Config_SetLiveKey("fg_late_spacing_slack", "0", error, sizeof(error)) && g_fg_late_spacing_slack.load() == 0);
+    CHECK(Config_SetLiveKey("fg_late_spacing_slack", "100", error, sizeof(error)) && g_fg_late_spacing_slack.load() == 100);
+    // The extra lead's developer key reaches the pipeline, clamped, in any position, and 0 gives the position's own.
+    CHECK(Config_SetLiveKey("fg_lead_extra_us", "1500", error, sizeof(error)) && PacingPipeline_GetConfig().fg_lead_extra_us == 1500);
+    CHECK(Config_SetLiveKey("fg_lead_extra_us", "9000", error, sizeof(error)) &&
+          g_config.fg_lead_extra_us == kPacingFgLeadExtraMaxUs && PacingPipeline_GetConfig().fg_lead_extra_us == kPacingFgLeadExtraMaxUs);
+    CHECK(Config_SetLiveKey("fg_lead_extra_us", "0", error, sizeof(error)) &&
+          PacingPipeline_GetConfig().fg_lead_extra_us == kPacingFgLeadExtraDefaultUs);
+    CHECK(Config_DeveloperOverrides() == 0);
 
     // Save round trip: the preference is saved as text, the raw developer keys stay raw.
     g_config.pacing_preference = PacingPreference::Latency;

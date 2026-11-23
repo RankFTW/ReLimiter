@@ -233,6 +233,7 @@ void ValidateConfig() {
     g_config.unified_queue_upstream = Clamp(g_config.unified_queue_upstream, 0, kPacingUnifiedQueueUpstreamMax);
     g_config.unified_queue_margin_end = Clamp(g_config.unified_queue_margin_end, 0, kPacingUnifiedQueueMarginEndMax);
     g_config.unified_queue_allow_us = Clamp(g_config.unified_queue_allow_us, 0, kPacingUnifiedQueueAllowMaxUs);
+    g_config.fg_lead_extra_us = Clamp(g_config.fg_lead_extra_us, 0, kPacingFgLeadExtraMaxUs);
 
     // ── Monitor Selection ──
     g_config.selected_monitor = Clamp(g_config.selected_monitor, 0, 8);
@@ -420,6 +421,11 @@ void LoadConfig(HMODULE hModule) {
     g_config.fg_render_break_window=ReadINIInt(S,"fg_render_break_window",-1,P);
     g_config.fg_present_ahead=ReadINIInt(S,"fg_present_ahead",4,P);
     g_config.fg_flip_gate_give_back=ReadINIInt(S,"fg_flip_gate_give_back",100,P);
+    g_config.fg_late_spacing_slack=ReadINIInt(S,"fg_late_spacing_slack",kPacingFgLateSpacingSlackDefault,P);
+    g_config.fg_late_spacing_commanded=ReadINIBool(S,"fg_late_spacing_commanded",false,P);
+    g_config.fg_lead_extra_us=ReadINIInt(S,"fg_lead_extra_us",kPacingFgLeadExtraDefaultUs,P);
+    g_config.fg_flip_batch_percent=ReadINIInt(S,"fg_flip_batch_percent",0,P);
+    g_config.fg_flip_batch_frames=ReadINIInt(S,"fg_flip_batch_frames",0,P);
     g_config.unified_hold_share=ReadINIDouble(S,"unified_hold_share",kPacingUnifiedHoldShareDefault,P);
     g_config.unified_queue_law=ReadINIBool(S,"unified_queue_law",kPacingUnifiedQueueLawDefault,P);
     g_config.unified_queue_rank=ReadINIInt(S,"unified_queue_rank",kPacingUnifiedQueueRankDefault,P);
@@ -897,12 +903,14 @@ static PacingPipelineConfig PacingPipelineConfigFrom(const Config& config) {
 
 void Config_ApplyPacingPipeline() {
     PacingPipelineConfig pipeline = PacingPipelineConfigFrom(g_config);
-    // The pacing preference meets the developer keys here, once: the pipeline carries only the effective rank and hold share
-    // (g_config and the INI keep the raw values; the clamp and the 32-bit forcing run on the effective pair).
+    // The pacing preference meets the developer keys here, once: the pipeline carries only the effective rank, hold
+    // share and extra lead (g_config and the INI keep the raw values; the clamp and the 32-bit forcing run on the
+    // effective values).
     const PacingPreferenceResolution effective = PacingPipeline_ResolvePreference(
-        g_config.pacing_preference, g_config.unified_queue_rank, g_config.unified_hold_share);
+        g_config.pacing_preference, g_config.unified_queue_rank, g_config.unified_hold_share, g_config.fg_lead_extra_us);
     pipeline.unified_queue_rank = effective.queue_rank;
     pipeline.unified_hold_share = effective.hold_share;
+    pipeline.fg_lead_extra_us = effective.lead_extra_us;
     // The owner of pacing is resolved here, once: the saved test mode counts only with developer_settings, and the
     // clamp below derives the one `unified` state from it (64-bit and no test mode). The observers it gates (the
     // queue law's probe and feed) follow the same state. It is noted for the Sleep-mode reconcile BEFORE the
@@ -933,6 +941,21 @@ void Config_ApplyPacingPipeline() {
     g_fg_render_break_window.store(std::clamp(g_config.fg_render_break_window, -1, 32), std::memory_order_relaxed);
     g_fg_present_ahead.store(sizeof(void*) == 8 ? std::clamp(g_config.fg_present_ahead, 0, 4) : 0, std::memory_order_relaxed);
     g_fg_flip_gate_give_back.store(std::clamp(g_config.fg_flip_gate_give_back, 4, 1000), std::memory_order_relaxed);
+    g_fg_late_spacing_slack.store(std::clamp(g_config.fg_late_spacing_slack, 0, 1000), std::memory_order_relaxed);
+    g_fg_late_spacing_commanded.store(g_config.fg_late_spacing_commanded ||
+        (kPacingPreferenceSmoothFloorCommanded && g_config.pacing_preference == PacingPreference::Smooth),
+        std::memory_order_relaxed);
+    const int percent = g_config.fg_flip_batch_percent <= 0 ? 0 : std::clamp(g_config.fg_flip_batch_percent, 10, 400);
+    const int frames = std::clamp(g_config.fg_flip_batch_frames, 0, 8);
+    g_fg_flip_batch_percent.store(percent, std::memory_order_relaxed);
+    g_fg_flip_batch_frames.store(frames, std::memory_order_relaxed);
+    // Report effective transitions here (including turning both keys off), not on each driver's batch.
+    static std::atomic<int> last_flip_batch_keys{0};
+    const int keys = (percent << 4) | frames; // frames is 0–8
+    if (last_flip_batch_keys.exchange(keys, std::memory_order_relaxed) != keys) {
+        LOG_INFO("NvAPI: SetFlipConfig rewrite: batch time %d%% (0 = as given), frames per batch %d (0 = as given)",
+            percent, frames);
+    }
 }
 
 // ── Live keys (developer control file) ──
@@ -998,6 +1021,11 @@ constexpr Key kKeys[] = {
     {"fg_render_break_window", &SetInt<&Config::fg_render_break_window>, Publish::Pipeline},
     {"fg_present_ahead", &SetInt<&Config::fg_present_ahead>, Publish::Pipeline},
     {"fg_flip_gate_give_back", &SetInt<&Config::fg_flip_gate_give_back>, Publish::Pipeline},
+    {"fg_late_spacing_slack", &SetInt<&Config::fg_late_spacing_slack>, Publish::Pipeline},
+    {"fg_late_spacing_commanded", &SetBool<&Config::fg_late_spacing_commanded>, Publish::Pipeline},
+    {"fg_lead_extra_us", &SetInt<&Config::fg_lead_extra_us>, Publish::Pipeline},
+    {"fg_flip_batch_percent", &SetInt<&Config::fg_flip_batch_percent>, Publish::Pipeline},
+    {"fg_flip_batch_frames", &SetInt<&Config::fg_flip_batch_frames>, Publish::Pipeline},
     {"unified_queue_margin_end", &SetInt<&Config::unified_queue_margin_end>, Publish::Pipeline},
     {"unified_hold_share", &SetDouble<&Config::unified_hold_share>, Publish::Pipeline},
     {"pacing_test_mode", &SetEnum<PacingTestMode, &Config::pacing_test_mode, PacingTestMode_FromText>, Publish::Pipeline},
@@ -1156,6 +1184,10 @@ void ApplyConfig() {
         LOG_WARN("Diagnostic lead queue correction off: the GPU queue wait's lead samples keep the time a finished "
                  "frame waited for the game's render thread, and under present-first ordering that wait follows "
                  "the lead (lead_queue_correction=false; 64-bit Direct3D 12)");
+    if (g_config.fg_lead_extra_us != kPacingFgLeadExtraDefaultUs)
+        LOG_WARN("Diagnostic FG lead extra: the FG input wait's lead gets %d us more allowance, so every frame starts "
+                 "that much earlier against its output target (fg_lead_extra_us=%d; 64-bit Direct3D 12)",
+            g_config.fg_lead_extra_us, g_config.fg_lead_extra_us);
     // The frame generation ordering switches are on by default (the INI only reads them and never saves them; they
     // act only where frame generation presents from its own thread, once present-first ordering is established): a
     // line only when one is off.
