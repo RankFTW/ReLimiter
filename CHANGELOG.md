@@ -1,5 +1,12 @@
 # Changelog
 
+## 4.0.3
+
+### Frame generation
+
+- **Higher 1% lows with DLSS Frame Generation at a frame-rate cap.** Where hardware flip metering is at work, the frame after a late one is now held to its spacing instead of being let through early. In Phantom Blade Zero and Gears of War: E-Day the 1% low rose 1 to 3.5 fps for 0.4 to 1.8 ms more PC latency.
+- **Smoother now also helps at a cap the GPU can hold.** With frame generation, **Smoother** starts each frame 1 ms earlier so fewer frames arrive late: fewer hitches for up to about 1.5 ms more PC latency.
+
 ## 4.0.2
 
 ### Frame generation
