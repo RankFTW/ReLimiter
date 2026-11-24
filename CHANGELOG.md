@@ -1,5 +1,15 @@
 # Changelog
 
+## 4.0.4
+
+### Frame generation
+
+- **Fewer uneven frames with DLSS Frame Generation without hardware flip metering.** ReLimiter's flip schedule crept earlier with every frame until a flip came late, so late flips kept coming back. A frame's first flip is now placed where the frames behind it can follow. At a frame-rate cap the 1% low rose 1 to 6 fps in Phantom Blade Zero (2x, 3x, 4x) and 1.9 fps in Gears of War: E-Day, with PC latency within about 1 ms; without a cap the result varied and was never worse.
+
+### FPS limiter
+
+- **VRR Cap is automatic and the default; Off is removed.** VRR Cap now follows your display instead of saving the number found at the first launch. **Off** already held the display's VRR cap in 64-bit games, so a saved `target_fps=0` now means VRR Cap; in 32-bit games, where it ran without a cap, it now holds the VRR cap too.
+
 ## 4.0.3
 
 ### Frame generation
