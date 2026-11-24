@@ -1,5 +1,21 @@
 # Changelog
 
+## 4.1.0
+
+### Frame generation
+
+- **Compatibility fixes for FG and MFG mods such as HSF and MFG Unlocker.**
+
+### OSD and settings
+
+- **A clock on the OSD.** **Clock** in the OSD elements shows the time of day (24-hour HH:MM) as the first line. It is off by default and saved with OSD presets.
+- **A shorter FPS line with frame generation.** It reads `157 fps (52.3)`: the output rate, then the rendered rate in brackets, without the word "render".
+- **The version is shown.** At the top of the settings panel and on the second line of the log.
+
+### Building
+
+- **`build.bat` runs again.** Parentheses in four of its messages ended the script's blocks early.
+
 ## 4.0.4
 
 ### Frame generation
