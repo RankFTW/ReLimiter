@@ -5,7 +5,8 @@ PresentFrameClassification PresentAssociation_ClassifyFrame(
 {
     const bool real_evidence =
         (evidence & (PRESENT_CLASSIFICATION_EVIDENCE_PCL_SIMULATION_MARKER |
-                     PRESENT_CLASSIFICATION_EVIDENCE_PRESENTMON_APPLICATION)) != 0;
+                     PRESENT_CLASSIFICATION_EVIDENCE_PRESENTMON_APPLICATION |
+                     PRESENT_CLASSIFICATION_EVIDENCE_LAST_PRESENT_OF_FRAME)) != 0;
     const bool generated_evidence =
         (evidence & (PRESENT_CLASSIFICATION_EVIDENCE_SIMULATION_FALLBACK |
                      PRESENT_CLASSIFICATION_EVIDENCE_PRESENTMON_REPEATED |

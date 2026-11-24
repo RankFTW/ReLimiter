@@ -112,6 +112,16 @@ constexpr bool kPacingLeadQueueCorrectionDefault = true;
 // +1.0 ms; the frame rate unchanged. 400 gave +4.2 and +2.9 fps for +2.6 and +3.1 ms; 25 +2.9 and +1.4 for +0.6
 // and +0.1. 0 keeps the eighth (250 us at least).
 constexpr int kPacingFgLateSpacingSlackDefault = 100;
+// Developer keys fg_flip_gate_cover and fg_flip_gate_fit (0 off | 50 to 99): the flip gate's first flip where frame
+// generation presents without hardware flip metering (fg_flip_gate_rule.h). Cover places it on the pacer's grid at
+// what that share of the newest cycles needed for every Present's work; fit holds it where its later frames can
+// follow a step apart and shares a late cycle's lateness between two intervals. On since 2026-11-24 (the owner;
+// record N.213, findings 1261 to 1267), measured against both off: Phantom Blade Zero 3x at a cap of 135, 1% low
+// +6.5 and +4.9 fps, ReLimiter's own flips over 2 ms long 9.6 to 3.7 a minute; 2x at 90 and 4x at 160, +1.3 and
+// +5.3 fps; Gears 2x at 90, +1.9 fps and hitches 15.7 to 10.9 a minute; PC latency -0.8 to +1.2 ms. Without a cap
+// the gate's long flips fall by 40 to 45% and what PresentMon shows of it varies by session (never worse).
+constexpr int kPacingFgFlipGateCoverDefault = 95;
+constexpr int kPacingFgFlipGateFitDefault = 75;
 // Developer key fg_lead_extra_us (default 0, at most kPacingFgLeadExtraMaxUs): extra allowance, in µs, of the FG
 // input wait's lead. Every frame starts that much earlier against its output target, so fewer finish behind it, and
 // a capped game's PC latency rises by the same amount. PacingPipeline_Resolve adds it to the snapshot's allowance on
@@ -191,8 +201,19 @@ constexpr double PacingPipeline_ReportFeedbackFallbackUs(PacingTestMode mode, in
     return mode != PacingTestMode::ReflexOnly && cap_fps > 0 ? 1000000.0 / static_cast<double>(cap_fps) : 16666.667;
 }
 
-// The VRR target the planner paces at: the cap; with the cap off the unified owner paces at the VRR cap of the display
-// ceiling (`vrr_cap_fps()`, called only then), every other owner gets 0 (pass-through for minimum latency).
+// The cap the limiter runs at (g_user_target_fps) from the saved one (`target_fps`): a positive cap as it is saved; 0
+// is the automatic VRR cap, the cap of the display's ceiling while variable refresh paces (`vrr_cap_fps()`, called only
+// then) and 0 on a fixed refresh, which the scheduler paces at the refresh itself. A ceiling not known yet gives 0 too.
+template <typename VrrCapFps>
+int PacingPipeline_EffectiveTargetFps(int saved_fps, bool vrr, VrrCapFps&& vrr_cap_fps)
+{
+    if (saved_fps > 0) return saved_fps;
+    return vrr ? static_cast<int>(vrr_cap_fps()) : 0;
+}
+
+// The VRR target the planner paces at: the cap; with a cap of 0 (the automatic cap where it is not resolved: the
+// display not detected yet, Dynamic MFG) the unified owner paces at the VRR cap of the display ceiling
+// (`vrr_cap_fps()`, called only then), every other owner gets 0 (pass-through for minimum latency).
 template <typename VrrCapFps>
 int PacingPipeline_VrrTargetFps(bool unified, int target_fps, VrrCapFps&& vrr_cap_fps)
 {

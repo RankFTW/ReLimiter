@@ -28,7 +28,7 @@ The settings panel shows one plain pacing line and, under **Details**, the resol
 
 ## FPS Limiting
 
-Set a target FPS in the settings panel. **VRR Cap** automatically calculates the safe maximum for your display so you stay inside the G-Sync window without tearing. You can also pick a custom value or disable limiting entirely.
+**VRR Cap**, the default, keeps the cap at the safe maximum for your display so you stay inside the G-Sync window without tearing, and follows the display if it changes. You can also pick a custom value in the settings panel.
 
 **Background FPS** caps the frame rate when you alt-tab out, saving power and reducing heat.
 

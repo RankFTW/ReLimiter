@@ -469,7 +469,8 @@ class EventsTests(TemporaryDirectoryTest):
         path = write_csv(self.directory / "relimiter_pacing_events_Game_7_8_capture_1.csv",
                          inspector.CURRENT_PACING_EVENTS_HEADER, self.events_rows())
         events = pacing.summarize_events(path)
-        self.assertEqual(events["schema_profile"], "current-source-86")
+        self.assertEqual(events["schema_profile"], "current-source-112")
+        self.assertIsNone(events["flip_gate"])
         self.assertEqual(events["capture"]["duration_s"], 8.0)
         self.assertEqual(events["missing_event_sequences"], 1)
         changes = events["epoch_changes"]
@@ -535,6 +536,77 @@ class EventsTests(TemporaryDirectoryTest):
         self.assertTrue(any("replaced 1 metric chains" in warning for warning in report["warnings"]))
         with self.assertRaisesRegex(ValueError, "events family"):
             pacing.analyze_capture(events)
+
+    def test_flip_gate_summary(self):
+        """flip_gate rows: per place the work's duration from the later of the Present's entry and the release of
+        the flip before, the time it had, the late ones, and per held cycle the need behind the FG input target."""
+        def flip(sequence, serial, place, shown_us, **cells):
+            cells = {f"flip_{name}": value for name, value in cells.items()}
+            row = dict(sequence=str(sequence), capture_epoch="1", event_type="flip_gate",
+                       event_qpc=str(shown_us * 10), qpc_frequency=str(FREQUENCY), flip_epoch="1",
+                       flip_serial=str(serial), flip_place=str(place), flip_outputs="3", flip_plan="1",
+                       flip_cycle_us="18000.0", flip_held="1", flip_moved="0", flip_bounded="0")
+            row.update({name: str(value) for name, value in cells.items()})
+            return row
+
+        def cycle(first_sequence, serial, base_us, middle_work_us, middle_release=1, middle_ready=1):
+            # The frame's FG input target at base; generation done 3 ms later; the first flip 5 ms behind the
+            # target (its own work done 2.5 ms behind it); a step is 6 ms.
+            ticks = lambda us: us * 10
+            first = flip(first_sequence, serial, 0, base_us + 5_000, release=1, ready=1,
+                         input_target_qpc=ticks(base_us), marker_done_qpc=ticks(base_us + 3_000),
+                         release_qpc=ticks(base_us + 5_000), rule_qpc=ticks(base_us + 5_000),
+                         target_qpc=ticks(base_us + 5_000), ready_qpc=ticks(base_us + 2_500))
+            # The middle Present enters 1.5 ms before its flip's time and its work takes middle_work_us.
+            middle = flip(first_sequence + 1, serial, 1, base_us + 11_000, release=middle_release,
+                          ready=middle_ready, entered_qpc=ticks(base_us + 9_500),
+                          target_qpc=ticks(base_us + 11_000), release_qpc=ticks(base_us + 11_000),
+                          rule_qpc=ticks(max(base_us + 11_000, base_us + 9_500 + middle_work_us)),
+                          ready_qpc=ticks(base_us + 9_500 + middle_work_us))
+            # The real Present enters before the middle flip's release: its work is counted from that release.
+            real = flip(first_sequence + 2, serial, 2, base_us + 17_000, real=1, release=1, ready=1,
+                        entered_qpc=ticks(base_us + 10_800), target_qpc=ticks(base_us + 17_000),
+                        release_qpc=ticks(base_us + 17_000), rule_qpc=ticks(base_us + 17_000),
+                        ready_qpc=ticks(base_us + 11_400))
+            return [first, middle, real]
+
+        rows = [dict(sequence="", capture_epoch="1", event_type="capture_start", event_qpc="10000000",
+                     qpc_frequency=str(FREQUENCY), csv_row_drops="0", csv_event_drops="0")]
+        rows += cycle(1, 1, 1_000_000, 1_000)                                    # in time by 0.5 ms
+        rows += cycle(4, 2, 1_018_000, 2_200, middle_release=2, middle_ready=3)  # 0.7 ms late
+        # A cycle the pacer had no plan for counts in the places and gives no need.
+        unplanned = cycle(7, 3, 1_036_000, 1_200)
+        for row in unplanned:
+            row["flip_plan"] = "0"
+        rows += unplanned
+        rows.append(dict(sequence="", capture_epoch="1", event_type="capture_end", event_qpc="20000000",
+                         qpc_frequency=str(FREQUENCY), csv_row_drops="0", csv_event_drops="0"))
+        path = write_csv(self.directory / "relimiter_pacing_events_Game_7_8_capture_2.csv",
+                         inspector.CURRENT_PACING_EVENTS_HEADER, rows)
+        events = pacing.summarize_events(path)
+        gate = events["flip_gate"]
+        self.assertEqual((gate["flips"], gate["plans"]), (9, {"held": 6, "none": 3}))
+        first, middle, real = gate["places"]
+        self.assertEqual([(entry["outputs"], entry["place"], entry["flips"]) for entry in gate["places"]],
+                         [(3, 0, 3), (3, 1, 3), (3, 2, 3)])
+        self.assertEqual(first["behind_generation_us"], {"count": 3, "p50_us": 2000.0, "p90_us": 2000.0,
+                                                         "p99_us": 2000.0})
+        self.assertIsNone(first["work_us"])
+        self.assertEqual(middle["release"], {"timed": 2, "with_work": 1})
+        self.assertEqual(middle["ready"], {"before": 2, "after": 1})
+        self.assertEqual(middle["work_us"], {"count": 3, "p50_us": 1200.0, "p90_us": 1200.0, "p99_us": 1200.0})
+        self.assertEqual((middle["timed"], middle["late"]), (3, 1))
+        self.assertEqual(middle["late_us"]["p50_us"], 700.0)
+        self.assertEqual(middle["time_before_flip_us"]["p50_us"], 1500.0)
+        # The real Present entered 0.2 ms before the middle flip's release: 0.4 ms of work, not 0.6.
+        self.assertEqual(real["work_us"]["p50_us"], 400.0)
+        self.assertEqual((real["timed"], real["late"]), (3, 0))
+        # Need: the middle flip's work done less one step, behind the target: 10.5 - 6 = 4.5 ms and 11.7 - 6 = 5.7.
+        self.assertEqual(gate["cycles"], [{
+            "outputs": 3, "count": 2,
+            "need_behind_input_us": {"count": 2, "p50_us": 4500.0, "p90_us": 4500.0, "p99_us": 4500.0},
+            "first_flip_behind_input_us": {"count": 2, "p50_us": 5000.0, "p90_us": 5000.0, "p99_us": 5000.0}}])
+        self.assertIn("flip gate: 9 flips", "\n".join(pacing._events_lines({**events, "source": "explicit"})))
 
 
 class PcLatencyTests(TemporaryDirectoryTest):
@@ -680,10 +752,11 @@ class Phase2AcceptanceTests(TemporaryDirectoryTest):
 
     def test_golden_files_use_the_phase2_schema(self):
         # The rows file stays a Phase 2 (129-column) capture, so these tests also
-        # prove the Phase 2 analysis on a historical schema; the events header is unchanged.
+        # prove the Phase 2 analysis on a historical schema; the events file has the 86-column header of the
+        # builds before the flip_gate rows.
         self.assertEqual(pacing.read_header(self.STALL_ROWS), OLD[:129])
         self.assertEqual(self.report()["input"]["schema_profile"], "historical-source-129")
-        self.assertEqual(pacing.read_header(self.STALL_EVENTS), inspector.CURRENT_PACING_EVENTS_HEADER)
+        self.assertEqual(pacing.read_header(self.STALL_EVENTS), inspector.CURRENT_PACING_EVENTS_HEADER[:86])
         self.assertEqual(self.report()["controllers"],
                          {"available": False, "reason": "the file predates the Phase 3 columns"})
 
@@ -1211,6 +1284,9 @@ class SchemaFixtureTests(unittest.TestCase):
         "feasibility_cause": pacing.FEASIBILITY_CAUSE_NAMES,
         "gpu_wait_cap_cause": pacing.GPU_WAIT_CAP_CAUSE_NAMES,
         "source_flag": pacing.SOURCE_FLAG_NAMES,
+        "flip_plan": pacing.FLIP_PLAN_NAMES,
+        "flip_release": pacing.FLIP_RELEASE_NAMES,
+        "flip_ready": pacing.FLIP_READY_NAMES,
         "timing_mode": None,  # the analyzer does not read it: no CSV column carries it
         "event_type": None,   # written as text; the analyzer matches the names (test_event_type_names)
     }
@@ -1237,7 +1313,8 @@ class SchemaFixtureTests(unittest.TestCase):
                          {value: name for value, name in SCHEMA.names("epoch_reason").items() if value != 0})
 
     def test_event_type_names(self):
-        read = {*pacing.LOSS_COUNTER_EVENT_TYPES, *pacing.EPOCH_EVENT_TYPES, pacing.SNAPSHOT_EVENT_TYPE}
+        read = {*pacing.LOSS_COUNTER_EVENT_TYPES, *pacing.EPOCH_EVENT_TYPES, pacing.SNAPSHOT_EVENT_TYPE,
+                pacing.FLIP_GATE_EVENT_TYPE}
         self.assertLessEqual(read, SCHEMA.live_names("event_type"))
         # The removed mechanisms' events of the pre-removal capture are the fixture's retired event types.
         carried = {row["event_type"] for row in read_csv(ROOT / "tests/data/pacing_pre_removal_events.csv")}
@@ -1260,7 +1337,7 @@ class InspectorTests(TemporaryDirectoryTest):
             (inspector.PRE_START_LIMIT_PACING_HEADER, "relimiter_pacing", "pre-start-limit-source-193"),
             (inspector.PRE_PLAN_ORDERED_PACING_HEADER, "relimiter_pacing", "pre-plan-ordered-source-192"),
             (OLD, "relimiter_pacing", "pre-removal-source-199"),
-            (inspector.CURRENT_PACING_EVENTS_HEADER, "relimiter_pacing_events", "current-source-86"),
+            (inspector.CURRENT_PACING_EVENTS_HEADER, "relimiter_pacing_events", "current-source-112"),
             (OLD[:148], "relimiter_pacing", "historical-source-148"),
             (OLD[:189], "relimiter_pacing", "historical-source-189"),
             (OLD[:195], "relimiter_pacing", "historical-source-195"),
@@ -1279,6 +1356,8 @@ class InspectorTests(TemporaryDirectoryTest):
             (OLD[:132], "relimiter_pacing", "historical-source-132"),
             (OLD[:129], "relimiter_pacing", "historical-source-129"),
             (OLD[:122], "relimiter_pacing", "historical-source-122"),
+            (inspector.CURRENT_PACING_EVENTS_HEADER[:111], "relimiter_pacing_events", "historical-source-111"),
+            (inspector.CURRENT_PACING_EVENTS_HEADER[:86], "relimiter_pacing_events", "historical-source-86"),
             (inspector.CURRENT_PACING_EVENTS_HEADER[:85], "relimiter_pacing_events", "historical-source-85"),
             (inspector.CURRENT_PACING_EVENTS_HEADER[:50], "relimiter_pacing_events", "historical-source-50"),
             (inspector.PACING_FIXED_RAW_HEADER, "relimiter_pacing", "historical-or-unknown"),
@@ -1296,7 +1375,7 @@ class InspectorTests(TemporaryDirectoryTest):
         # The writer's tables are the current headers; the readers of removed columns name them by the old header.
         rows = SCHEMA.row_columns
         events = SCHEMA.event_columns
-        self.assertEqual((len(rows), len(events)), (197, 86))
+        self.assertEqual((len(rows), len(events)), (197, 112))
         self.assertEqual(rows, [name for name in OLD if name not in inspector.REMOVED_PACING_COLUMNS] +
                          ["plan_ordered", "plan_start_limit_us", "plan_start_applied",
                           "plan_lead_own_us", "plan_lead_floor_us"])
@@ -1311,11 +1390,13 @@ class InspectorTests(TemporaryDirectoryTest):
         self.assertEqual(OLD[133:136], [*pacing.PLACEMENT_COLUMNS, pacing.PRE_SLEEP_MARGIN_COLUMN])
         self.assertTrue(set(pacing.CONTROLLER_COLUMNS + (pacing.PRE_SLEEP_MARGIN_COLUMN,))
                         <= set(inspector.REMOVED_PACING_COLUMNS))
-        # The events table is unchanged.
+        # The events table before the flip_gate rows is unchanged; their columns are appended.
         self.assertEqual(events[80:85], ["snapshot_dropped_records", "etw_events_lost", "etw_buffers_lost",
                                          "lost_present_count", "overflowed_present_count"])
         self.assertEqual(list(pacing.PCL_LOSS_COLUMNS), events[81:85])
-        self.assertEqual(events[85:], ["reason"])
+        self.assertEqual(events[85:86], ["reason"])
+        self.assertTrue(all(name.startswith("flip_") for name in events[86:]))
+        self.assertEqual((events[86], events[110], events[111]), ("flip_epoch", "flip_ready", "flip_frame_id"))
 
     def test_retired_source_flags_keep_their_names(self):
         # The bits no build sets any more (4 gpu_paced, 64 overload, 128 stall_injected) keep the analyzer's names

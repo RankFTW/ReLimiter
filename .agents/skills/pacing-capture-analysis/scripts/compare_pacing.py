@@ -82,7 +82,7 @@ INI_KEYS = frozenset({
     "osd_text_brightness", "osd_toggle_key", "osd_position_cycle_key", "shared_presets", "osd_preset_prev_key",
     "osd_preset_next_key", "blackout_key", "pacing_preference", "advanced_settings", "developer_settings",
     "config_version", "flip_metering_off", "gpu_wait_late_guard", "gpu_wait_present_first",
-    "gpu_wait_start_limit", "lead_queue_correction",
+    "gpu_wait_start_limit", "lead_queue_correction", "fg_flip_gate_cover", "fg_flip_gate_entry", "fg_flip_gate_fit",
     "gpu_wait_ab_interleave_s", "gpu_queue_probe", "gpu_queue_probe_source", "pacing_test_mode",
     "unified_hold_share", "unified_queue_law", "unified_queue_rank", "unified_queue_need_frames",
     "unified_queue_upstream", "unified_queue_margin_end", "unified_queue_allow_us", "control_file",

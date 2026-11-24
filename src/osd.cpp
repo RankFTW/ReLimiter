@@ -7,6 +7,7 @@
 #include "pacing_resolver.h"
 #include "fg_divisor.h"
 #include "display_state.h"
+#include "unified_pacer.h"
 #include "marker_log.h"
 #include "nvapi_types.h"
 #include "correlator.h"
@@ -317,7 +318,7 @@ static void DrawPacingSummaryLine(const PacingPipelineSnapshot& pipeline, bool h
     }
     switch (pipeline.reason) {
     case PacingFallbackReason::Passthrough:
-        ImGui::TextColored(gray, g_config.target_fps > 0 ? "Not pacing right now" : "No FPS cap set");
+        ImGui::TextColored(gray, g_user_target_fps.load(std::memory_order_relaxed) > 0 ? "Not pacing right now" : "No FPS cap yet");
         return;
     case PacingFallbackReason::IdleCap:
         ImGui::TextColored(gray, "Idle cap active (background, FG-Off Cap or OLED Care)");
@@ -479,13 +480,18 @@ static void DrawSettingsImpl(reshade::api::effect_runtime* runtime, bool editabl
     static bool s_target_active = false;
     if (!s_target_active)
         s_target_edit = g_user_target_fps.load(std::memory_order_relaxed);
-    int target = s_target_edit;
+    // The saved cap: 0 is VRR Cap (automatic: the limiter runs at the display's VRR cap, which the slider then shows),
+    // above 0 a custom cap. There is no state without a cap.
+    const auto set_cap = [&config_dirty](int saved) {
+        g_config.target_fps = saved;
+        DisplayState_PublishTargetFps();
+        s_target_edit = g_user_target_fps.load(std::memory_order_relaxed);
+        config_dirty = true;
+    };
 
-    // Compute Reflex VRR cap: fps = hz - hz^2/3600, floored
+    // The display's VRR cap: floor(hz - hz^2/3600)
     double ceiling_hz = g_ceiling_hz.load(std::memory_order_relaxed);
-    int reflex_cap = 0;
-    if (ceiling_hz > 1.0)
-        reflex_cap = static_cast<int>(ceiling_hz - (ceiling_hz * ceiling_hz / 3600.0));
+    const int reflex_cap = static_cast<int>(UnifiedPacer_VrrCapFps(ceiling_hz));
 
     // Check for Dynamic DMFG early — affects all FPS controls
     s_panel.runtime = runtime;
@@ -495,40 +501,21 @@ static void DrawSettingsImpl(reshade::api::effect_runtime* runtime, bool editabl
     const bool dmfg_dynamic_active = presets.available && presets.mfg_mode_override == 4;
 
     if (dmfg_dynamic_active) ImGui::BeginDisabled();
-    if (ImGui::RadioButton("VRR Cap", reflex_cap > 0 && target == reflex_cap)) {
-        if (reflex_cap > 0) {
-            g_user_target_fps.store(reflex_cap, std::memory_order_relaxed);
-            g_config.target_fps = reflex_cap;
-            s_target_edit = reflex_cap;
-            config_dirty = true;
-        }
-    }
+    const bool automatic = g_config.target_fps <= 0;
+    if (ImGui::RadioButton("VRR Cap", automatic) && !automatic) set_cap(0);
     ImGui::SameLine();
-    if (ImGui::RadioButton("Custom", target > 0 && target != reflex_cap)) {
-        if (target == 0 || target == reflex_cap) {
-            target = 60;
-            g_user_target_fps.store(target, std::memory_order_relaxed);
-            g_config.target_fps = target;
-            s_target_edit = target;
-            config_dirty = true;
-        }
-    }
-    ImGui::SameLine();
-    if (ImGui::RadioButton("Off", target == 0)) {
-        g_user_target_fps.store(0, std::memory_order_relaxed);
-        g_config.target_fps = 0;
-        s_target_edit = 0;
-        config_dirty = true;
-    }
+    // Custom starts from the cap in use, so choosing it changes nothing until the slider is moved.
+    if (ImGui::RadioButton("Custom", !automatic) && automatic) set_cap(s_target_edit >= 30 ? s_target_edit : 60);
     if (dmfg_dynamic_active) ImGui::EndDisabled();
     if (reflex_cap > 0) {
-        char tip[128];
+        char tip[256];
         snprintf(tip, sizeof(tip),
-                 "VRR Cap sets your FPS to the Reflex-safe maximum for your display "
-                 "(hz - hz^2/3600). For your monitor that's %d fps.", reflex_cap);
+                 "VRR Cap keeps your FPS at the Reflex-safe maximum for your display (hz - hz^2/3600) and follows "
+                 "the display if it changes. For your monitor that's %d fps. Without variable refresh the cap is "
+                 "the display's refresh rate. Custom sets a cap of your own.", reflex_cap);
         HelpTip(tip);
     } else {
-        HelpTip("VRR Cap sets your FPS to the Reflex-safe maximum for your display. "
+        HelpTip("VRR Cap keeps your FPS at the Reflex-safe maximum for your display. "
                 "Display not detected yet.");
     }
 
@@ -567,38 +554,27 @@ static void DrawSettingsImpl(reshade::api::effect_runtime* runtime, bool editabl
             ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f),
                 "No target set. Set via RHI, NVIDIA App, or Profile Inspector.");
     } else {
-        if (s_target_edit == 0)
-            snprintf(slider_fmt, sizeof(slider_fmt), "Off");
-        else if (s_target_edit == reflex_cap && reflex_cap > 0)
-            snprintf(slider_fmt, sizeof(slider_fmt), "%%d (VRR)");
+        // VRR Cap shows the cap it runs at; until the display is detected, and on a fixed refresh, there is no number.
+        if (g_config.target_fps <= 0 && !s_target_active)
+            snprintf(slider_fmt, sizeof(slider_fmt), s_target_edit > 0 ? "%%d (VRR)" : "Auto");
         else
             snprintf(slider_fmt, sizeof(slider_fmt), "%%d");
-        ImGui::SliderInt("Target FPS", &s_target_edit, 0, 360, slider_fmt);
+        ImGui::SliderInt("Target FPS", &s_target_edit, 30, 360, slider_fmt);
         s_target_active = ImGui::IsItemActive();
-        if (ImGui::IsItemDeactivatedAfterEdit()) {
-            if (s_target_edit > 0 && s_target_edit < 30) s_target_edit = 30;
-            g_user_target_fps.store(s_target_edit, std::memory_order_relaxed);
-            g_config.target_fps = s_target_edit;
-            config_dirty = true;
-        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) set_cap(s_target_edit < 30 ? 30 : s_target_edit);
     }
     if (dmfg_dynamic_active)
         HelpTip("Dynamic MFG is active. The FPS target is controlled by the driver profile. "
                 "Set it via RHI, NVIDIA App, or Profile Inspector before launching the game.");
     else
-        HelpTip("The FPS the limiter will target. 0 = no limiting. Minimum is 30.");
+        HelpTip("The FPS the limiter targets. Moving the slider sets a custom cap. Minimum is 30.");
 
     if (!dmfg_dynamic_active) {
         for (int p : {30, 60, 120, 240}) {
             ImGui::SameLine();
             char label[8];
             snprintf(label, sizeof(label), "%d", p);
-            if (ImGui::Button(label)) {
-                g_user_target_fps.store(p, std::memory_order_relaxed);
-                g_config.target_fps = p;
-                s_target_edit = p;
-                config_dirty = true;
-            }
+            if (ImGui::Button(label)) set_cap(p);
         }
     }
 

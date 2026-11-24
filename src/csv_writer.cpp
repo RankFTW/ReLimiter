@@ -876,6 +876,7 @@ static const char* PacingEventTypeText(PacingCsvEventType type)
     case PacingCsvEventType::PclStatus: return "pcl_status";
     case PacingCsvEventType::GridEpoch: return "grid_epoch";
     case PacingCsvEventType::PipelineChange: return "pipeline_change";
+    case PacingCsvEventType::FlipGate: return "flip_gate";
     }
     return "unknown";
 }
@@ -933,6 +934,12 @@ static bool PacingEventIsJoinStatistics(const PacingCsvEvent& event)
 static bool PacingEventIsSnapshot(const PacingCsvEvent& event)
 {
     return event.type == PacingCsvEventType::Snapshot;
+}
+
+// Flip-gate rows whose producer filled the detail (it does while a capture runs).
+static bool PacingEventIsFlipGate(const PacingCsvEvent& event)
+{
+    return event.type == PacingCsvEventType::FlipGate && event.flip.detailed != 0;
 }
 
 // Loss-window rows name the sample's swapchain, snapshot rows the selected one.
@@ -1138,6 +1145,63 @@ static const PacingEventColumn PACING_EVENT_COLUMNS[] = {
     // Appended: the epoch or pipeline-change reason
     { "reason", [](CsvLine* line, const PacingCsvEvent& event) {
         UnsignedIf(line, PacingEventHasReason(event), event.reason); } },
+    // Appended: flip_gate rows (PacingFlipSample and its PacingFlipGateDetail). Times are QPC and empty where the
+    // gate had none; flip_plan, flip_release and flip_ready are PacingFlipPlan, PacingFlipRelease and PacingFlipReady.
+    { "flip_epoch", [](CsvLine* line, const PacingCsvEvent& event) {
+        UnsignedIf(line, PacingEventIsFlipGate(event), event.flip.epoch); } },
+    { "flip_serial", [](CsvLine* line, const PacingCsvEvent& event) {
+        UnsignedIf(line, PacingEventIsFlipGate(event), event.flip.cycle); } },
+    { "flip_marker", [](CsvLine* line, const PacingCsvEvent& event) {
+        UnsignedIf(line, PacingEventIsFlipGate(event), event.flip.detail.entry_marker); } },
+    { "flip_place", [](CsvLine* line, const PacingCsvEvent& event) {
+        UnsignedIf(line, PacingEventIsFlipGate(event), event.flip.index); } },
+    { "flip_outputs", [](CsvLine* line, const PacingCsvEvent& event) {
+        UnsignedIf(line, PacingEventIsFlipGate(event), event.flip.outputs); } },
+    { "flip_real", [](CsvLine* line, const PacingCsvEvent& event) {
+        UnsignedIf(line, PacingEventIsFlipGate(event), event.flip.real); } },
+    { "flip_plan", [](CsvLine* line, const PacingCsvEvent& event) {
+        UnsignedIf(line, PacingEventIsFlipGate(event), EnumValue(event.flip.detail.plan)); } },
+    { "flip_cycle_us", [](CsvLine* line, const PacingCsvEvent& event) {
+        DecimalIf(line, PacingEventIsFlipGate(event) && event.flip.cycle_ticks > 0 && s_qpc_frequency != 0,
+            static_cast<double>(event.flip.cycle_ticks) * 1e6 / static_cast<double>(s_qpc_frequency)); } },
+    { "flip_input_target_qpc", [](CsvLine* line, const PacingCsvEvent& event) {
+        QpcIf(line, PacingEventIsFlipGate(event), event.flip.detail.input_target_qpc); } },
+    { "flip_arrived_qpc", [](CsvLine* line, const PacingCsvEvent& event) {
+        QpcIf(line, PacingEventIsFlipGate(event), event.flip.detail.arrived_qpc); } },
+    { "flip_entered_qpc", [](CsvLine* line, const PacingCsvEvent& event) {
+        QpcIf(line, PacingEventIsFlipGate(event), event.flip.detail.entered_qpc); } },
+    { "flip_spacing_us", [](CsvLine* line, const PacingCsvEvent& event) {
+        DecimalIf(line, PacingEventIsFlipGate(event) && event.flip.detail.spacing_ticks > 0 && s_qpc_frequency != 0,
+            static_cast<double>(event.flip.detail.spacing_ticks) * 1e6 / static_cast<double>(s_qpc_frequency)); } },
+    { "flip_enqueued_qpc", [](CsvLine* line, const PacingCsvEvent& event) {
+        QpcIf(line, PacingEventIsFlipGate(event), event.flip.detail.enqueued_qpc); } },
+    { "flip_earliest_qpc", [](CsvLine* line, const PacingCsvEvent& event) {
+        QpcIf(line, PacingEventIsFlipGate(event), event.flip.detail.earliest_qpc); } },
+    { "flip_marker_done_qpc", [](CsvLine* line, const PacingCsvEvent& event) {
+        QpcIf(line, PacingEventIsFlipGate(event), event.flip.detail.marker_done_qpc); } },
+    { "flip_rule_done_qpc", [](CsvLine* line, const PacingCsvEvent& event) {
+        QpcIf(line, PacingEventIsFlipGate(event), event.flip.detail.rule_done_qpc); } },
+    { "flip_held", [](CsvLine* line, const PacingCsvEvent& event) {
+        UnsignedIf(line, PacingEventIsFlipGate(event), event.flip.detail.held); } },
+    { "flip_target_qpc", [](CsvLine* line, const PacingCsvEvent& event) {
+        QpcIf(line, PacingEventIsFlipGate(event), event.flip.detail.target_qpc); } },
+    { "flip_moved", [](CsvLine* line, const PacingCsvEvent& event) {
+        UnsignedIf(line, PacingEventIsFlipGate(event), event.flip.detail.moved); } },
+    { "flip_bounded", [](CsvLine* line, const PacingCsvEvent& event) {
+        UnsignedIf(line, PacingEventIsFlipGate(event), event.flip.detail.bounded); } },
+    { "flip_release_qpc", [](CsvLine* line, const PacingCsvEvent& event) {
+        QpcIf(line, PacingEventIsFlipGate(event), event.flip.detail.release_qpc); } },
+    { "flip_release", [](CsvLine* line, const PacingCsvEvent& event) {
+        UnsignedIf(line, PacingEventIsFlipGate(event), EnumValue(event.flip.detail.release)); } },
+    { "flip_rule_qpc", [](CsvLine* line, const PacingCsvEvent& event) {
+        QpcIf(line, PacingEventIsFlipGate(event), event.flip.detail.rule_flip_qpc); } },
+    { "flip_ready_qpc", [](CsvLine* line, const PacingCsvEvent& event) {
+        QpcIf(line, PacingEventIsFlipGate(event), event.flip.detail.ready_qpc); } },
+    { "flip_ready", [](CsvLine* line, const PacingCsvEvent& event) {
+        UnsignedIf(line, PacingEventIsFlipGate(event), EnumValue(event.flip.detail.ready)); } },
+    // Appended after the first build that wrote flip_gate rows (2026-11-23, 111 columns).
+    { "flip_frame_id", [](CsvLine* line, const PacingCsvEvent& event) {
+        NonZeroIf(line, PacingEventIsFlipGate(event), event.flip.detail.frame_id); } },
 };
 
 template <typename Column, size_t Count>

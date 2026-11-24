@@ -154,6 +154,14 @@ FALLBACK_REASON_NAMES = {0: "none", 1: "passthrough", 2: "idle_cap", 3: "smoothi
 # Rows carry 1 or 2 only: the in-process sources (3, 4) feed the runtime window without joined rows.
 DISPLAY_SOURCE_NAMES = {1: "etw", 2: "dxgi", 3: "flip_gate", 4: "fg_input"}
 IN_PROCESS_DISPLAY_SOURCES = (3, 4)
+# flip_gate event rows (one per flip the flip gate let go; builds from 2026-11-23): PacingFlipPlan, PacingFlipRelease
+# and PacingFlipReady in the flip_plan, flip_release and flip_ready cells.
+FLIP_GATE_EVENT_TYPE = "flip_gate"
+FLIP_PLAN_NAMES = {0: "none", 1: "held", 2: "late"}
+FLIP_RELEASE_NAMES = {0: "at_once", 1: "timed", 2: "with_work"}
+FLIP_READY_NAMES = {0: "none", 1: "before", 2: "by_release", 3: "after"}
+FLIP_READY_TIMED = (1, 3)  # flip_ready_qpc is when the Present's own work was seen done
+FLIP_PLAN_HELD = 1
 PLAN_COLUMNS = ("plan_rung", "plan_status", "display_source")
 OUTPUT_KIND_GPU_QUEUE_WAIT = 4
 # Stall recovery (section 9): tol = max(T_out / 4, 500 us); the long interval
@@ -1063,6 +1071,110 @@ def _loss_windows(rows: list[dict[str, str]], clock: _EventClock, context_qpc: i
             "unmatched_ends": unmatched_ends, "windows": windows[:REPORTED_EVENTS]}
 
 
+def _flip_gate_events(by_type: dict[str, list[dict[str, str]]], frequency: int | None) -> dict[str, Any] | None:
+    """flip_gate rows: frame generation presenting from its own thread, where ReLimiter times each flip.
+
+    Per multiplier and place of the cycle (0 the first generated frame's, the last the real frame's): how the
+    flips were let go, how the gate learned when the Present's own work was done, and for the Presents after the
+    first how long that work took (from the later of the Present's entry and the release of the flip before, so
+    a Present that stood behind the gate before it is not charged that wait), how much time the Present had
+    between its entry and its flip's time, and how often the work came after that time. For the first flip: how
+    far it stood behind frame generation's completion. Per cycle whose first flip was held on a planned frame
+    with every flip's work timed: how far behind the frame's FG input target the first flip had to stand for
+    every flip's work to be done at its time (the largest of work done - place * step - target), next to where
+    it stood. Times the gate saw (flip_ready_qpc) carry its clock thread's wake after the event.
+    None without such rows or without a QPC frequency."""
+    rows = by_type.get(FLIP_GATE_EVENT_TYPE, [])
+    if not rows or not frequency:
+        return None
+
+    def us(later: int | None, earlier: int | None) -> float | None:
+        return None if not later or not earlier else ticks_to_us(later - earlier, frequency)
+
+    flips = []
+    for row in rows:
+        flip = {name: _event_int(row, f"flip_{name}") for name in (
+            "epoch", "serial", "place", "outputs", "plan", "held", "release", "ready", "moved", "bounded",
+            "input_target_qpc", "entered_qpc", "marker_done_qpc", "target_qpc", "release_qpc", "rule_qpc",
+            "ready_qpc")}
+        try:
+            flip["cycle_us"] = _decimal(row, "flip_cycle_us")
+        except ValueError:
+            flip["cycle_us"] = None
+        if flip["place"] is None or not flip["outputs"] or not flip["release_qpc"]:
+            continue
+        flips.append(flip)
+    flips.sort(key=lambda flip: flip["release_qpc"])
+
+    places: dict[tuple[int, int], dict[str, Any]] = {}
+    cycles: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
+    previous_release: int | None = None
+    for flip in flips:
+        entry = places.setdefault((flip["outputs"], flip["place"]), {
+            "flips": 0, "release": Counter(), "ready": Counter(), "moved": 0, "bounded": 0,
+            "work": [], "time": [], "late": [], "timed": 0, "lag": []})
+        entry["flips"] += 1
+        entry["release"][_enum_label(flip["release"], FLIP_RELEASE_NAMES, "unknown")] += 1
+        entry["ready"][_enum_label(flip["ready"], FLIP_READY_NAMES, "unknown")] += 1
+        entry["moved"] += flip["moved"] or 0
+        entry["bounded"] += flip["bounded"] or 0
+        timed = flip["ready"] in FLIP_READY_TIMED and bool(flip["ready_qpc"])
+        if flip["place"] == 0:
+            lag = us(flip["rule_qpc"], flip["marker_done_qpc"])
+            if lag is not None:
+                entry["lag"].append(lag)
+        else:
+            if flip["entered_qpc"] and flip["target_qpc"]:
+                entry["time"].append(ticks_to_us(flip["target_qpc"] - flip["entered_qpc"], frequency))
+            if timed and flip["entered_qpc"]:
+                start = max(flip["entered_qpc"], previous_release or 0)
+                entry["work"].append(ticks_to_us(flip["ready_qpc"] - start, frequency))
+            if timed and flip["target_qpc"]:
+                entry["timed"] += 1
+                if flip["ready_qpc"] > flip["target_qpc"]:
+                    entry["late"].append(ticks_to_us(flip["ready_qpc"] - flip["target_qpc"], frequency))
+        flip["timed"] = timed
+        previous_release = flip["release_qpc"]
+        if flip["epoch"] is not None and flip["serial"] is not None:
+            cycles.setdefault((flip["epoch"], flip["serial"], flip["outputs"]), []).append(flip)
+
+    need: dict[int, list[float]] = {}
+    standing: dict[int, list[float]] = {}
+    for (_, _, outputs), cycle in cycles.items():
+        first = next((flip for flip in cycle if flip["place"] == 0), None)
+        if (first is None or len(cycle) != outputs or sorted(flip["place"] for flip in cycle) != list(range(outputs))
+                or first["plan"] != FLIP_PLAN_HELD or not first["held"] or not first["input_target_qpc"]
+                or not first["cycle_us"] or not first["rule_qpc"] or not all(flip["timed"] for flip in cycle)):
+            continue
+        step_us = first["cycle_us"] / outputs
+        need.setdefault(outputs, []).append(max(
+            ticks_to_us(flip["ready_qpc"] - first["input_target_qpc"], frequency) - flip["place"] * step_us
+            for flip in cycle))
+        standing.setdefault(outputs, []).append(
+            ticks_to_us(first["rule_qpc"] - first["input_target_qpc"], frequency))
+
+    return {
+        "flips": len(flips),
+        "plans": dict(Counter(_enum_label(flip["plan"], FLIP_PLAN_NAMES, "unknown") for flip in flips)),
+        "places": [{
+            "outputs": outputs, "place": place, "flips": entry["flips"],
+            "release": dict(entry["release"]), "ready": dict(entry["ready"]),
+            "moved": entry["moved"], "bounded": entry["bounded"],
+            "behind_generation_us": distribution_p90(entry["lag"]) if place == 0 else None,
+            "work_us": distribution_p90(entry["work"]) if place else None,
+            "time_before_flip_us": distribution_p90(entry["time"]) if place else None,
+            "timed": entry["timed"] if place else None,
+            "late": len(entry["late"]) if place else None,
+            "late_us": distribution_p90(entry["late"]) if place else None,
+        } for (outputs, place), entry in sorted(places.items())],
+        "cycles": [{
+            "outputs": outputs, "count": len(values),
+            "need_behind_input_us": distribution_p90(values),
+            "first_flip_behind_input_us": distribution_p90(standing[outputs]),
+        } for outputs, values in sorted(need.items())],
+    }
+
+
 def summarize_events(path: Path, time_origin_qpc: int | None = None,
                      retired_events: bool = True) -> dict[str, Any]:
     """Capture boundaries, epoch changes, loss windows, drops, native PCL loss and
@@ -1198,6 +1310,7 @@ def summarize_events(path: Path, time_origin_qpc: int | None = None,
         "clock_map_status_changes": {"count": len(clock_map), "changes": clock_map[:REPORTED_EVENTS]},
         "pcl_status_changes": {"count": len(pcl_changes), "changes": pcl_changes[:REPORTED_EVENTS],
                                "initial": pcl_initial[:REPORTED_EVENTS]},
+        "flip_gate": _flip_gate_events(by_type, frequencies[0] if frequencies else None),
         **plan_events,
         **controller_events,
         "warnings": warnings,
@@ -2324,6 +2437,36 @@ def _plan_event_lines(events: dict[str, Any]) -> list[str]:
     ]
 
 
+def _flip_gate_lines(flip_gate: dict[str, Any] | None) -> list[str]:
+    if flip_gate is None:
+        return []
+
+    def ms(entry: dict[str, Any] | None) -> str:
+        if not entry or not entry["count"]:
+            return "-"
+        return "/".join(_number(entry[name] / 1000.0) for name in ("p50_us", "p90_us", "p99_us"))
+
+    lines = [f"  flip gate: {flip_gate['flips']} flips, their frames' plans {_counts(flip_gate['plans'])}"
+             " (times in ms as p50/p90/p99)"]
+    for place in flip_gate["places"]:
+        text = (f"    {place['outputs']} flips a frame, place {place['place']}: {place['flips']} flips, let go "
+                f"{_counts(place['release'])}, work seen {_counts(place['ready'])}")
+        if place["place"] == 0:
+            text += f"; behind generation's completion {ms(place['behind_generation_us'])}"
+        else:
+            share = _percent(place["late"] / place["timed"]) if place["timed"] else "-"
+            text += (f"; own work {ms(place['work_us'])}, time from entry to its flip {ms(place['time_before_flip_us'])}"
+                     f", work after its time {place['late']} of {place['timed']} ({share}) by {ms(place['late_us'])}")
+        if place["moved"] or place["bounded"]:
+            text += f"; moved forward {place['moved']}, bounded {place['bounded']}"
+        lines.append(text)
+    for cycle in flip_gate["cycles"]:
+        lines.append(f"    {cycle['outputs']} flips a frame, {cycle['count']} held cycles: the first flip had to "
+                     f"stand {ms(cycle['need_behind_input_us'])} behind the FG input target, and stood "
+                     f"{ms(cycle['first_flip_behind_input_us'])}")
+    return lines
+
+
 def _stall_recovery_lines(stall: dict[str, Any]) -> list[str]:
     if not stall["available"]:
         return [f"Stall recovery: unavailable ({stall['reason']})"]
@@ -2530,6 +2673,7 @@ def _events_lines(events: dict[str, Any] | None) -> list[str]:
     lines.append(f"  PC Latency status: initial {initial}, changes {pcl_changes['count']}"
                  + (f" [{shown}]" if shown else ""))
     lines += _plan_event_lines(events)
+    lines += _flip_gate_lines(events.get("flip_gate"))
     return lines
 
 

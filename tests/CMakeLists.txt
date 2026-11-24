@@ -645,6 +645,23 @@ if(MSVC)
     target_compile_options(test_fg_flip_gate_rule PRIVATE /W4 /utf-8 /permissive-)
 endif()
 
+## ── Present places: which native Present of a frame generation cycle was in progress at a time ──
+add_executable(test_fg_present_places
+    test_fg_present_places.cpp
+)
+set_target_properties(test_fg_present_places PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+)
+target_include_directories(test_fg_present_places PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+if(MSVC)
+    set_property(TARGET test_fg_present_places PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_compile_options(test_fg_present_places PRIVATE /W4 /utf-8 /permissive-)
+endif()
+
 ## ── Period governor C2 and rung feasibility C3 tests ──
 # Directly test the production period tracker (rise, miss bump, hold, fall,
 # probe backoff, fixed-refresh quantization; C2) and demotion, dwell doubling
@@ -1123,6 +1140,7 @@ add_test(NAME fg_present_order_rule COMMAND test_fg_present_order_rule)
 add_test(NAME gpu_hold_order_rule COMMAND test_gpu_hold_order_rule)
 add_test(NAME fg_break_window_rule COMMAND test_fg_break_window_rule)
 add_test(NAME fg_flip_gate_rule COMMAND test_fg_flip_gate_rule)
+add_test(NAME fg_present_places COMMAND test_fg_present_places)
 add_test(NAME period_governor COMMAND test_period_governor)
 add_test(NAME rung_feasibility COMMAND test_rung_feasibility)
 add_test(NAME source_stage COMMAND test_source_stage)

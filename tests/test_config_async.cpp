@@ -194,6 +194,8 @@ std::atomic<int> g_fg_mode{ 0 };
 #endif
 AdaptiveWakeGuard g_adaptive_wake_guard;
 void OLEDCare_SetConfig(bool, int) {}
+// display_state.cpp publishes the limiter's cap from the saved one; here no display is detected, so it is the saved one.
+void DisplayState_PublishTargetFps() noexcept { g_user_target_fps.store(g_config.target_fps); }
 void VSync_ApplyOpenGL() {}
 #ifdef _WIN64
 void ReflexInject_SetEnabled(bool) noexcept {}
@@ -1307,6 +1309,11 @@ void TestPacingPreference() {
         // Smooth's second lever (the FG input wait's floor at the commanded interval) and the floor's slack default.
         CHECK(g_fg_late_spacing_commanded.load() == (test.expected == PacingPreference::Smooth));
         CHECK(g_fg_late_spacing_slack.load() == kPacingFgLateSpacingSlackDefault && kPacingFgLateSpacingSlackDefault == 100);
+        // The flip gate's cover and fit are on by default where the gate exists (64-bit), and published as 0 elsewhere.
+        CHECK(kPacingFgFlipGateCoverDefault == 95 && kPacingFgFlipGateFitDefault == 75);
+        CHECK(g_fg_flip_gate_cover.load() == (sizeof(void*) == 8 ? kPacingFgFlipGateCoverDefault : 0));
+        CHECK(g_fg_flip_gate_fit.load() == (sizeof(void*) == 8 ? kPacingFgFlipGateFitDefault : 0));
+        CHECK(g_fg_flip_gate_entry.load() == 0);
         // Smooth's third lever (the FG input wait's extra lead) reaches the pipeline; no other position sets it.
         CHECK(pipeline.fg_lead_extra_us ==
             (test.expected == PacingPreference::Smooth ? kPacingPreferenceSmoothLeadExtraUs : kPacingFgLeadExtraDefaultUs));
@@ -2286,7 +2293,8 @@ const IniKey non_default_ini[] = {
     {"developer_settings", "true", "true"}, {"config_version", "6", "6"}, {"flip_metering_off", "true", "true"},
     {"gpu_wait_late_guard", "true", "true"}, {"gpu_wait_present_first", "false", "false"},
     {"gpu_wait_start_limit", "false", "false"},
-    {"lead_queue_correction", "false", "false"},
+    {"lead_queue_correction", "false", "false"}, {"fg_flip_gate_cover", "80", "80"},
+    {"fg_flip_gate_entry", "1", "1"}, {"fg_flip_gate_fit", "90", "90"},
     {"gpu_wait_ab_interleave_s", "30", "30"},
     {"gpu_queue_probe", "false", "false"}, {"gpu_queue_probe_source", "0", "0"},
     {"pacing_test_mode", "driver_limiter", "driver_limiter"}, {"unified_hold_share", "0.125", "0.125000"},
@@ -2300,7 +2308,7 @@ const IniKey non_default_ini[] = {
     {"hang_report", "true", "true"}, {"hang_report_dump", "false", "false"}, {"hang_report_test_after_s", "30", "30"},
     {"streamline_compat", "force_false", "force_false"}};
 constexpr size_t non_default_ini_count = sizeof(non_default_ini) / sizeof(non_default_ini[0]);
-static_assert(non_default_ini_count == 60, "the contract lists 60 further keys");
+static_assert(non_default_ini_count == 63, "the contract lists 63 further keys");
 bool IsKeybindKey(const std::string& key) {
     return key == "osd_preset_prev_key" || key == "osd_preset_next_key" || key == "blackout_key" ||
            key == "osd_position_cycle_key" || key == "oled_care_key" || key == "oled_care_all_monitors" ||
@@ -2555,10 +2563,10 @@ const LiveKey live_keys[] = {
     {"unified_queue_margin_end", "0"}, {"unified_hold_share", "0.1"}, {"pacing_test_mode", "reflex_only"},
     {"unified_queue_law", "off"}, {"unified_queue_rank", "3"}, {"unified_queue_need_frames", "6"},
     {"gpu_wait_late_guard", "on"}, {"gpu_wait_present_first", "off"}, {"gpu_wait_start_limit", "off"},
-    {"lead_queue_correction", "off"},
-    {"gpu_wait_ab_interleave_s", "30"},
+    {"lead_queue_correction", "off"}, {"fg_flip_gate_cover", "80"}, {"fg_flip_gate_entry", "1"},
+    {"fg_flip_gate_fit", "90"}, {"gpu_wait_ab_interleave_s", "30"},
     {"unified_queue_upstream", "1"}, {"unified_queue_allow_us", "2500"}};
-static_assert(sizeof(live_keys) / sizeof(live_keys[0]) == 20, "the contract lists 20 live keys");
+static_assert(sizeof(live_keys) / sizeof(live_keys[0]) == 23, "the contract lists 23 live keys");
 bool IsLiveKey(const std::string& key) {
     for (const LiveKey& live : live_keys)
         if (key == live.key) return true;
@@ -2604,6 +2612,9 @@ const DeveloperField developer_fields[] = {
     {"gpu_wait_present_first", [] { g_config.gpu_wait_present_first = false; }, [] { return g_config.gpu_wait_present_first; }},
     {"gpu_wait_start_limit", [] { g_config.gpu_wait_start_limit = false; }, [] { return g_config.gpu_wait_start_limit; }},
     {"lead_queue_correction", [] { g_config.lead_queue_correction = false; }, [] { return g_config.lead_queue_correction; }},
+    {"fg_flip_gate_cover", [] { g_config.fg_flip_gate_cover = 0; }, [] { return g_config.fg_flip_gate_cover == kPacingFgFlipGateCoverDefault; }},
+    {"fg_flip_gate_entry", [] { g_config.fg_flip_gate_entry = 1; }, [] { return g_config.fg_flip_gate_entry == 0; }},
+    {"fg_flip_gate_fit", [] { g_config.fg_flip_gate_fit = 0; }, [] { return g_config.fg_flip_gate_fit == kPacingFgFlipGateFitDefault; }},
     {"gpu_wait_ab_interleave_s", [] { g_config.gpu_wait_ab_interleave_s = 30; }, [] { return g_config.gpu_wait_ab_interleave_s == 0; }},
     {"control_file", [] { g_config.control_file = true; }, [] { return !g_config.control_file; }},
     {"gpu_queue_probe", [] { g_config.gpu_queue_probe = false; }, [] { return g_config.gpu_queue_probe; }},
@@ -2619,7 +2630,7 @@ const DeveloperField developer_fields[] = {
     {"unified_queue_allow_us", [] { g_config.unified_queue_allow_us = 2500; }, [] { return g_config.unified_queue_allow_us == 4000; }},
     {"hang_report_dump", [] { g_config.hang_report_dump = false; }, [] { return g_config.hang_report_dump; }},
     {"hang_report_test_after_s", [] { g_config.hang_report_test_after_s = 30; }, [] { return g_config.hang_report_test_after_s == 0; }}};
-static_assert(sizeof(developer_fields) / sizeof(developer_fields[0]) == 20, "the contract lists 20 developer fields");
+static_assert(sizeof(developer_fields) / sizeof(developer_fields[0]) == 23, "the contract lists 23 developer fields");
 void TestDeveloperFieldsAreCountedAndResetOneByOne() {
     Reset();
     CHECK(Config_DeveloperOverrides() == 0);

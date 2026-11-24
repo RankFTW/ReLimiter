@@ -47,7 +47,9 @@ CURRENT_ROW_COLUMNS = 197           # + plan_lead_own_us and plan_lead_floor_us
 REMOVED_ROW_COLUMNS = ["predicted_render_us", "governor_step", "governor_interval_us", "plan_signal_advance_us",
                        "pre_sleep_margin_us", "gpu_first_submit_qpc", "gpu_start_qpc"]
 OLD = inspector.PRE_REMOVAL_PACING_HEADER  # every historical prefix length is a prefix of it
-PHASE3_EVENT_COLUMNS = 86  # unchanged since Phase 2: new event kinds only
+PHASE3_EVENT_COLUMNS = 86  # unchanged from Phase 2 until the flip_gate rows: new event kinds only
+FIRST_FLIP_GATE_EVENT_COLUMNS = 111  # the first build that wrote flip_gate rows (2026-11-23)
+CURRENT_EVENT_COLUMNS = 112          # + flip_frame_id
 LEGACY_SCHEDULER_HEADER = ["frame_id", "timestamp_us", "actual_frame_time_us"]
 FRAMEVIEW_HEADER = [
     "Application", "ProcessID", "SwapChainAddress", "Runtime", "PresentMode", "TimeInSeconds",
@@ -99,11 +101,11 @@ class ProfileTests(unittest.TestCase):
                 self.assertEqual(inspector.detect_kind(header), kind)
                 self.assertEqual(inspector.schema_profile(kind, header), f"current-source-{len(header)}")
         self.assertEqual(len(inspector.CURRENT_PACING_HEADER), CURRENT_ROW_COLUMNS)
-        self.assertEqual(len(inspector.CURRENT_PACING_EVENTS_HEADER), PHASE3_EVENT_COLUMNS)
+        self.assertEqual(len(inspector.CURRENT_PACING_EVENTS_HEADER), CURRENT_EVENT_COLUMNS)
         self.assertEqual(inspector.schema_profile("relimiter_pacing", inspector.CURRENT_PACING_HEADER),
                          "current-source-197")
         self.assertEqual(inspector.schema_profile("relimiter_pacing_events",
-                                                  inspector.CURRENT_PACING_EVENTS_HEADER), "current-source-86")
+                                                  inspector.CURRENT_PACING_EVENTS_HEADER), "current-source-112")
 
     def test_pre_removal_header_is_its_own_profile(self):
         self.assertEqual(len(OLD), ROLE_ROW_COLUMNS)
@@ -161,6 +163,10 @@ class ProfileTests(unittest.TestCase):
             ("relimiter_pacing", OLD[:PHASE1_ROW_COLUMNS], "historical-source-122"),
             ("relimiter_pacing_events", inspector.CURRENT_PACING_EVENTS_HEADER[:PHASE1_EVENT_COLUMNS],
              "historical-source-85"),
+            ("relimiter_pacing_events", inspector.CURRENT_PACING_EVENTS_HEADER[:PHASE3_EVENT_COLUMNS],
+             "historical-source-86"),
+            ("relimiter_pacing_events", inspector.CURRENT_PACING_EVENTS_HEADER[:FIRST_FLIP_GATE_EVENT_COLUMNS],
+             "historical-source-111"),
             ("relimiter_pacing", OLD[:PHASE2_ROW_COLUMNS], "historical-source-129"),
             ("relimiter_pacing", OLD[:PHASE3_ROW_COLUMNS], "historical-source-132"),
             ("relimiter_pacing", OLD[:Q16_ROW_COLUMNS], "historical-source-133"),
@@ -261,7 +267,10 @@ class ProfileTests(unittest.TestCase):
                                     "plan_lead_own_us", "plan_lead_floor_us"])
         self.assertEqual(inspector.CURRENT_PACING_EVENTS_HEADER[PHASE1_EVENT_COLUMNS - 1],
                          "overflowed_present_count")
-        self.assertEqual(inspector.CURRENT_PACING_EVENTS_HEADER[PHASE1_EVENT_COLUMNS:], ["reason"])
+        self.assertEqual(inspector.CURRENT_PACING_EVENTS_HEADER[PHASE1_EVENT_COLUMNS:PHASE3_EVENT_COLUMNS],
+                         ["reason"])
+        self.assertEqual(inspector.CURRENT_PACING_EVENTS_HEADER[PHASE3_EVENT_COLUMNS], "flip_epoch")
+        self.assertEqual(inspector.CURRENT_PACING_EVENTS_HEADER[FIRST_FLIP_GATE_EVENT_COLUMNS:], ["flip_frame_id"])
         self.assertIn("pcl_total_us", OLD[PHASE0_ROW_COLUMNS:])
         self.assertIn("etw_events_lost", inspector.CURRENT_PACING_EVENTS_HEADER[PHASE0_EVENT_COLUMNS:])
 

@@ -147,6 +147,16 @@ namespace
         CHECK(PacingPipeline_VrrTargetFps(false, 60, vrr_cap) == 60 && reads == 1);
         CHECK(PacingPipeline_VrrTargetFps(true, -1, vrr_cap) == 138 && reads == 2);
         CHECK(PacingPipeline_VrrTargetFps(false, -1, vrr_cap) == -1 && reads == 2);
+
+        // The cap the limiter runs at from the saved one: a saved cap as it is; 0 (VRR Cap, automatic) is the display's
+        // VRR cap while variable refresh paces, read only then, and 0 on a fixed refresh and before the ceiling is known.
+        reads = 0;
+        CHECK(PacingPipeline_EffectiveTargetFps(0, true, vrr_cap) == 138 && reads == 1);
+        CHECK(PacingPipeline_EffectiveTargetFps(0, false, vrr_cap) == 0 && reads == 1);
+        CHECK(PacingPipeline_EffectiveTargetFps(60, true, vrr_cap) == 60 && reads == 1);
+        CHECK(PacingPipeline_EffectiveTargetFps(157, false, vrr_cap) == 157 && reads == 1);
+        CHECK(PacingPipeline_EffectiveTargetFps(0, true, [] { return 0.0; }) == 0);
+        CHECK(PacingPipeline_EffectiveTargetFps(-1, true, vrr_cap) == 138 && reads == 2);
     }
 }
 

@@ -61,6 +61,7 @@ public:
     void* order_queue = nullptr;          // fg_present_order: the queue of this scope's first outermost Signal
     bool order_done = false;              // ... and whether its Wait on that queue has been followed
     int64_t order_cycle = 0;              // fg_present_ahead 3: the pacer's interval (ticks) for this input: held > 0, not held < 0
+    int64_t order_input = 0;              // ... and the input's release target as planned (QPC), the decision's time where not held
 private:
     static thread_local StreamlineInputScope* current_;
     StreamlineInputScope* previous_ = nullptr;

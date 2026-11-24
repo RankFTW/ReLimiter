@@ -702,7 +702,15 @@ namespace
             });
         DrainQueue<decltype(s_flip_queue), PacingFlipSample>(&s_flip_queue, kFlipQueueCapacity,
             [now_qpc](const PacingFlipSample& sample) {
-                if (sample.flip_qpc >= s_state.window_start_qpc) AddFlipSample(sample, now_qpc);
+                if (sample.flip_qpc < s_state.window_start_qpc) return;
+                // The capture's row for the flip, whichever source feeds the window (AddFlipSample leaves the
+                // flip out of the window while ETW display samples flow).
+                if (sample.detailed) {
+                    PacingCsvEvent event{};
+                    event.flip = sample;
+                    PushEvent(PacingCsvEventType::FlipGate, sample.flip_qpc, event);
+                }
+                AddFlipSample(sample, now_qpc);
             });
         RetireInProcessWindow(now_qpc);
     }

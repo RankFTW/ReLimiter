@@ -128,6 +128,16 @@ uint32_t NativePclInternal_BeginObserverEpoch() noexcept;
 // sample gating above.
 void NativePclInternal_PublishDisplaySample(
     const PacingDisplaySample& sample) noexcept;
+// The place of a native Present in its frame generation cycle, where the
+// add-on's own unit recorded one (fg_present_order.h; 64-bit Direct3D 12
+// only). Asked through here: the collector's translation unit is built in the
+// PresentData library, without the add-on target's definitions, and would get
+// that header's no-op forms. False: none recorded.
+struct FgPresentPlace;
+bool NativePclInternal_FindPresentPlace(
+    uint32_t thread_id,
+    int64_t present_start_qpc,
+    FgPresentPlace* place) noexcept;
 
 // Implemented by the upstream-facing PresentData collector translation unit.
 void NativePclCollector_Run() noexcept;

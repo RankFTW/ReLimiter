@@ -50,6 +50,7 @@
 //   each flip lands 0.2 to 0.5 ms (median; 0.7 to 1.9 at the 90th percentile) behind its call amid render work, so
 //   the displayed interval varies by 0.5 to 1.4 ms per place in the cycle and the places differ in the mean (at 4x
 //   7.1, 5.8, 6.4 and 6.4 ms). The same terms, with the step in place of the half.
+#include <algorithm>
 #include <cstdint>
 
 struct FgFlipGateRule {
@@ -70,24 +71,49 @@ struct FgFlipGateRule {
     int64_t Distance(int64_t step) const noexcept { return step - step / (give_back > 0 ? give_back : kGiveBack); }
 
     // A cycle's first generated frame's gate is to be let go. `pacer_cycle`: the pacer's grid interval for the frame,
-    // 0 where it has no plan for it. `flips`: the cycle's flips (2 at 2x). Returns the earliest time the distance
-    // from the flip before allows, 0 where there is none to keep.
-    int64_t Begin(int64_t pacer_cycle, int flips = 2) noexcept {
+    // 0 where it has no plan for it. `flips`: the cycle's flips (2 at 2x). `phase`: developer key fg_flip_gate_cover,
+    // the time the first flip is to stand at for the cycle's Presents to have their own work done by their flips'
+    // times (FgFlipGatePhase below; 0 none). Returns the earliest time the first flip may come: the distance behind
+    // the flip before, 0 where there is none to keep; with a phase no sooner than the phase, and then no more than a
+    // step and what a flip gives back behind the flip before, so the schedule moves later as slowly as the give-back
+    // moves it earlier.
+    int64_t Begin(int64_t pacer_cycle, int flips = 2, int64_t phase = 0) noexcept {
         outputs = flips >= 2 ? flips : 2;
         cycle = pacer_cycle > 0 ? pacer_cycle : last_cycle;
         earliest = 0;
         generated_flip = 0;
         held = false;
-        if (cycle > 0 && last_flip > 0) earliest = last_flip + Distance(Step());
+        if (cycle > 0 && last_flip > 0) {
+            const int64_t step = Step(), distance = Distance(step);
+            earliest = last_flip + distance;
+            if (phase > earliest) {
+                const int64_t most = last_flip + step + (step - distance);
+                earliest = phase < most ? phase : most;
+            }
+        }
         return earliest;
     }
 
-    // The first generated frame's own work was done at `work`, before the earliest time Begin gave; frame generation
-    // had completed for it at `done` (not after `work`). Returns its flip's time: never before `work`, never past the
-    // earliest time, never more than a step behind `done`.
-    int64_t Generated(int64_t work, int64_t done) noexcept {
+    // The first generated frame's own work was done at `work`; frame generation had completed for it at `done` (not
+    // after `work`). Returns its flip's time: never before `work`, never past the earliest time Begin gave unless
+    // `gap` asks for it, never more than a step behind `done`.
+    //
+    // `gap`: developer key fg_flip_gate_fit, how far behind the first frame's work the first flip has to stand for
+    // the cycle's later frames to be ready a step apart behind it, as the newest cycles had it (FgFlipGatePhase with
+    // the first frame's work for its target; 0 none). The flip then stands no sooner than `work` plus the gap, less
+    // half of what that would put between it and the flip before beyond a step, and never sooner than `work`: a
+    // cycle that comes late shares its lateness between the interval before its first flip and the one behind it,
+    // and a cycle that comes in time is held where its later frames can follow.
+    int64_t Generated(int64_t work, int64_t done, int64_t gap = 0) noexcept {
         const int64_t most = done + Step();
-        const int64_t time = earliest < most ? earliest : most;
+        int64_t time = earliest < most ? earliest : most;
+        if (gap > 0 && cycle > 0 && last_flip > 0) {
+            const int64_t floor = work + gap;
+            const int64_t over = floor - (last_flip + Step());
+            const int64_t share = over <= 0 ? 0 : over / 2 < gap ? over / 2 : gap;
+            const int64_t fit = floor - share < most ? floor - share : most;
+            if (fit > time) time = fit;
+        }
         held = time > work;
         return held ? time : work;
     }
@@ -133,3 +159,128 @@ struct FgFlipGateRule {
         last_spacing = 0;
     }
 };
+
+// Developer key fg_flip_gate_cover: how far behind the pacer's target for a frame's FG input the cycle's first flip
+// has to stand for the own work of every Present of the cycle to be done by its flip's time, as the newest cycles
+// needed it.
+//
+// Why. The rule above gives a hundredth of a step back at every junction, so against the pacer's grid the schedule
+// stands that much earlier each cycle (64 us at 3x and 157 fps), and only a flip that comes with its work after its
+// time moves it back, by that lateness. Where the pacer holds each frame's FG input to its grid the schedule
+// therefore settles where late flips cancel the give-back: 76 and 64 us of lateness a cycle in two captures against
+// 63.7 us given back, a fifth of the cycles late by 0.3 to 0.4 ms (Phantom Blade Zero at 3x, 2026-11-23, N.213
+// finding 1258). The late Present is the one with the least room, at 3x the second generated frame's: DLSS-G makes
+// it its own spacing behind generation's completion, and its work then takes 0.8 ms at the median and 2 to 2.5 ms
+// at the tail. Generation completes a steady time behind the pacer's target: what moves is the schedule. So the
+// first flip is given a place on the pacer's grid, the target plus what a share of the newest cycles needed, and
+// the give-back ends there.
+//
+// Rejected on measurement: making that Present sooner instead (when the flip before it is let go), so that no flip
+// moves. Its work then takes over a step in 1 to 1.5% of cycles, most often where it is made within 2 ms of
+// generation's completion, and the lateness left falls on the real frame alone: 1% low -5.6 and -10.1 fps and
+// hitches +40 and +20 a minute against the rule as it stood (two sessions of three rounds, N.213 finding 1259).
+//
+// A cycle's need: the latest, over its Presents, of when the Present's own work was done less its place's steps,
+// behind the target. A sample comes from a time the first flip does not set (the frame's generation, DLSS-G's own
+// spacing), or, where a Present's work stood behind the gate before it, lies below the place the first flip had: the
+// phase does not feed itself. A cycle with a Present whose work was not timed gives no sample.
+//
+// Developer key fg_flip_gate_fit uses the same record with the first frame's own work for its target: the need is
+// then how far behind that work the first flip has to stand for the later frames to follow a step apart (0 where
+// they are ready sooner), which FgFlipGateRule::Generated takes as its `gap`.
+struct FgFlipGatePhase {
+    static constexpr int kWindow = 256;   // cycles kept: 5 s at 50 frames a second
+    static constexpr int kWarm = 64;      // cycles before a phase is given
+    int cover = 99;                       // the key's value: the share of the kept cycles the phase covers, percent
+
+    void Reset() noexcept {
+        count = 0;
+        next = 0;
+        phase = 0;
+        BeginCycle();
+    }
+    bool Warm() const noexcept { return count >= kWarm; }
+    // Ticks behind the pacer's target; meaningful once Warm.
+    int64_t Phase() const noexcept { return phase; }
+
+    void BeginCycle() noexcept {
+        worst = 0;
+        seen = 0;
+        any = false;
+        whole = true;
+    }
+    // The Present at `index` of the cycle in progress, in order from 0: its own work was seen done at `done` (0: not
+    // timed); `step` the cycle's.
+    void Work(int index, int64_t done, int64_t step) noexcept {
+        if (index != seen) whole = false;
+        seen = index + 1;
+        if (done <= 0 || step <= 0) {
+            whole = false;
+            return;
+        }
+        const int64_t first = done - index * step;
+        if (!any || first > worst) worst = first;
+        any = true;
+    }
+    // The cycle's last flip has happened. `target`: the pacer's target for the frame's FG input (0: it had none, or
+    // did not hold the frame to it); `flips`: the cycle's flips. Whether the cycle gave a sample.
+    bool EndCycle(int64_t target, int flips) noexcept {
+        const bool sample = whole && any && seen == flips && target > 0;
+        if (sample) Add(worst - target);
+        BeginCycle();
+        return sample;
+    }
+    void Add(int64_t need) noexcept {
+        samples[next] = need;
+        next = (next + 1) % kWindow;
+        if (count < kWindow) ++count;
+        if (count >= kWarm) phase = Cover();
+    }
+    // Lower-index empirical quantile of the kept samples, sorted[floor(p * (n - 1))], as pacing_metrics.h; the share
+    // within 50 to 99 percent.
+    int64_t Cover() const noexcept {
+        if (count <= 0) return 0;
+        int64_t sorted[kWindow];
+        std::copy(samples, samples + count, sorted);
+        const int share = cover < 50 ? 50 : cover > 99 ? 99 : cover;
+        const int rank = share * (count - 1) / 100;
+        std::nth_element(sorted, sorted + rank, sorted + count);
+        return sorted[rank];
+    }
+
+    int64_t samples[kWindow] = {};
+    int count = 0, next = 0;
+    int64_t phase = 0;
+    // The cycle in progress.
+    int64_t worst = 0;   // the latest of (work done less its place's steps) so far
+    int seen = 0;        // its Presents so far
+    bool any = false;    // one of them was timed
+    bool whole = true;   // every one was timed, in order
+};
+
+// Developer key fg_flip_gate_entry: when a Present after the first is made in a cycle whose first flip was not held.
+//
+// Why. A later flip ran on two clocks: its Present was made when the hold let it go, DLSS-G's own spacing behind
+// generation's completion, and its flip's time was counted from the cycle's first flip. Where the first flip is held
+// to a time the schedule sets the room between the two. Where it comes with its own work (a cycle late for the
+// schedule; that work is done about 1 ms before the completion is stamped) the Present was behind its flip's time
+// before its work began, so such a cycle showed a second long interval behind the one its lateness made: the later
+// flip's lateness less its work was +1.2 to +1.4 ms there against -1.2 to -1.9 ms in held cycles, 10 to 18 such
+// intervals a minute at a cap and 90 to 430 where the GPU or the CPU is the limit (Phantom Blade Zero at 2x and 3x,
+// N.213 findings 1263 to 1265). There the Present is made the fit's gap before its own flip's time instead, never
+// later than the spacing gives: what the newest cycles' later frames needed behind the first frame's work.
+//
+// Rejected on measurement: making every cycle's later Presents sooner, at their arrival, by a percentile of their
+// own work or by a fixed lead (findings 1259, 1262, 1264). Away from where it was made before, a Present's work
+// takes a step or more in 0.2 to 1.1% of cycles; in the cycles of this rule, a hundredth of all, that is rare.
+//
+// `own`: the time DLSS-G's spacing behind generation's completion gives; `gap`: FgFlipGateRule::Generated's (ticks;
+// 0: none known), never taken for more than three quarters of a spacing, so the Present is not made before the flip
+// before it; `first`: the cycle's first flip as it happened (0: not known); `spacing`: DLSS-G's own spacing a
+// place, which a not-held cycle's flips stand apart by; `index`: the Present's place.
+constexpr int64_t FgFlipGateEntryTime(int64_t own, int64_t gap, int64_t first, int64_t spacing, int index) noexcept {
+    if (gap <= 0 || first <= 0 || spacing <= 0 || index < 1) return own;
+    const int64_t most = spacing - spacing / 4;
+    const int64_t time = first + index * spacing - (gap < most ? gap : most);
+    return time < own ? time : own;
+}

@@ -10,6 +10,7 @@
 #include <new>
 #include <thread>
 
+#include "fg_present_order.h"
 #include "pacing_telemetry.h"
 #include "runtime_lifecycle.h"
 #include "logger.h"
@@ -212,6 +213,14 @@ void NativePclInternal_PublishDisplaySample(
     const PacingDisplaySample& sample) noexcept
 {
     PacingTelemetry_PushDisplay(sample);
+}
+
+bool NativePclInternal_FindPresentPlace(
+    uint32_t thread_id,
+    int64_t present_start_qpc,
+    FgPresentPlace* place) noexcept
+{
+    return FgPresentOrder_FindPlace(thread_id, present_start_qpc, place);
 }
 
 void NativePclInternal_PublishSample(

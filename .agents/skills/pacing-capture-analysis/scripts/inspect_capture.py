@@ -233,12 +233,22 @@ CURRENT_PACING_EVENTS_HEADER = [
     # from builds of 2026-10-04 to 2026-10-20, gpu_wait_cap (GpuWaitCapCause) rows (the governor_step,
     # rung_feasibility and stall_injected types are no longer written; their numbers stay);
     "reason",
+    # flip_gate rows (builds from 2026-11-23): one per flip the flip gate let go, frame generation presenting
+    # from its own thread (PacingFlipSample and PacingFlipGateDetail; times are QPC, empty where the gate had none).
+    "flip_epoch", "flip_serial", "flip_marker", "flip_place", "flip_outputs", "flip_real", "flip_plan",
+    "flip_cycle_us", "flip_input_target_qpc", "flip_arrived_qpc", "flip_entered_qpc", "flip_spacing_us",
+    "flip_enqueued_qpc", "flip_earliest_qpc", "flip_marker_done_qpc", "flip_rule_done_qpc", "flip_held",
+    "flip_target_qpc", "flip_moved", "flip_bounded", "flip_release_qpc", "flip_release", "flip_rule_qpc",
+    "flip_ready_qpc", "flip_ready",
+    # Appended after the first build that wrote flip_gate rows (its files are historical-source-111).
+    "flip_frame_id",
 ]
 
 # Earlier rows files carry a prefix of PRE_REMOVAL_PACING_HEADER of these
 # lengths (the lengths count the pre-removal columns, so they stay valid for
 # the old header only). The events header did not change in Phase 3 or 4 (new
-# event kinds only), so a Phase 2 events file is current-source-86.
+# event kinds only), so a Phase 2 events file is historical-source-86: the
+# header every build before the flip_gate rows wrote.
 HISTORICAL_PACING_HEADER_LENGTHS = (198, 195, 189, 183, 172, 162, 161, 159, 158, 148, 142, 140, 138, 136, 133, 132, 129, 122, 111)  # before the queue role column;
                                                                                                                                       # before the render-thread feed columns;
                                                                                                                                 # before the CPU time and thread id columns;
@@ -256,7 +266,8 @@ HISTORICAL_PACING_HEADER_LENGTHS = (198, 195, 189, 183, 172, 162, 161, 159, 158,
                                                                                   # Phase 4 before the wait starts;
                                                                                   # Phase 3 (Q16); Phase 3 before Q16;
                                                                                   # Phase 2; Phase 1; Phase 0
-HISTORICAL_PACING_EVENTS_HEADER_LENGTHS = (85, 81, 50)  # Phase 1; Phase 0; before snapshot rows
+HISTORICAL_PACING_EVENTS_HEADER_LENGTHS = (111, 86, 85, 81, 50)  # the first flip_gate build; before the flip_gate
+                                                                # rows; Phase 1; Phase 0; before snapshot rows
 
 
 # ── Stream recognition ──

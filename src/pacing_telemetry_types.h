@@ -452,6 +452,50 @@ struct PacingDisplaySample {
     double pcl_dropped_accumulation_us = 0.0;
 };
 
+// The capture's flip_gate event rows (relimiter_pacing_events_*): what the flip gate knew and did for one flip. The
+// value tables are in tests/data/pacing_schema.txt (flip_plan, flip_release, flip_ready).
+enum class PacingFlipPlan : uint8_t {
+    None = 0,   // the pacer had no plan for the flip's frame
+    Held = 1,   // it held the frame's FG input to its grid
+    Late = 2    // it had a plan and did not hold: the frame was late for its slot
+};
+enum class PacingFlipRelease : uint8_t {
+    AtOnce = 0,   // let go as the clock reached it: no time to keep, or the time had passed
+    Timed = 1,    // let go at its time
+    WithWork = 2  // let go, and the flip came later with the frame's own work
+};
+enum class PacingFlipReady : uint8_t {
+    None = 0,       // no readiness stamp went on the queue, or it never completed
+    Before = 1,     // seen complete before the release: flip_ready_qpc is when
+    ByRelease = 2,  // complete at the look behind the release; when is not known
+    After = 3       // seen complete after the release: flip_ready_qpc is when
+};
+// Filled by the flip gate's clock thread only while a capture runs. Times are QPC, 0 = none. A time the clock saw
+// (ready_qpc) carries the clock thread's wake after the event; the others are stamps of the thread that acted.
+struct PacingFlipGateDetail {
+    uint64_t entry_marker = 0;      // the marker its Present's entry hold counted from (the cycle's, as a rule)
+    uint64_t frame_id = 0;          // the game's frame id of the cycle's frame (its proxy Present's), 0 none known
+    int64_t input_target_qpc = 0;   // the frame's FG input: its release target as planned, or the decision's time
+                                    // where the frame was late for its slot (PacingFlipPlan::Late)
+    int64_t arrived_qpc = 0;        // its Present reached ReLimiter, in front of the entry hold
+    int64_t entered_qpc = 0;        // the entry hold ended and the native Present began
+    int64_t spacing_ticks = 0;      // a later Present's: DLSS-G's own spacing times its place
+    int64_t enqueued_qpc = 0;       // the gate's Wait went on the queue, inside the native Present
+    int64_t earliest_qpc = 0;       // the first flip's: the earliest time the distance from the flip before allows
+    int64_t marker_done_qpc = 0;    // frame generation's completion as stamped for entry_marker
+    int64_t rule_done_qpc = 0;      // the first flip's: the completion the rule was given (0: it was not asked)
+    int64_t target_qpc = 0;         // the flip's time as decided, after the bound and a move forward
+    int64_t release_qpc = 0;        // the clock's Signal of the gate
+    int64_t rule_flip_qpc = 0;      // the flip's time as the rule was told it
+    int64_t ready_qpc = 0;          // the frame's own work in front of the gate was seen done (PacingFlipReady)
+    PacingFlipPlan plan = PacingFlipPlan::None;
+    PacingFlipRelease release = PacingFlipRelease::AtOnce;
+    PacingFlipReady ready = PacingFlipReady::None;
+    uint8_t held = 0;               // the cycle's first flip was held behind its own work (the rule's `held`)
+    uint8_t moved = 0;              // a later flip moved forward for the next frame
+    uint8_t bounded = 0;            // its time was cut at the gate's bound
+};
+
 // The flip gate's clock thread (fg_present_order.cpp), once per flip it let go: frame generation presenting from its
 // own thread, where ReLimiter times each displayed frame. flip_qpc is when the flip happened as the gate knows it:
 // its release as the clock made it, or the frame's own work where that was done later (the flip follows by 0.14 ms
@@ -466,4 +510,6 @@ struct PacingFlipSample {
     uint8_t index = 0;       // the flip's place in its cycle: 0 the first generated frame's
     uint8_t outputs = 0;     // the cycle's flips: 2 at 2x, 3 at 3x, 4 at 4x
     uint8_t real = 0;        // the cycle's last flip, the real frame's
+    uint8_t detailed = 0;    // `detail` is filled (a capture runs)
+    PacingFlipGateDetail detail{};
 };

@@ -95,6 +95,7 @@
 // that compiles a caller gets the no-op forms below.
 #include <atomic>
 #include <cstdint>
+#include "fg_present_places.h"
 
 inline std::atomic<bool> g_fg_present_order{false};
 // Order waits enqueued and released so far (the release side runs only while they differ).
@@ -155,9 +156,27 @@ inline std::atomic<int> g_fg_present_ahead{0};
 // default 100): the share of the displayed interval given back per flip after a late frame, as 1/this
 // (fg_flip_gate_rule.h).
 inline std::atomic<int> g_fg_flip_gate_give_back{100};
+// fg_present_ahead 3 and 4 (developer live key `fg_flip_gate_cover`, 0 off | 50 to 99, default 95): a cycle's first
+// flip is placed on the pacer's grid, the frame's FG input target plus what that share (percent) of the newest
+// cycles needed for every Present's own work to be done by its flip's time, instead of as early as the distance
+// from the flip before allows (FgFlipGatePhase in fg_flip_gate_rule.h).
+inline std::atomic<int> g_fg_flip_gate_cover{0};
+// fg_present_ahead 3 and 4 (developer live key `fg_flip_gate_entry`, default off; needs `fg_flip_gate_fit`): in a
+// cycle whose first flip came with its own work, a later Present is made the fit's gap before its flip's time, never
+// later than DLSS-G's own spacing behind generation's completion puts it (FgFlipGateEntryTime in
+// fg_flip_gate_rule.h).
+inline std::atomic<int> g_fg_flip_gate_entry{0};
+// fg_present_ahead 3 and 4 (developer live key `fg_flip_gate_fit`, 0 off | 50 to 99, default 75): a cycle's first flip
+// stands no sooner than its own work plus what that share (percent) of the newest cycles' later frames were ready
+// behind a step grid from it, less half of what that puts between it and the flip before beyond a step
+// (FgFlipGateRule::Generated in fg_flip_gate_rule.h).
+inline std::atomic<int> g_fg_flip_gate_fit{0};
 // Threads in a cycle woken ahead that have not presented since, and threads with a flip gate armed for the native
 // Present they are in: the gate of the unit's work in front of a native Present and at its return.
 inline std::atomic<int> g_fg_present_ahead_woken{0};
+// A Present of a cycle woken ahead has been placed since the add-on loaded (fg_present_places.h): the gate of the PC
+// Latency collector's lookup below.
+inline std::atomic<bool> g_fg_present_placed{false};
 
 #if defined(_WIN64) && defined(RELIMITER_FG_PRESENT_ORDER)
 #include <Windows.h>
@@ -179,7 +198,7 @@ void FgPresentOrder_Service(bool fg_presenting, int fg_multiplier) noexcept;
 void FgPresentOrder_BeforeExecuteActive(ID3D12CommandQueue* queue, FgPresentOrder_FenceFn native_signal,
     FgPresentOrder_FenceFn native_wait) noexcept;
 void FgPresentOrder_NoteQueueWaitActive(ID3D12CommandQueue* queue, ID3D12Fence* fence, uint64_t value) noexcept;
-void FgPresentOrder_NotePlanActive(bool held, double interval_us) noexcept;
+void FgPresentOrder_NotePlanActive(bool held, double interval_us, int64_t target_qpc) noexcept;
 void FgPresentOrder_NotePresentQueueActive(void* queue) noexcept;
 // ReShade's present event, in front of the native Present (no thread in a cycle woken ahead: one load and a branch):
 // the swapchain's queue, for the gate of a Present of such a cycle.
@@ -197,6 +216,13 @@ inline void FgPresentOrder_AfterSignal(ID3D12CommandQueue* queue) noexcept {
 }
 void FgPresentOrder_AheadBeforePresent() noexcept;
 bool FgPresentOrder_AheadAfterPresent(bool presented) noexcept;
+bool FgPresentOrder_FindPlaceActive(uint32_t thread, int64_t start_qpc, FgPresentPlace* place) noexcept;
+// The PC Latency collector, per Present record of ETW (nothing placed yet: one load and a branch): the place of the
+// Present `thread` had in progress at `start_qpc` in its frame generation cycle, where this unit made one for it.
+inline bool FgPresentOrder_FindPlace(uint32_t thread, int64_t start_qpc, FgPresentPlace* place) noexcept {
+    return g_fg_present_placed.load(std::memory_order_relaxed) &&
+        FgPresentOrder_FindPlaceActive(thread, start_qpc, place);
+}
 
 // Queue Signal detour, outermost calls only (key off: one load and a branch).
 inline void FgPresentOrder_NoteSignal(void* queue, void* fence) noexcept {
@@ -219,11 +245,12 @@ inline void FgPresentOrder_NoteQueueWait(ID3D12CommandQueue* queue, ID3D12Fence*
         FgPresentOrder_NoteQueueWaitActive(queue, fence, value);
 }
 // The FG input wait's outcome for the frame of the current proxy Present scope (the unit not ordering, which is tested
-// first: one load and a branch): the pacer's grid interval for the input, and whether it holds the input to the grid
-// (a planned input not held was late for its slot).
-inline void FgPresentOrder_NotePlan(bool held, double interval_us) noexcept {
+// first: one load and a branch): the pacer's grid interval for the input, whether it holds the input to the grid
+// (a planned input not held was late for its slot), and the release target it resolved for a held input.
+inline void FgPresentOrder_NotePlan(bool held, double interval_us, int64_t target_qpc) noexcept {
     if (g_fg_present_order_queue.load(std::memory_order_relaxed) != nullptr &&
-        g_fg_present_ahead.load(std::memory_order_relaxed) >= 3) FgPresentOrder_NotePlanActive(held, interval_us);
+        g_fg_present_ahead.load(std::memory_order_relaxed) >= 3)
+        FgPresentOrder_NotePlanActive(held, interval_us, target_qpc);
 }
 // Queue Execute detour, in front of the native call, outermost calls only. The ordering's queue is tested first, so
 // where the unit does not order (hardware flip metering, no frame generation) this gate is one load and a branch.
@@ -277,4 +304,5 @@ inline void FgPresentOrder_BeforeNativePresent() noexcept {}
 inline void FgPresentOrder_OnQueueDestroy(void*) noexcept {}
 inline bool FgPresentOrder_Shutdown(unsigned long) noexcept { return true; }
 inline void FgPresentOrder_Service(bool, int) noexcept {}
+inline bool FgPresentOrder_FindPlace(uint32_t, int64_t, FgPresentPlace*) noexcept { return false; }
 #endif

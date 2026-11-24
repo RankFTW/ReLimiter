@@ -9,6 +9,7 @@
 #include "vsync_control.h"
 #include "pacing_resolver.h"
 #include "reflex_inject.h"
+#include "display_state.h"
 #include "logger.h"
 #include "fg_present_order.h"
 #include <Windows.h>
@@ -421,6 +422,9 @@ void LoadConfig(HMODULE hModule) {
     g_config.fg_render_break_window=ReadINIInt(S,"fg_render_break_window",-1,P);
     g_config.fg_present_ahead=ReadINIInt(S,"fg_present_ahead",4,P);
     g_config.fg_flip_gate_give_back=ReadINIInt(S,"fg_flip_gate_give_back",100,P);
+    g_config.fg_flip_gate_cover=ReadINIInt(S,"fg_flip_gate_cover",kPacingFgFlipGateCoverDefault,P);
+    g_config.fg_flip_gate_entry=ReadINIInt(S,"fg_flip_gate_entry",0,P);
+    g_config.fg_flip_gate_fit=ReadINIInt(S,"fg_flip_gate_fit",kPacingFgFlipGateFitDefault,P);
     g_config.fg_late_spacing_slack=ReadINIInt(S,"fg_late_spacing_slack",kPacingFgLateSpacingSlackDefault,P);
     g_config.fg_late_spacing_commanded=ReadINIBool(S,"fg_late_spacing_commanded",false,P);
     g_config.fg_lead_extra_us=ReadINIInt(S,"fg_lead_extra_us",kPacingFgLeadExtraDefaultUs,P);
@@ -646,6 +650,9 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     WriteINIBool(S, "gpu_wait_present_first", config.gpu_wait_present_first, P);
     WriteINIBool(S, "gpu_wait_start_limit", config.gpu_wait_start_limit, P);
     WriteINIBool(S, "lead_queue_correction", config.lead_queue_correction, P);
+    WriteINIInt(S, "fg_flip_gate_cover", config.fg_flip_gate_cover, P);
+    WriteINIInt(S, "fg_flip_gate_entry", config.fg_flip_gate_entry, P);
+    WriteINIInt(S, "fg_flip_gate_fit", config.fg_flip_gate_fit, P);
     WriteINIInt(S, "gpu_wait_ab_interleave_s", config.gpu_wait_ab_interleave_s, P);
     WriteINIBool(S, "gpu_queue_probe", config.gpu_queue_probe, P);
     WriteINIInt(S, "gpu_queue_probe_source", config.gpu_queue_probe_source, P);
@@ -941,6 +948,11 @@ void Config_ApplyPacingPipeline() {
     g_fg_render_break_window.store(std::clamp(g_config.fg_render_break_window, -1, 32), std::memory_order_relaxed);
     g_fg_present_ahead.store(sizeof(void*) == 8 ? std::clamp(g_config.fg_present_ahead, 0, 4) : 0, std::memory_order_relaxed);
     g_fg_flip_gate_give_back.store(std::clamp(g_config.fg_flip_gate_give_back, 4, 1000), std::memory_order_relaxed);
+    g_fg_flip_gate_cover.store(sizeof(void*) == 8 && g_config.fg_flip_gate_cover > 0
+        ? std::clamp(g_config.fg_flip_gate_cover, 50, 99) : 0, std::memory_order_relaxed);
+    g_fg_flip_gate_entry.store(sizeof(void*) == 8 && g_config.fg_flip_gate_entry > 0 ? 1 : 0, std::memory_order_relaxed);
+    g_fg_flip_gate_fit.store(sizeof(void*) == 8 && g_config.fg_flip_gate_fit > 0
+        ? std::clamp(g_config.fg_flip_gate_fit, 50, 99) : 0, std::memory_order_relaxed);
     g_fg_late_spacing_slack.store(std::clamp(g_config.fg_late_spacing_slack, 0, 1000), std::memory_order_relaxed);
     g_fg_late_spacing_commanded.store(g_config.fg_late_spacing_commanded ||
         (kPacingPreferenceSmoothFloorCommanded && g_config.pacing_preference == PacingPreference::Smooth),
@@ -1021,6 +1033,9 @@ constexpr Key kKeys[] = {
     {"fg_render_break_window", &SetInt<&Config::fg_render_break_window>, Publish::Pipeline},
     {"fg_present_ahead", &SetInt<&Config::fg_present_ahead>, Publish::Pipeline},
     {"fg_flip_gate_give_back", &SetInt<&Config::fg_flip_gate_give_back>, Publish::Pipeline},
+    {"fg_flip_gate_cover", &SetInt<&Config::fg_flip_gate_cover>, Publish::Pipeline},
+    {"fg_flip_gate_entry", &SetInt<&Config::fg_flip_gate_entry>, Publish::Pipeline},
+    {"fg_flip_gate_fit", &SetInt<&Config::fg_flip_gate_fit>, Publish::Pipeline},
     {"fg_late_spacing_slack", &SetInt<&Config::fg_late_spacing_slack>, Publish::Pipeline},
     {"fg_late_spacing_commanded", &SetBool<&Config::fg_late_spacing_commanded>, Publish::Pipeline},
     {"fg_lead_extra_us", &SetInt<&Config::fg_lead_extra_us>, Publish::Pipeline},
@@ -1055,7 +1070,7 @@ bool Config_SetLiveKey(const char* key, const char* value, char* error, size_t e
     ValidateConfig();
     switch (entry->publish) {
         case live_key::Publish::TargetFps:
-            g_user_target_fps.store(g_config.target_fps, std::memory_order_relaxed);
+            DisplayState_PublishTargetFps();
             break;
         case live_key::Publish::BackgroundFps:
             g_background_fps.store(g_config.background_fps, std::memory_order_relaxed);
@@ -1080,6 +1095,9 @@ int Config_DeveloperOverrides() {
         (g_config.gpu_wait_present_first != d.gpu_wait_present_first) +
         (g_config.gpu_wait_start_limit != d.gpu_wait_start_limit) +
         (g_config.lead_queue_correction != d.lead_queue_correction) +
+        (g_config.fg_flip_gate_cover != d.fg_flip_gate_cover) +
+        (g_config.fg_flip_gate_entry != d.fg_flip_gate_entry) +
+        (g_config.fg_flip_gate_fit != d.fg_flip_gate_fit) +
         (g_config.gpu_wait_ab_interleave_s != d.gpu_wait_ab_interleave_s) +
         (g_config.control_file != d.control_file) +
         (g_config.gpu_queue_probe != d.gpu_queue_probe) +
@@ -1104,6 +1122,9 @@ void Config_ResetDeveloperSettings() {
     g_config.gpu_wait_present_first = d.gpu_wait_present_first;
     g_config.gpu_wait_start_limit = d.gpu_wait_start_limit;
     g_config.lead_queue_correction = d.lead_queue_correction;
+    g_config.fg_flip_gate_cover = d.fg_flip_gate_cover;
+    g_config.fg_flip_gate_entry = d.fg_flip_gate_entry;
+    g_config.fg_flip_gate_fit = d.fg_flip_gate_fit;
     g_config.gpu_wait_ab_interleave_s = d.gpu_wait_ab_interleave_s;
     g_config.control_file = d.control_file;
     g_config.gpu_queue_probe = d.gpu_queue_probe;
@@ -1125,7 +1146,7 @@ void Config_ResetDeveloperSettings() {
 void ApplyConfig() {
     // Wire config values to module globals
     OLEDCare_SetConfig(g_config.oled_care_all_monitors, g_config.oled_care_idle_minutes);
-    g_user_target_fps.store(g_config.target_fps, std::memory_order_relaxed);
+    DisplayState_PublishTargetFps();
     g_background_fps.store(g_config.background_fps, std::memory_order_relaxed);
     g_fg_off_fps.store(g_config.fg_off_fps, std::memory_order_relaxed);
     g_adaptive_wake_guard.base = g_config.initial_wake_guard_us;
@@ -1160,6 +1181,25 @@ void ApplyConfig() {
         LOG_WARN("Diagnostic GPU wait late guard on: while the newest 64 frames all arrived late for their slot, "
                  "the limit on the GPU queue wait's lead follows their lateness and earliest heavy GPU work "
                  "(gpu_wait_late_guard=true, interleave %d s)", g_config.gpu_wait_ab_interleave_s);
+    // The flip gate's cover and fit are on by default: a line only when one is off its default.
+    if (sizeof(void*) == 8 && g_config.fg_flip_gate_cover != kPacingFgFlipGateCoverDefault)
+        LOG_WARN("Diagnostic flip gate cover off its default: fg_flip_gate_cover=%d (default %d; 0 is off). With frame "
+                 "generation and no hardware flip metering a frame's first flip is placed on the pacer's grid, as far "
+                 "behind the frame's FG input target as that share of the newest frames' Presents needed for their "
+                 "work; off, it comes as early as its distance from the flip before allows (64-bit Direct3D 12)",
+                 g_config.fg_flip_gate_cover > 0 ? std::clamp(g_config.fg_flip_gate_cover, 50, 99) : 0,
+                 kPacingFgFlipGateCoverDefault);
+    if (sizeof(void*) == 8 && g_config.fg_flip_gate_entry > 0)
+        LOG_WARN("Diagnostic flip gate entry on: with frame generation and no hardware flip metering, in a frame whose "
+                 "first flip came with its own work the later Presents are made by their flips' times (it needs "
+                 "fg_flip_gate_fit, now %d; fg_flip_gate_entry; 64-bit Direct3D 12)", g_config.fg_flip_gate_fit);
+    if (sizeof(void*) == 8 && g_config.fg_flip_gate_fit != kPacingFgFlipGateFitDefault)
+        LOG_WARN("Diagnostic flip gate fit off its default: fg_flip_gate_fit=%d (default %d; 0 is off). With frame "
+                 "generation and no hardware flip metering a frame's first flip stands no sooner than its later frames "
+                 "can follow a step apart, as that share of the newest frames had it, and a late frame's lateness is "
+                 "shared with the interval before (64-bit Direct3D 12)",
+                 g_config.fg_flip_gate_fit > 0 ? std::clamp(g_config.fg_flip_gate_fit, 50, 99) : 0,
+                 kPacingFgFlipGateFitDefault);
     // Present-first ordering and the start limit are on by default: a line only when one is off and, with it on,
     // when the interleave alternates it (the period the scheduler reads: published clamped to 0-600). The
     // interleave alternates the start limit while that key is on, and present-first only while it is off.

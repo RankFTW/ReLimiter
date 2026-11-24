@@ -46,7 +46,10 @@ enum PresentClassificationEvidence : uint32_t {
     PRESENT_CLASSIFICATION_EVIDENCE_PRESENTMON_GENERATED = 1u << 4,
     PRESENT_CLASSIFICATION_EVIDENCE_MIXED_FRAME_TYPES = 1u << 5,
     // An earlier present of the same app frame (PresentFrameGrouper).
-    PRESENT_CLASSIFICATION_EVIDENCE_EARLIER_PRESENT_OF_FRAME = 1u << 6
+    PRESENT_CLASSIFICATION_EVIDENCE_EARLIER_PRESENT_OF_FRAME = 1u << 6,
+    // The last present of an app frame of several (PresentFrameGrouper): the frame's own, with or without the
+    // frame's marker known.
+    PRESENT_CLASSIFICATION_EVIDENCE_LAST_PRESENT_OF_FRAME = 1u << 7
 };
 
 // Independent of the number of displayed instances carried by the event.
@@ -92,6 +95,9 @@ struct PresentAppIdentity {
     // Simulation start a present without its own marker reuses; 0 means the
     // chain's last simulation start.
     uint64_t fallback_sim_start_qpc = 0;
+    // A placed present whose frame's marker present is not known: the chain's last simulation start is another
+    // frame's and does not stand for its own, so it gets no PC Latency.
+    bool frame_unknown = false;
 };
 
 enum class PresentGroupRole : uint8_t {
@@ -116,6 +122,9 @@ struct PresentGroupResolved {
     // The group's marker present; the present itself when Standalone.
     Payload head{};
     PresentGroupRole role = PresentGroupRole::Standalone;
+    // False: a placed present (AddPlaced) whose frame's marker present is not known. It has no head and no identity
+    // of its own to use: a marker it carries is another frame's.
+    bool identified = true;
 };
 
 // Per-swapchain, deterministic grouping of presents into app frames. A group
@@ -135,13 +144,15 @@ class PresentFrameGrouper
 public:
     using Resolved = PresentGroupResolved<Payload>;
 
-    // Resolved presents are appended to *out in arrival order.
+    // Resolved presents are appended to *out in arrival order. `marker_frame_id`: the frame whose marker the present
+    // carries (0: none or not known), for a placed present that follows (AddPlaced).
     void Add(
         const Payload& present,
         bool carries_marker,
         bool presentmon_typed,
         uint64_t now_qpc,
-        std::vector<Resolved>* out)
+        std::vector<Resolved>* out,
+        uint32_t marker_frame_id = 0)
     {
         if (carries_marker) {
             ResolvePending(out);
@@ -152,6 +163,7 @@ public:
             }
             else {
                 Hold(present, now_qpc);
+                pending_frame_id_ = marker_frame_id;
             }
             return;
         }
@@ -171,10 +183,67 @@ public:
         Hold(present, now_qpc);
     }
 
+    // A present whose place in its frame generation cycle the add-on itself knows (fg_present_places.h): `frame_id`
+    // is the app frame the cycle presents (0: not known) and `last` says it is the cycle's last present, the real
+    // frame's. Nothing is inferred from the order of the markers. `own_frame_id` is the frame whose marker PresentMon
+    // attached to this present (0: none): the first present after the game's PRESENT_START, which with a presenting
+    // thread of DLSS-G's own is a present of that frame's cycle or of the one before it. The cycle's head is the
+    // newest present that carried the cycle's frame; where none of the last kCarriers marker presents did, the
+    // present is resolved without an identity. Resolved at once.
+    //
+    // Presents the marker order still holds were not found among the places. Where their head carries this cycle's
+    // frame they are taken for earlier presents of this cycle (generated, the head kept as the cycle's): a present
+    // of the cycle before that carried the marker early is then named generated too, which a present without a
+    // place cannot be told from. Otherwise their group ends here by the marker order.
+    void AddPlaced(
+        const Payload& present,
+        uint32_t own_frame_id,
+        uint32_t frame_id,
+        bool last,
+        uint64_t now_qpc,
+        std::vector<Resolved>* out)
+    {
+        if (count_ != 0 && frame_id != 0 && pending_frame_id_ == frame_id) {
+            Keep(pending_[0], frame_id);
+            for (size_t index = 0; index < count_; ++index) {
+                Emit(pending_[index], pending_[0], PresentGroupRole::Generated, out);
+            }
+            ClearPending();
+        }
+        else {
+            ResolvePending(out);
+        }
+        open_ = false;
+        passthrough_ = false;
+        if (own_frame_id != 0) Keep(present, own_frame_id);
+        last_placed_qpc_ = now_qpc;
+        Resolved resolved;
+        resolved.present = present;
+        resolved.head = present;
+        resolved.role = last ? PresentGroupRole::Real : PresentGroupRole::Generated;
+        resolved.identified = false;
+        // Newest first: a frame id met again (the game's count began again) is the newer present's. An unused
+        // carrier has no frame.
+        for (size_t back = 1; frame_id != 0 && back <= kCarriers; ++back) {
+            const Carrier& carrier = carriers_[(carrier_next_ - back) % kCarriers];
+            if (carrier.frame_id == frame_id) {
+                resolved.head = carrier.present;
+                resolved.identified = true;
+                break;
+            }
+        }
+        out->push_back(std::move(resolved));
+    }
+
     // A group whose last present arrived limit_qpc ago or more is taken as
-    // complete. Presents of it that arrive later are Standalone.
+    // complete. Presents of it that arrive later are Standalone. The marker
+    // presents kept for placed presents are let go after the same time.
     void FlushIfStale(uint64_t now_qpc, uint64_t limit_qpc, std::vector<Resolved>* out)
     {
+        if (last_placed_qpc_ != 0 && now_qpc >= last_placed_qpc_ && now_qpc - last_placed_qpc_ >= limit_qpc) {
+            for (Carrier& carrier : carriers_) carrier = Carrier{};
+            last_placed_qpc_ = 0;
+        }
         if (count_ == 0 || now_qpc < last_hold_qpc_ || now_qpc - last_hold_qpc_ < limit_qpc) return;
         ResolvePending(out);
         open_ = false;
@@ -222,11 +291,32 @@ private:
     {
         for (size_t index = 0; index < count_; ++index) pending_[index] = Payload{};
         count_ = 0;
+        pending_frame_id_ = 0;
+    }
+
+    // The newest marker presents among placed presents: a cycle's frame is carried by a present of its own or of the
+    // cycle before it. A power of two: the newest is counted back from a wrapping index.
+    static constexpr size_t kCarriers = 8;
+    static_assert((kCarriers & (kCarriers - 1)) == 0, "kCarriers must be a power of two");
+    struct Carrier {
+        uint32_t frame_id = 0;   // 0: unused
+        Payload present{};
+    };
+    void Keep(const Payload& present, uint32_t frame_id)
+    {
+        Carrier& carrier = carriers_[carrier_next_++ % kCarriers];
+        carrier.frame_id = frame_id;
+        carrier.present = present;
     }
 
     std::array<Payload, Capacity> pending_{};
     size_t count_ = 0;
     uint64_t last_hold_qpc_ = 0;
+    // The frame whose marker the pending group's head carries, 0 not known.
+    uint32_t pending_frame_id_ = 0;
     bool open_ = false;
     bool passthrough_ = false;
+    std::array<Carrier, kCarriers> carriers_{};
+    size_t carrier_next_ = 0;
+    uint64_t last_placed_qpc_ = 0;
 };

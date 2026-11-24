@@ -46,10 +46,12 @@ enum class PacingCsvEventType : uint8_t {
     PclStatus = 12,   // native PCL snapshot status change; value is NativePclStatus
     // Derived from Source records
     GridEpoch = 13,      // value epoch, previous_value previous epoch, reason PacingEpochReason
-    PipelineChange = 14  // pipeline_generation changed: value plan_rung, previous_value previous rung,
+    PipelineChange = 14, // pipeline_generation changed: value plan_rung, previous_value previous rung,
                          // reason PacingFallbackReason
     // 15 stall_injected, 16 governor_step, 17 rung_feasibility and 18 gpu_wait_cap were retired:
     // never written by this build, older files carry them.
+    FlipGate = 19        // one flip the flip gate let go (fg_present_order.cpp): the flip_* columns; event_qpc is
+                         // when the flip happened as the gate knows it (PacingFlipSample::flip_qpc)
 };
 
 // Cumulative pacing telemetry producer drops (requested records lost to a full queue).
@@ -116,6 +118,7 @@ struct PacingCsvEvent {
     PacingChainStatistics chains{};    // join-statistics rows
     PacingCsvSnapshot snapshot{};      // snapshot rows
     PacingPclLossCounters pcl_loss{};  // capture-start, capture-end and queue-drop rows
+    PacingFlipSample flip{};           // flip-gate rows
 };
 
 // Initialize CSV writer. Starts background thread.

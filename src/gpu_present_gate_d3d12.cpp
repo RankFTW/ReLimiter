@@ -1591,8 +1591,8 @@ bool GpuPresent_BeginFgInput(uint64_t native,const GpuPresentFgInput& input) noe
         if(!Enqueue(request,&trace))outcome=AdmissionOutcome(trace);
     }
     // fg_present_ahead 3 and 4 (the ordering unit not ordering: one load and a branch): whether this input is held to
-    // the grid, and the grid's interval, go with this scope's marker, for the flip gate.
-    FgPresentOrder_NotePlan(outcome==PacingPlanStatus::Held,plan.interval_us);
+    // the grid, the grid's interval and the release target go with this scope's marker, for the flip gate.
+    FgPresentOrder_NotePlan(outcome==PacingPlanStatus::Held,plan.interval_us,trace.target_qpc);
     trace.queue=native;trace.swapchain=input.swapchain;trace.present_sequence=0;
     trace.plan_status=static_cast<uint8_t>(outcome);
     RecordOutcome(plan,PacingRung::FgInputWait,outcome,trace.target_qpc,Qpc());

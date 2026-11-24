@@ -205,11 +205,12 @@ class PreRemovalEqualityTests(unittest.TestCase):
             self.assertEqual([[record[i] for i in keep] + [""] * len(APPENDED) for record in old_records],
                              current_records)
         self.for_each_capture(check)
-        # The events header is the same in both variants; the current variant lacks only the retired types.
+        # The events header is the same in both variants (the 86 columns every build before the flip_gate rows
+        # wrote); the current variant lacks only the retired types.
         old_events_header, old_events = read_table(self.events)
         current_events_header, current_events = read_table(self.current_events)
         self.assertEqual(old_events_header, current_events_header)
-        self.assertEqual(old_events_header, inspector.CURRENT_PACING_EVENTS_HEADER)
+        self.assertEqual(old_events_header, inspector.CURRENT_PACING_EVENTS_HEADER[:86])
         column = old_events_header.index("event_type")
         self.assertEqual({record[column] for record in old_events} - {record[column] for record in current_events},
                          {"governor_step", "rung_feasibility", "stall_injected"})

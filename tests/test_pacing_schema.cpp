@@ -192,6 +192,37 @@ const char* PclStatusName(NativePclStatus value)
     return nullptr;
 }
 
+const char* FlipPlanName(PacingFlipPlan value)
+{
+    switch (value) {
+    case PacingFlipPlan::None: return "none";
+    case PacingFlipPlan::Held: return "held";
+    case PacingFlipPlan::Late: return "late";
+    }
+    return nullptr;
+}
+
+const char* FlipReleaseName(PacingFlipRelease value)
+{
+    switch (value) {
+    case PacingFlipRelease::AtOnce: return "at_once";
+    case PacingFlipRelease::Timed: return "timed";
+    case PacingFlipRelease::WithWork: return "with_work";
+    }
+    return nullptr;
+}
+
+const char* FlipReadyName(PacingFlipReady value)
+{
+    switch (value) {
+    case PacingFlipReady::None: return "none";
+    case PacingFlipReady::Before: return "before";
+    case PacingFlipReady::ByRelease: return "by_release";
+    case PacingFlipReady::After: return "after";
+    }
+    return nullptr;
+}
+
 // source_flags bits: the value is the bit. No build names bits 4, 64 and 128 any more.
 const char* SourceFlagName(PacingSourceFlags value)
 {
@@ -441,6 +472,9 @@ int main()
     CheckTable(fixture, "clock_map_status", ByCast(ClockMapStatusName));
     CheckTable(fixture, "pcl_status", ByCast(PclStatusName));
     CheckTable(fixture, "source_flag", ByCast(SourceFlagName));
+    CheckTable(fixture, "flip_plan", ByCast(FlipPlanName));
+    CheckTable(fixture, "flip_release", ByCast(FlipReleaseName));
+    CheckTable(fixture, "flip_ready", ByCast(FlipReadyName));
 
     // The GPU wait cap ladder is gone with its enumeration: every value is an older capture's.
     g_checked_tables.insert("gpu_wait_cap_cause");

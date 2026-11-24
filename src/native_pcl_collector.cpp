@@ -24,6 +24,7 @@
 #include "native_pcl_etw_session.h"
 #include "native_pcl_loss_window.h"
 #include "present_association.h"
+#include "fg_present_places.h"
 
 namespace
 {
@@ -167,15 +168,44 @@ namespace
 
             // Presents of one app frame are told apart only once the frame's
             // group closes (see PresentFrameGrouper); the chain's grouper
-            // returns the presents now resolved, oldest first.
+            // returns the presents now resolved, oldest first. Where the
+            // add-on itself placed the present in its frame generation cycle
+            // (DLSS-G presenting from its own thread, fg_present_places.h),
+            // that place stands instead of the order of the markers.
             SwapchainPclState& chain = swapchain_states_[present->SwapChainAddress];
             resolved_presents_.clear();
-            chain.groups.Add(
-                present,
-                present->PclSimStartTime != 0,
-                HasPresentMonFrameType(*present),
-                QueryQpc(),
-                &resolved_presents_);
+            const bool typed = HasPresentMonFrameType(*present);
+            const uint32_t marker_frame =
+                present->PclSimStartTime != 0 ? present->PclFrameId : 0;
+            FgPresentPlace place;
+            if (!typed && NativePclInternal_FindPresentPlace(
+                    present->ThreadId, static_cast<int64_t>(present->PresentStartTime), &place)) {
+                if (!logged_present_places_) {
+                    logged_present_places_ = true;
+                    LOG_INFO(
+                        "Native PCL: frame generation's presents are labelled "
+                        "by the place ReLimiter recorded for each "
+                        "(swapchain=%llu)",
+                        static_cast<unsigned long long>(present->SwapChainAddress));
+                }
+                // The id PresentMon carries is the low half of the frame's.
+                chain.groups.AddPlaced(
+                    present,
+                    marker_frame,
+                    static_cast<uint32_t>(place.frame),
+                    place.index + 1 >= place.outputs,
+                    QueryQpc(),
+                    &resolved_presents_);
+            }
+            else {
+                chain.groups.Add(
+                    present,
+                    present->PclSimStartTime != 0,
+                    typed,
+                    QueryQpc(),
+                    &resolved_presents_,
+                    marker_frame);
+            }
             ProcessResolvedPresents(chain);
         }
 
@@ -288,14 +318,21 @@ namespace
         void ProcessResolvedPresents(SwapchainPclState& chain)
         {
             for (const auto& resolved : resolved_presents_) {
-                ProcessResolvedPresent(
-                    *resolved.present,
-                    resolved.role,
-                    PresentAssociation_EffectiveIdentity(
+                // A placed present whose frame's marker present is not
+                // known has no identity: the marker it may carry itself is
+                // another frame's, and so is the chain's last simulation
+                // start.
+                PresentAppIdentity identity;
+                if (resolved.identified) {
+                    identity = PresentAssociation_EffectiveIdentity(
                         resolved.role,
                         IdentityOf(*resolved.present),
-                        IdentityOf(*resolved.head)),
-                    chain);
+                        IdentityOf(*resolved.head));
+                }
+                else {
+                    identity.frame_unknown = true;
+                }
+                ProcessResolvedPresent(*resolved.present, resolved.role, identity, chain);
             }
             resolved_presents_.clear();
         }
@@ -679,6 +716,10 @@ namespace
                 evidence |=
                     PRESENT_CLASSIFICATION_EVIDENCE_EARLIER_PRESENT_OF_FRAME;
             }
+            else if (role == PresentGroupRole::Real) {
+                evidence |=
+                    PRESENT_CLASSIFICATION_EVIDENCE_LAST_PRESENT_OF_FRAME;
+            }
             observation.frame_classification =
                 PresentAssociation_ClassifyFrame(evidence);
             return observation;
@@ -832,7 +873,7 @@ namespace
                 ? identity.pcl_sim_start_qpc
                 : identity.fallback_sim_start_qpc != 0
                     ? identity.fallback_sim_start_qpc
-                    : chain.last_simulation_qpc;
+                    : identity.frame_unknown ? 0 : chain.last_simulation_qpc;
             if (!chain.input_to_frame_start_initialized ||
                 simulation_start_qpc == 0) {
                 return false;
@@ -904,6 +945,9 @@ namespace
         bool tracking_synchronized_ = false;
         bool saw_process_present_ = false;
         bool saw_pcl_timing_ = false;
+        // One line a session where presents are first labelled by their
+        // recorded place: the lookup's engagement is otherwise invisible.
+        bool logged_present_places_ = false;
         // Cleared when a loss window closes: the next sample must re-establish
         // availability before EvaluateAvailability stops publishing warm-up.
         bool has_published_sample_ = false;

@@ -20,9 +20,9 @@
 # Tables bound to a *_Text function: rung, placement, fallback_reason, timing_mode, governor_cause,
 # feasibility_cause, event_type (checked through the writer's event_type cell). Tables the build has no text for
 # (epoch_reason, plan_status, display_source, output_kind, join_rule, identity_domain, break_reason,
-# clock_map_status, pcl_status, source_flag) are bound to the enumerators: the C++ test lists every enumerator of
-# the enum and fails to compile when one is added. gpu_wait_cap_cause has no enumeration in the build at all:
-# all of it is retired.
+# clock_map_status, pcl_status, source_flag, flip_plan, flip_release, flip_ready) are bound to the enumerators: the
+# C++ test lists every enumerator of the enum and fails to compile when one is added. gpu_wait_cap_cause has no
+# enumeration in the build at all: all of it is retired.
 
 row_column row_kind
 row_column sequence
@@ -308,6 +308,32 @@ event_column etw_buffers_lost
 event_column lost_present_count
 event_column overflowed_present_count
 event_column reason
+event_column flip_epoch
+event_column flip_serial
+event_column flip_marker
+event_column flip_place
+event_column flip_outputs
+event_column flip_real
+event_column flip_plan
+event_column flip_cycle_us
+event_column flip_input_target_qpc
+event_column flip_arrived_qpc
+event_column flip_entered_qpc
+event_column flip_spacing_us
+event_column flip_enqueued_qpc
+event_column flip_earliest_qpc
+event_column flip_marker_done_qpc
+event_column flip_rule_done_qpc
+event_column flip_held
+event_column flip_target_qpc
+event_column flip_moved
+event_column flip_bounded
+event_column flip_release_qpc
+event_column flip_release
+event_column flip_rule_qpc
+event_column flip_ready_qpc
+event_column flip_ready
+event_column flip_frame_id
 
 # rung
 rung 0 source_only
@@ -488,6 +514,23 @@ event_type 15 stall_injected retired
 event_type 16 governor_step retired
 event_type 17 rung_feasibility retired
 event_type 18 gpu_wait_cap retired
+event_type 19 flip_gate
+
+# flip_plan (the flip_plan column of flip_gate event rows)
+flip_plan 0 none
+flip_plan 1 held
+flip_plan 2 late
+
+# flip_release (the flip_release column)
+flip_release 0 at_once
+flip_release 1 timed
+flip_release 2 with_work
+
+# flip_ready (the flip_ready column)
+flip_ready 0 none
+flip_ready 1 before
+flip_ready 2 by_release
+flip_ready 3 after
 
 # The 88 keys of the [FrameLimiter] section (retired keys are not listed: the build neither reads nor writes them).
 config_key target_fps
@@ -525,6 +568,9 @@ config_key gpu_wait_late_guard
 config_key gpu_wait_present_first
 config_key gpu_wait_start_limit
 config_key lead_queue_correction
+config_key fg_flip_gate_cover
+config_key fg_flip_gate_entry
+config_key fg_flip_gate_fit
 config_key gpu_wait_ab_interleave_s
 config_key gpu_queue_probe
 config_key gpu_queue_probe_source

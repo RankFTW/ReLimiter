@@ -61,7 +61,7 @@ ReLimiter creates `relimiter.ini` next to the addon on first launch. Close the g
 
 Open the ReShade overlay, normally with **Home**, and find ReLimiter's settings panel.
 
-1. Choose **VRR Cap**, or set a **Custom** FPS cap.
+1. **VRR Cap** is selected by default and needs no setup; set a **Custom** FPS cap if you want a lower target.
 2. Read the one-line status below the FPS controls. ReLimiter always paces for an even cadence and chooses how to hold each frame by itself; the line says what it is doing, for example `Smooth: frames are held on the GPU to an even cadence`. Open **Details** under it for the technical lines.
 3. Open **OSD** and enable the readings you want to see.
 
@@ -77,9 +77,10 @@ Use the FPS limiter to keep your frame rate within your monitor's VRR range or t
 
 | Mode | What it does |
 |------|--------------|
-| **VRR Cap** | Calculates a cap below the display's refresh rate. For example, a 165 Hz display uses approximately 157 FPS. |
-| **Custom** | Lets you choose a target from 30–360 FPS using the slider, with quick-set buttons for 30, 60, 120 and 240 FPS. |
-| **Off** | Disables the normal FPS cap. OSD and other features remain available. |
+| **VRR Cap** | The default. Keeps the cap just below the display's refresh rate and follows the display if it changes. For example, a 165 Hz display uses 157 FPS. On a display without variable refresh the cap is the refresh rate. |
+| **Custom** | Lets you choose a target from 30–360 FPS using the slider, with quick-set buttons for 30, 60, 120 and 240 FPS. Moving the slider while **VRR Cap** is selected switches to **Custom**. |
+
+There is no setting without a cap. An INI from an earlier version with the cap **Off** (`target_fps=0`) now runs **VRR Cap**.
 
 Choose a target your game can sustain in the scenes you play. Avoid running several frame limiters at once unless you have a specific reason to do so.
 
@@ -182,7 +183,7 @@ The main view shows one plain line under the FPS controls:
 | `Capped: Dynamic frame generation paces its own frames (frames are not held)` | Grey | The game's Dynamic frame generation mode chooses how many frames it generates. ReLimiter caps the real frames (the game's render rate) and holds nothing after that; the displayed FPS can differ from the cap when the multiplier changes. |
 | `Capped: frame generation can't be held here (frames are not held)` | Grey | ReLimiter could not hook Streamline's DXGI factory or swap chain in this game, usually because another add-on or injector hooked them first in a way ReLimiter cannot follow. The `Cause:` line below it names the step that failed, and the module that hooked it when known; include it in a bug report. The cap still applies. |
 | `Idle cap active (background, FG-Off Cap or OLED Care)` | Grey | An idle cap is active; frames follow the cadence without an output hold. |
-| `No FPS cap set` | Grey | The FPS limiter has no cap for ReLimiter to pace. |
+| `No FPS cap yet` | Grey | **VRR Cap** is selected and the display has not been detected yet, so there is no cap to pace at. |
 | `Not pacing right now` | Grey | A cap is set but ReLimiter is not pacing, for example during Dynamic MFG passthrough or before a presenting swapchain exists. |
 | `Capped (frames are not held)` | Grey | The cap applies but nothing is held after the source wait. |
 
@@ -516,7 +517,7 @@ Recording starts off on every game launch. Each time it is turned on, a new capt
 | File prefix | Contents |
 |-------------|----------|
 | `relimiter_pacing_` | One row per displayed frame, or per Present call when no display time is available: ReLimiter's release and frame plan, the game's Present call, GPU wait and readiness timing, Reflex timing, the display time and its source (ETW or DXGI), Frame Pacing measurements and PC Latency when PC latency collection is on. Rows are written only for DXGI games (DX10, DX11, DX12); in Vulkan, OpenGL and DX9 games the file has only its header |
-| `relimiter_pacing_events_` | Capture start and end, pipeline changes, cadence restarts, measurement loss, PC latency status changes and Frame Pacing snapshots |
+| `relimiter_pacing_events_` | Capture start and end, pipeline changes, cadence restarts, measurement loss, PC latency status changes and Frame Pacing snapshots; with DLSS Frame Generation on a GPU without hardware flip metering, also one row per displayed frame with the timing ReLimiter gave it |
 
 Display times come from [PC latency collection](#optional-pc-latency-measurement) or, on DX11 and DX12 without it, from DXGI frame statistics. PC Latency needs PC latency collection. Without display times, rows still record releases, Present calls and the available GPU and Reflex timing, but the display columns stay empty. An empty cell means the value was unavailable, not zero. Not every game supplies every measurement. Release and Present times describe ReLimiter's pacing, not what reached the display, especially with frame generation. Column-level detail is in the [Developer Reference](DEVELOPER_REFERENCE.md#capture-files).
 
@@ -571,7 +572,7 @@ Most settings can be changed through the overlay. For manual changes, close the 
 
 | Key | Default | Values / purpose |
 |-----|---------|------------------|
-| `target_fps` | 0 | 0 disables the normal cap; 30–1000 FPS via INI. Use the overlay to choose VRR Cap or a custom target. |
+| `target_fps` | 0 | 0 is VRR Cap: the cap follows the display's VRR cap. 30–1000 FPS is a custom cap. |
 | `pacing_preference` | balanced | **Pacing preference** (64-bit DirectX 12): `latency` (**Lower latency**), `balanced` or `smooth` (**Smoother**). Any other value loads as `balanced`. |
 | `advanced_settings` | false | Show advanced user controls |
 | `developer_settings` | false | INI-only. Shows the developer settings in the Advanced section; see [Developer Settings](#developer-settings). |

@@ -16,6 +16,7 @@
 #include <Windows.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -24,6 +25,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 // ── Stubs for the production dependencies of csv_writer.cpp ──
@@ -858,10 +860,18 @@ void CheckEventsFile(const CsvFile& events)
 {
     const Cells appended{ "snapshot_dropped_records", "etw_events_lost", "etw_buffers_lost",
         "lost_present_count", "overflowed_present_count", "reason" };
-    Check(events.header.size() == 86, "pacing events have 86 columns, got " + std::to_string(events.header.size()));
-    Check(events.header.size() >= appended.size() &&
-              Cells(events.header.end() - appended.size(), events.header.end()) == appended,
+    Check(events.header.size() == 112, "pacing events have 112 columns, got " + std::to_string(events.header.size()));
+    // The 86 columns of every build before the flip_gate rows, then the flip columns.
+    Check(events.header.size() >= 86 &&
+              Cells(events.header.begin() + 86 - appended.size(), events.header.begin() + 86) == appended,
           "native PCL loss columns follow snapshot_dropped_records, then reason");
+    for (size_t column = 86; column < events.header.size(); ++column) {
+        Check(events.header[column].rfind("flip_", 0) == 0,
+              "the appended columns are the flip gate's: " + events.header[column]);
+    }
+    Check(events.header.size() == 112 && events.header[86] == "flip_epoch" && events.header[110] == "flip_ready" &&
+              events.header[111] == "flip_frame_id",
+          "the flip columns start at flip_epoch; flip_frame_id was appended behind the first build's 111");
     for (const auto& row : events.rows) Check(row.size() == events.header.size(), "every event has one cell per column");
 
     const size_t start = RowOfEvent(events, "capture_start");
@@ -925,6 +935,44 @@ void CheckEventsFile(const CsvFile& events)
         const std::string type = events.Cell(row, "event_type");
         Check(type != "stall_injected" && type != "governor_step" && type != "rung_feasibility",
               "retired event types are never written: " + type);
+    }
+
+    // Flip-gate rows: a detailed one writes every flip column, with empty cells for the times the gate had none;
+    // one whose producer filled no detail (no capture ran when the flip was let go) writes none.
+    size_t flip = events.rows.size(), bare = events.rows.size();
+    for (size_t row = 0; row < events.rows.size(); ++row) {
+        if (events.Cell(row, "event_type") != "flip_gate") continue;
+        (flip == events.rows.size() ? flip : bare) = row;
+    }
+    Check(flip < events.rows.size() && bare < events.rows.size(), "both flip_gate events are written");
+    if (flip >= events.rows.size() || bare >= events.rows.size()) return;
+    const std::pair<const char*, const char*> cells[] = {
+        { "event_qpc", "91000" }, { "flip_epoch", "3" }, { "flip_serial", "77" }, { "flip_marker", "41" },
+        { "flip_place", "1" }, { "flip_outputs", "3" }, { "flip_real", "0" }, { "flip_plan", "1" },
+        { "flip_input_target_qpc", "60000" }, { "flip_arrived_qpc", "70000" }, { "flip_entered_qpc", "88000" },
+        { "flip_enqueued_qpc", "88200" }, { "flip_earliest_qpc", "" }, { "flip_marker_done_qpc", "64000" },
+        { "flip_rule_done_qpc", "" }, { "flip_held", "1" }, { "flip_target_qpc", "90000" }, { "flip_moved", "0" },
+        { "flip_bounded", "0" }, { "flip_release_qpc", "90010" }, { "flip_release", "2" },
+        { "flip_rule_qpc", "91000" }, { "flip_ready_qpc", "91000" }, { "flip_ready", "3" },
+        { "flip_frame_id", "5123" },
+    };
+    for (const auto& [column, value] : cells) {
+        Check(events.Cell(flip, column) == value,
+              std::string("flip_gate ") + column + " is " + value + ", got " + events.Cell(flip, column));
+    }
+    const double frequency = std::stod(events.Cell(flip, "qpc_frequency"));
+    Check(!events.Cell(flip, "flip_cycle_us").empty() &&
+              std::abs(std::stod(events.Cell(flip, "flip_cycle_us")) - 190000.0 * 1e6 / frequency) < 0.01 &&
+              !events.Cell(flip, "flip_spacing_us").empty() &&
+              std::abs(std::stod(events.Cell(flip, "flip_spacing_us")) - 62000.0 * 1e6 / frequency) < 0.01,
+          "the flip's cycle and spacing are written in microseconds");
+    Check(events.Cell(flip, "value").empty() && events.Cell(flip, "reason").empty() &&
+              events.Cell(flip, "csv_event_drops").empty(),
+          "flip_gate rows leave the other events' columns empty");
+    for (size_t column = 86; column < events.header.size(); ++column) {
+        Check(events.rows[bare][column].empty(),
+              "a flip_gate row without detail writes no " + events.header[column]);
+        Check(events.rows[drops][column].empty(), "other events leave " + events.header[column] + " empty");
     }
 }
 } // namespace
@@ -1003,6 +1051,38 @@ int main()
     pipeline.value = 3;  // PacingRung::GpuQueueWait
     pipeline.reason = 0; // PacingFallbackReason::None
     CSV_PushPacingEvent(pipeline);
+
+    PacingCsvEvent flip{};
+    flip.capture_epoch = capture.epoch;
+    flip.type = PacingCsvEventType::FlipGate;
+    flip.event_qpc = 91000;
+    flip.flip.flip_qpc = 91000;
+    flip.flip.cycle_ticks = 190000;
+    flip.flip.epoch = 3;
+    flip.flip.cycle = 77;
+    flip.flip.index = 1;
+    flip.flip.outputs = 3;
+    flip.flip.detailed = 1;
+    flip.flip.detail.entry_marker = 41;
+    flip.flip.detail.frame_id = 5123;
+    flip.flip.detail.input_target_qpc = 60000;
+    flip.flip.detail.arrived_qpc = 70000;
+    flip.flip.detail.entered_qpc = 88000;
+    flip.flip.detail.spacing_ticks = 62000;
+    flip.flip.detail.enqueued_qpc = 88200;
+    flip.flip.detail.marker_done_qpc = 64000;
+    flip.flip.detail.target_qpc = 90000;
+    flip.flip.detail.release_qpc = 90010;
+    flip.flip.detail.rule_flip_qpc = 91000;
+    flip.flip.detail.ready_qpc = 91000;
+    flip.flip.detail.plan = PacingFlipPlan::Held;
+    flip.flip.detail.release = PacingFlipRelease::WithWork;
+    flip.flip.detail.ready = PacingFlipReady::After;
+    flip.flip.detail.held = 1;
+    CSV_PushPacingEvent(flip);
+    flip.flip.detailed = 0; // the producer filled no detail: only the event itself is written
+    flip.event_qpc = 92000;
+    CSV_PushPacingEvent(flip);
 
     CSV_SetEnabled(false);
     Check(CSV_Shutdown(), "writer stops");

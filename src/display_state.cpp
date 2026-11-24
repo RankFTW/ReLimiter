@@ -8,6 +8,8 @@
 #include "scheduler.h"
 #include "vblank_thread.h"
 #include "logger.h"
+#include "pacing_resolver.h"
+#include "unified_pacer.h"
 #include "runtime_lifecycle.h"
 #include <cmath>
 #include <cstring>
@@ -179,6 +181,7 @@ void QueryVRRCeiling() {
 
         // Seed estimated_refresh_us from ceiling before vblank thread starts
         g_estimated_refresh_us.store(1000000.0 / max_hz, std::memory_order_relaxed);
+        DisplayState_PublishTargetFps();   // the automatic VRR cap follows the ceiling
         return;
     }
 }
@@ -274,20 +277,6 @@ static void RefreshGSyncState(NvU32 display_id) {
                      "reports variable refresh for the game's frames",
                      vrr_info.bIsVRREnabled, vrr_info.bIsVRRPossible,
                      vrr_info.bIsVRRRequested, vrr_info.bIsDisplayInVRRMode, display_id);
-
-        // First launch + VRR confirmed: default cap to Reflex VRR cap (hz - hz²/3600)
-        if (new_state && Config_IsFirstLaunch()) {
-            double hz = g_ceiling_hz.load(std::memory_order_relaxed);
-            if (hz > 1.0) {
-                int vrr_cap = static_cast<int>(hz - (hz * hz / 3600.0));
-                if (vrr_cap > 0) {
-                    g_config.target_fps = vrr_cap;
-                    ApplyConfig();
-                    SaveConfig();
-                    LOG_INFO("First launch: target_fps defaulted to VRR cap %d (ceiling %.0f Hz)", vrr_cap, hz);
-                }
-            }
-        }
     }
 
     // The first poll applies its result even when it matches the initial
@@ -370,4 +359,14 @@ void OnGSyncStateChange(bool new_gsync_active) {
         g_pacing_mode.store(next, std::memory_order_release);
     }
     UpdateVBlankThreadForMode(next);
+    DisplayState_PublishTargetFps();   // the automatic VRR cap is the display's only while variable refresh paces
+}
+
+void DisplayState_PublishTargetFps() noexcept {
+    const int fps = PacingPipeline_EffectiveTargetFps(g_config.target_fps,
+        g_pacing_mode.load(std::memory_order_relaxed) == PacingMode::VRR,
+        [] { return UnifiedPacer_VrrCapFps(g_ceiling_hz.load(std::memory_order_relaxed)); });
+    const int was = g_user_target_fps.exchange(fps, std::memory_order_relaxed);
+    if (g_config.target_fps <= 0 && fps > 0 && fps != was)
+        LOG_INFO("Automatic VRR cap: %d fps (ceiling %.0f Hz)", fps, g_ceiling_hz.load(std::memory_order_relaxed));
 }
