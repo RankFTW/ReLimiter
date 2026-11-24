@@ -97,6 +97,11 @@ bool GpuReadiness_ReleaseAfterRundown() noexcept;
 void GpuReadiness_OnQueueDestroy(reshade::api::command_queue* queue) noexcept;
 void GpuReadiness_OnPresent(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain) noexcept;
 void GpuReadiness_OnFinishPresent(reshade::api::swapchain* swapchain) noexcept;
+#ifdef _WIN64
+// Base Present beneath a Streamline proxy: the selected identity, but the actual output queue and device.
+void GpuReadiness_BeginScope(uint64_t native, uint64_t native_queue, uint64_t native_device) noexcept;
+void GpuReadiness_EndScope(uint64_t native) noexcept;
+#endif
 
 // Thin native-hook scope: no GPU wait, fence creation, allocation or scheduler
 // ownership. Replays a pre-recorded timestamp/resolve list and signals before P.

@@ -23,15 +23,35 @@ void VSync_OnNativeSelected(uint64_t native);
 
 // A completed present scope of the selected native swapchain (ReShade's finish_present). While the vtable entry
 // carries the route there is no inline patch on DXGI's Present; after 32 consecutive completed scopes in which no
-// vtable entry ran, the inline Present / Present1 pair is installed once (one hook batch) and never removed. One
-// atomic exchange and one compare on an ordinary frame, no lock.
+// vtable entry ran, the inline pair is installed once and never removed. For a carried native, missing
+// base entries instead retire that alias without consuming the inline one-shot.
 void VSync_NoteFinishedPresent(uint64_t native);
 // ReShade's present event of the selected object, before the native call: installs the copy when the object has
 // none. When another module replaced the object's vptr after our copy, it is left alone (counted, logged once).
 void VSync_ObserveNativeVptr(uint64_t native);
 // Destroy event of a swapchain: the vptr is restored only if it still equals our copy.
 void VSync_OnNativeDestroyed(uint64_t native);
-// Teardown, before the hooks are disabled: restores every vptr that is still ours. The copies and detours stay mapped.
+#ifdef _WIN64
+struct StreamlineBaseBinding;
+struct IDXGISwapChain;
+struct IDXGISwapChain1;
+struct DXGI_PRESENT_PARAMETERS;
+// Base entries from an admitted DXGI detour, with the live forward from its record (or inline trampoline).
+HRESULT VSync_PresentBase(HRESULT (STDMETHODCALLTYPE* original)(IDXGISwapChain*, UINT, UINT), bool vtable,
+    size_t slot, void* caller, IDXGISwapChain* self, UINT sync, UINT flags, const StreamlineBaseBinding& binding);
+HRESULT VSync_Present1Base(HRESULT (STDMETHODCALLTYPE* original)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*),
+    bool vtable, size_t slot, void* caller, IDXGISwapChain1* self, UINT sync, UINT flags,
+    const DXGI_PRESENT_PARAMETERS* parameters, const StreamlineBaseBinding& binding);
+// Reserve under the vtable lock. A changed proxy supersedes even an in-flight resolution before
+// the same-proxy probe interval is considered. No old base object is dereferenced.
+uint64_t VSync_BeginOutputAlias(uint64_t alias, uint64_t proxy, uint64_t now_ms, uint64_t* refused_base = nullptr) noexcept;
+bool VSync_AbandonOutputAlias(uint64_t ticket) noexcept;
+// A zero base completes a failed resolution without publishing or disturbing a newer ticket.
+bool VSync_BindOutputAlias(uint64_t ticket, const StreamlineBaseBinding& binding) noexcept;
+void VSync_ActivateOutputAlias(uint64_t ticket, uint64_t alias) noexcept;
+bool VSync_UnbindOutputAlias(uint64_t alias) noexcept;
+#endif
+// Teardown: restore ReShade-owned objects only. Base objects have no destruction notification; never touch them.
 void VSync_RestoreVtables();
 // Teardown: the DXGI Present / Present1 inline patches (at most `capacity`) are never disabled: they stay
 // enabled and pass through. The targets are handed to DisableAllHooksExcept.

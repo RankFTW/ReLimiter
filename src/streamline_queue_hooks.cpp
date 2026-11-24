@@ -276,7 +276,27 @@ void StreamlineQueue_Offer(const StreamlineComEvidence& evidence) noexcept {
         ~OfferTrail() { Breadcrumb_Trail(TrailKind::QueueOfferLeave); }
     } offer_trail;
     const std::array<uint64_t, 3> methods{evidence.entries[6], evidence.entries[7], evidence.entries[8]};
-    if (!RuntimeMethods(methods)) { LOG_WARN("Streamline GPU: unsupported standard queue methods"); return; }
+    if (!RuntimeMethods(methods)) {
+        // Which methods and whose: the queue ReShade presents with is another module's proxy, or the class vtable's
+        // slots were rewritten, or the code pages are not execute-read (a patch in progress).
+        char text[3][160];
+        for (size_t i = 0; i < 3; ++i) {
+            HMODULE owner = nullptr;
+            wchar_t path[MAX_PATH]{};
+            MEMORY_BASIC_INFORMATION info{};
+            const bool in_module = GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCWSTR>(methods[i]), &owner) && owner && GetModuleFileNameW(owner, path, MAX_PATH);
+            path[MAX_PATH - 1] = L'\0';
+            const wchar_t* name = in_module ? std::wcsrchr(path, L'\\') : nullptr;
+            VirtualQuery(reinterpret_cast<void*>(methods[i]), &info, sizeof(info));
+            std::snprintf(text[i], sizeof(text[i]), "0x%llX in %ls (protect 0x%lX)", static_cast<unsigned long long>(methods[i]),
+                in_module ? (name ? name + 1 : path) : L"no module", info.Protect);
+        }
+        LOG_WARN("Streamline GPU: unsupported standard queue methods: ExecuteCommandLists %s, Signal %s, Wait %s (they must "
+                 "be D3D12Core.dll's or d3d12.dll's own code on execute-read pages)", text[0], text[1], text[2]);
+        return;
+    }
     const bool installed = StreamlineQueue_EnsureHooks(methods);
     if (!install_status_valid.load(std::memory_order_acquire)) return; // never reached the installs (stopping, pin or validation failed)
     streamline_ready.store(installed, std::memory_order_release);

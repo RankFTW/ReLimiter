@@ -22,6 +22,8 @@
 #include "streamline_discovery.h"
 #include "streamline_factory_probe.h"
 #include "streamline_proxy_probe.h"
+#include "streamline_base_present.h"
+#include "native_queue.h"
 #include "streamline_gpu_handoff.h"
 #include "system_hardening.h"
 #include "marker_log.h"
@@ -254,6 +256,7 @@ static void on_destroy_swapchain(reshade::api::swapchain* sc, bool resize) {
             StreamlineDiscovery_RecordBoundary({StreamlineBoundaryStage::DestroySwapchain,
                 sc->get_native(), 0, sc->get_device()->get_native(),
                 FrameTimeline_GetPresentSwapchainGeneration(sc->get_native()), 0, resize});
+            StreamlineBase_OnDestroyed(sc->get_native());
         }
         if (sc && sc->get_device())
             TraceSwapchainLifecycle("destroy_swapchain", sc->get_device()->get_api(), sc,
@@ -337,7 +340,7 @@ static void on_present_impl(reshade::api::command_queue* queue,
                             const reshade::api::rect* source_rect,
                             const reshade::api::rect* dest_rect,
                             uint32_t dirty_rect_count,
-                            const reshade::api::rect* dirty_rects) {
+                            const reshade::api::rect* dirty_rects, bool carried) {
     // Init is provisional; only the selected presenter may recapture global
     // state or pace. The try-only guard also handles late load and subsequent
     // destroy/recreate lifetimes without a permanent late-init barrier.
@@ -464,11 +467,12 @@ static void on_present_impl(reshade::api::command_queue* queue,
 
     LARGE_INTEGER now_qpc;
     QueryPerformanceCounter(&now_qpc);
-    EnfDisp_OnPresent(now_qpc.QuadPart);
-    GpuReadiness_OnPresent(queue, sc);
+    // The output FPS counts this event unless the frames are counted at Streamline's base swapchain below ReShade.
+    EnfDisp_OnPresent(now_qpc.QuadPart, !carried);
+    if (!carried) GpuReadiness_OnPresent(queue, sc);
     // The native route runs for every mode: it carries plan keys to the
     // native Present for H2 and H3 and qualifies PacingCapability::NativeRoute.
-    if (SwapMgr_GetActiveAPI() == ActiveAPI::DX11 || SwapMgr_GetActiveAPI() == ActiveAPI::DX12) {
+    if (!carried && (SwapMgr_GetActiveAPI() == ActiveAPI::DX11 || SwapMgr_GetActiveAPI() == ActiveAPI::DX12)) {
         const uint64_t native = sc->get_native();
         NativeGate_BeginScope(native, FrameTimeline_GetPresentSwapchainGeneration(native));
     }
@@ -485,14 +489,18 @@ static void on_finish_present(reshade::api::command_queue*, reshade::api::swapch
     RuntimeCallbackGuard callback;
     HangProgress_Bump(g_hang_progress.finish_present);
     if (callback.IsStopping() || !sc) return;
-    GpuReadiness_OnFinishPresent(sc);
     const uint64_t native = sc->get_native();
-    NativeGate_EndScope(native, FrameTimeline_GetPresentSwapchainGeneration(native));
+    // Use this event's decision, not a fresh binding: the first wrapped-proxy discovery is inside N's body.
+    if (!StreamlineBase_EventCarried(native)) {
+        GpuReadiness_OnFinishPresent(sc);
+        NativeGate_EndScope(native, FrameTimeline_GetPresentSwapchainGeneration(native));
+    }
     // The inline Present pair's fallback: a completed present scope of the selected native swapchain (counts the
     // scopes in which the vtable entry that carries the route did not run).
     VSync_NoteFinishedPresent(native);
     NativeGate_PublishRouteCapability(FrameTimeline_CurrentControllerGeneration());
     VSync_RouteDiagnosticsTick();
+    StreamlineBase_NoteGamePresentDone(native); // only now may the discovering event hand off to B
 }
 
 static void on_destroy_command_queue(reshade::api::command_queue* queue) {
@@ -504,14 +512,17 @@ static void on_destroy_command_queue(reshade::api::command_queue* queue) {
     if (!callback.IsStopping() && queue && queue->get_device() &&
         queue->get_device()->get_api() == reshade::api::device_api::d3d12) {
         StreamlineDiscovery_RecordBoundary({StreamlineBoundaryStage::DestroyQueue,
-            0, queue->get_native(), queue->get_device()->get_native()});
+            0, NativeQueue_Peek(queue->get_native()), queue->get_device()->get_native()});
     }
     if (!callback.IsStopping()) {
         GpuReadiness_OnQueueDestroy(queue);
         if (queue && queue->get_device() && queue->get_device()->get_api() == reshade::api::device_api::d3d12) {
-            GpuQueueProbe_OnQueueDestroy(reinterpret_cast<void*>(static_cast<uintptr_t>(queue->get_native())));
-            FgPresentOrder_OnQueueDestroy(reinterpret_cast<void*>(static_cast<uintptr_t>(queue->get_native())));
-            GpuHoldOrder_OnQueueDestroy(reinterpret_cast<void*>(static_cast<uintptr_t>(queue->get_native())));
+            // The Direct3D queue the units knew it by (native_queue.h); the mapping goes with the queue.
+            void* const native = reinterpret_cast<void*>(static_cast<uintptr_t>(NativeQueue_Peek(queue->get_native())));
+            GpuQueueProbe_OnQueueDestroy(native);
+            FgPresentOrder_OnQueueDestroy(native);
+            GpuHoldOrder_OnQueueDestroy(native);
+            NativeQueue_Forget(queue->get_native());
         }
     }
 }
@@ -528,19 +539,22 @@ static void on_present(reshade::api::command_queue* queue,
     try {
         // Observe before selected-presenter filtering, including auxiliary pairs.
         // This queue is ReShade-observed, not a proven game creation/input queue.
+        bool carried = false;
         if (sc && sc->get_device() && sc->get_device()->get_api() == reshade::api::device_api::d3d12) {
             const bool d3d12_queue = queue && queue->get_device() &&
                 queue->get_device()->get_api() == reshade::api::device_api::d3d12;
             // One read of the native queue for the three consumers.
-            const uint64_t native_queue = d3d12_queue ? queue->get_native() : 0;
+            const uint64_t native_queue = d3d12_queue ? NativeQueue_Of(queue->get_native()) : 0;
+            // One inactive relaxed load and compare inside NoteGamePresent decides all output work for this event.
+            carried = StreamlineBase_NoteGamePresent(sc->get_native(), sc->get_device()->get_native(), native_queue);
+            if (!carried) {
+                StreamlineDiscovery_RecordBoundary({StreamlineBoundaryStage::Present,
+                    sc->get_native(), native_queue, sc->get_device()->get_native(),
+                    FrameTimeline_GetPresentSwapchainGeneration(sc->get_native()), 0, false,
+                    d3d12_queue ? queue->get_device()->get_native() : 0});
+                if (d3d12_queue) FgPresentOrder_NotePresentQueue(reinterpret_cast<void*>(static_cast<uintptr_t>(native_queue)));
+            }
             StreamlineProxy_RecordInner(sc->get_native(), native_queue, sc->get_device()->get_native());
-            StreamlineDiscovery_RecordBoundary({StreamlineBoundaryStage::Present,
-                sc->get_native(), native_queue,
-                sc->get_device()->get_native(),
-                FrameTimeline_GetPresentSwapchainGeneration(sc->get_native()), 0, false,
-                d3d12_queue ? queue->get_device()->get_native() : 0});
-            // fg_present_ahead 3 and 4 (no thread woken ahead: one load and a branch): the swapchain's queue, for the flip gate.
-            if (d3d12_queue) FgPresentOrder_NotePresentQueue(reinterpret_cast<void*>(static_cast<uintptr_t>(native_queue)));
         }
         on_present_impl(
             queue,
@@ -548,7 +562,7 @@ static void on_present(reshade::api::command_queue* queue,
             source_rect,
             dest_rect,
             dirty_rect_count,
-            dirty_rects);
+            dirty_rects, carried);
     }
     catch (...) {
         OutputDebugStringA("ReLimiter: Present callback rejected an exception.\n");

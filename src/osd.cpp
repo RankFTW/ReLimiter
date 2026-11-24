@@ -39,6 +39,7 @@
 #include "native_pcl_measurement.h"
 #include "pacing_telemetry.h"
 #include "runtime_lifecycle.h"
+#include "relimiter_version.h"
 #include <string>
 #include <array>
 #include <atomic>
@@ -469,6 +470,8 @@ static void DrawSettingsImpl(reshade::api::effect_runtime* runtime, bool editabl
             s_focus_lock_hwnd = hwnd;
         }
     }
+
+    ImGui::TextDisabled("ReLimiter %s", RELIMITER_VERSION_STRING);
 
     // ════════════════════════════════════════════
     // SECTION 1: FPS
@@ -927,6 +930,9 @@ static void DrawSettingsImpl(reshade::api::effect_runtime* runtime, bool editabl
             }
         };
 
+        ImGui::Spacing();
+        if (ImGui::Checkbox("Clock##osd_elem", &g_config.osd_show_clock)) config_dirty = true;
+        HelpTip("Show the time of day (24-hour HH:MM) as the first line of the OSD.");
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.9f, 1.0f), "Performance");
         if (ImGui::Checkbox("FPS##osd_elem", &g_config.osd_show_fps)) config_dirty = true;
@@ -2218,17 +2224,35 @@ static void DrawOSDImpl(reshade::api::effect_runtime* runtime) {
         ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * scale);
 
         // ═══════════════════════════════════
+        // CLOCK (grey): the first line, above every other reading
+        // ═══════════════════════════════════
+        // The text is rebuilt at each new second, not at every frame (GetLocalTime converts through the time zone).
+        if (g_config.osd_show_clock) {
+            static ULONGLONG s_clock_next_tick = 0;
+            static char s_clock_text[8] = "";
+            const ULONGLONG tick = GetTickCount64();
+            if (tick >= s_clock_next_tick) {
+                SYSTEMTIME st;
+                GetLocalTime(&st);
+                snprintf(s_clock_text, sizeof(s_clock_text), "%02d:%02d", st.wHour, st.wMinute);
+                s_clock_next_tick = tick + 1000 - st.wMilliseconds;
+            }
+            OSDTextColored(ColSystem(), s_clock_text);
+        }
+
+        // ═══════════════════════════════════
         // PERFORMANCE (cyan)
         // ═══════════════════════════════════
         if (g_config.osd_show_fps && ft > 0.0) {
             double output = s_display_output_fps;
             char buf[64];
+            // With frame generation: the output rate, and the rendered rate in brackets.
             if (smooth_motion) {
-                snprintf(buf, sizeof(buf), "%.0f fps (%.1f render)", s_display_fps * 2.0, s_display_fps);
+                snprintf(buf, sizeof(buf), "%.0f fps (%.1f)", s_display_fps * 2.0, s_display_fps);
             } else if (dmfg && output > 0.0) {
-                snprintf(buf, sizeof(buf), "%.0f fps (%.1f render)", output, s_display_fps);
+                snprintf(buf, sizeof(buf), "%.0f fps (%.1f)", output, s_display_fps);
             } else if (output > 0.0 && fg_presenting && fg_mult > 0)
-                snprintf(buf, sizeof(buf), "%.0f fps (%.1f render)", output, s_display_fps);
+                snprintf(buf, sizeof(buf), "%.0f fps (%.1f)", output, s_display_fps);
             else
                 snprintf(buf, sizeof(buf), "%.1f fps", s_display_fps);
             OSDTextColored(ColPerf(), buf);

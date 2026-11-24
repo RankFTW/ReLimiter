@@ -3,6 +3,7 @@
 #include "startup_breadcrumb.h"
 #include "log_level_state.h"
 #include "nvapi_marker_census.h"
+#include "relimiter_version.h"
 #include <reshade.hpp>
 #include <cstdio>
 #include <cstring>
@@ -287,8 +288,8 @@ opened:
     {
         char header[512];
         int n = snprintf(header, sizeof(header),
-            "=== relimiter log [%s] (PID %lu) ===\r\nLog: %s\r\n",
-            exe_name, pid, path);
+            "=== relimiter log [%s] (PID %lu) ===\r\nReLimiter %s (%s)\r\nLog: %s\r\n",
+            exe_name, pid, RELIMITER_VERSION_STRING, sizeof(void*) == 8 ? "64-bit" : "32-bit", path);
         if (n > 0) RawWrite(header, n);
         RawFlush();
     }

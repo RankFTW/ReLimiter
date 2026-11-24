@@ -32,13 +32,11 @@ The settings panel shows one plain pacing line and, under **Details**, the resol
 
 **Background FPS** caps the frame rate when you alt-tab out, saving power and reducing heat.
 
-## VSync Override
-
-Force VSync off (recommended when using the frame limiter), force it on, or leave it at whatever the game sets. Applies to DX11, DX12 and OpenGL games.
-
 ## Frame Generation
 
 ReLimiter detects DLSS Frame Generation automatically and adjusts pacing to match. The OSD shows the current FG mode and multiplier.
+
+**Frame generation added by a mod** — Where a mod brings DLSS Frame Generation into a game and loads Streamline under ReShade (for example KCD2FrameGeneration in Kingdom Come: Deliverance II), ReLimiter follows the frames to the swap chain Streamline presents on and paces them the same way, with or without hardware flip metering.
 
 **Dynamic MFG** — For DLSS 4.5 Dynamic Multi-Frame Generation, ReLimiter detects the driver profile and hands pacing to the driver (passthrough) while continuing to provide OSD and telemetry. Set the output target through RHI, the NVIDIA App or Profile Inspector. `dynamic_mfg_passthrough=true` in the INI forces passthrough if detection misses a game.
 
@@ -48,10 +46,12 @@ ReLimiter detects DLSS Frame Generation automatically and adjusts pacing to matc
 
 The OSD shows real-time stats organized by category:
 
+- **Clock** — time of day, 24-hour HH:MM (off by default)
 - **Performance** — FPS, 1% Low, 0.1% Low, Frametime, Frametime Graph
-- **Latency** — CPU Latency, GPU Render Time, Total Frame Cost, FG Time
+- **Latency** — CPU Latency, PCL (PC Latency), GPU Render, Frame Cost, FG Time
 - **Quality** — Jitter (the average change from one frame interval to the next), Frame Pacing (frame time, jitter, hitches and animation error over the last 5 seconds, measured on displayed frames from ETW PC Latency timing, DXGI frame statistics or ReLimiter's flip gate, or on the real frames entering frame generation where hardware flip metering places the generated ones)
 - **Pipeline** — Frame Generation status, time added by the limiter
+- **DLSS** — Quality Level, Features, Resolution, Presets, Versions (see [DLSS Info on OSD](#dlss-info-on-osd))
 - **System** — GPU Temp, GPU Clock, GPU Usage, VRAM, CPU Usage, RAM
 
 Toggle the OSD on/off with the keybind (default: PageUp). Every element can be individually enabled or disabled in the settings panel.

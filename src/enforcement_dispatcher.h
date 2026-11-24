@@ -38,7 +38,12 @@ void EnfDisp_OnSwapchainDestroy(bool full_teardown);
 
 // Called from ReShade present event — delegates to VkEnforce_OnPresent
 // for present-based paths, no-op for marker-based paths.
-void EnfDisp_OnPresent(int64_t now_qpc);
+// count_output: this present event is a frame on the display's swapchain (the usual case). False where Streamline
+// sits below ReShade and the frames are counted at the base swapchain instead (streamline_base_present.h).
+void EnfDisp_OnPresent(int64_t now_qpc, bool count_output = true);
+// A Present that reaches the display's swapchain: one entry of the rolling one-second window the output FPS is the
+// count of. Any thread; a call that meets another thread inside the window is dropped.
+void EnfDisp_NoteOutputPresent(int64_t now_qpc) noexcept;
 
 // Query: which enforcement path is active (for telemetry/OSD).
 EnforcementPath EnfDisp_GetActivePath();

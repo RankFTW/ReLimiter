@@ -12,6 +12,7 @@ static DWORD WINAPI TestModuleName(HMODULE, LPWSTR, DWORD);
 #undef CaptureStackBackTrace
 #include "../src/streamline_proxy_probe.cpp"
 #include "../src/streamline_factory_probe.cpp"
+void StreamlineBase_NoteProxyPresent(uint64_t) noexcept {} // streamline_base_present.cpp is not part of this test
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1303,6 +1304,21 @@ int main() {
     CHECK(presents == previous_presents + 2); StreamlineProxy_RecordInner(1,reinterpret_cast<uint64_t>(&a),2);
     CHECK(p::queue_offer_state == 2 && p::queue_methods.entries[7] == reinterpret_cast<uint64_t>(&Signal));
     StreamlineProxy_Drain(); CHECK(p::queue_offer_state == 3);
+    // ReShade above Streamline: the native route's VSync vtable copy lands on Streamline's proxy, which then shows
+    // the copy's vptr. A copy noted over the proxy class is that class; a copy of any other class is not.
+    {
+        static std::array<void*,41> copy_table{}, other_class{}, other_copy{};
+        const auto expected = reinterpret_cast<uint64_t>(proxy.table), copy = reinterpret_cast<uint64_t>(copy_table.data());
+        const auto foreign = reinterpret_cast<uint64_t>(other_copy.data());
+        CHECK(p::ExpectedClass(expected) && !p::ExpectedClass(copy) && !p::ExpectedClass(0));
+        StreamlineProxy_NoteVtableCopy(reinterpret_cast<uint64_t>(other_class.data()), foreign);
+        CHECK(!p::ExpectedClass(foreign) && !p::ExpectedClass(copy));
+        StreamlineProxy_NoteVtableCopy(expected, copy); StreamlineProxy_NoteVtableCopy(expected, copy);
+        CHECK(p::copy_count == 2 && p::ExpectedClass(copy) && !p::ExpectedClass(foreign));
+        StreamlineProxy_NoteVtableCopy(0, 1); StreamlineProxy_NoteVtableCopy(1, 0); CHECK(p::copy_count == 2);
+        Object via_copy{copy_table.data()};
+        CHECK(p::ExpectedClass(p::ReadVtable(&via_copy)));
+    }
     // Factory anchor has no creation observers and releases its temporary ref.
     proxy_table[10] = reinterpret_cast<void*>(&FactoryA); proxy_table[15] = reinterpret_cast<void*>(&FactoryB); proxy_table[16] = reinterpret_cast<void*>(&FactoryC);
     auto anchor = f::Bootstrap(GetModuleHandleW(nullptr),&Factory,false); CHECK(anchor.valid && proxy.refs == 1);

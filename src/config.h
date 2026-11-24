@@ -34,6 +34,7 @@ struct Config {
     std::string osd_preset_next_key = "";
 
     // OSD element visibility
+    bool osd_show_clock = false;       // time of day, 24-hour HH:MM, the OSD's first line
     bool osd_show_fps = true;
     bool osd_show_frametime = false;
     bool osd_show_frametime_graph = false;
@@ -77,6 +78,7 @@ struct Config {
     // Pacing diagnostics (x64). Change one at a time for A/B captures.
     bool gpu_present_gate_probes = true;              // developer: GPU queue-wait pre/post timestamp bracket
     bool flip_metering_off = false; // developer: off (default) | on; NvAPI_D3D12_SetFlipConfig is hidden from the game, so frame generation runs without hardware flip metering, as on GPUs without it (64-bit, from the next launch)
+    bool vtable_copy_at_present = true; // on (default) | off, the developer A/B value; on, a native swapchain object that has no copy yet gets ReLimiter's private vtable (the native Present entry, vtable_copy.h) at its first present event instead of at its selection during swapchain creation, so a layer above that inspects the native object when the creation call returns to it (MFG Unlocker takes only an object whose vtable is DXGI's own) finds it as DXGI made it (DXGI swapchains, from the next swapchain). Saved, as fg_flip_gate_cover
     bool control_file = false; // developer: off (default) | on; a test harness drives ReLimiter through relimiter_control.txt next to the INI (control_file.h) (from the next launch)
     bool gpu_queue_probe = kPacingGpuQueueProbeDefault; // developer measurement: on (default) | off; 64-bit DX12; per frame the presenting queue's submissions, empty time and margins (pacing CSV gq_*); nothing runs without a Direct3D 12 presenting queue
     int gpu_queue_probe_source = kPacingGpuQueueProbeSourceDefault; // developer: 0–1, default 1; 1 lets the queue probe adopt the queue that carries the frame's rendering by following per-frame fence dependencies from the presenting queue (64-bit DX12; effective only with the probe on; 0 on Win32)
@@ -201,6 +203,7 @@ struct OSDPreset {
     float osd_scale = 1.0f;
     float osd_opacity = 0.6f;
     // Element toggles
+    bool show_clock = false;
     bool show_fps = false;
     bool show_frametime = false;
     bool show_frametime_graph = false;

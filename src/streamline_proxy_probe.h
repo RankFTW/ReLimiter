@@ -20,10 +20,20 @@ void StreamlineProxy_RecordInner(uint64_t swapchain, uint64_t queue, uint64_t de
 bool StreamlineProxy_Unavailable(char* cause = nullptr, size_t size = 0) noexcept;
 // Installer worker only; the first cause stays for the process lifetime.
 void StreamlineProxy_MarkUnavailable(const char* cause) noexcept;
+// The native route's VSync vtable copy (vsync_control.cpp) replaces the vptr `original` of an object with `copy`.
+// When ReShade sits above Streamline, that object is Streamline's swapchain proxy: its Present then shows our copy's
+// vptr, and the copy stands for the class it replaced. Called before the copy is published, under the vtable lock;
+// read lock-free on every Present. At most kCopyCapacity pairs, never removed (records are never freed either).
+void StreamlineProxy_NoteVtableCopy(uint64_t original, uint64_t copy) noexcept;
+// A swap chain vptr of Streamline's proxy class (its class vtable or one of our VSync copies of it); false before the
+// proxy's Present hooks are installed. Any thread, lock-free.
+bool StreamlineProxy_IsProxyClass(uint64_t vptr) noexcept;
 #else
 inline void StreamlineProxy_Install(HMODULE, uint64_t, const StreamlineComEvidence&, bool) noexcept {}
 inline void StreamlineProxy_Drain(bool = false) noexcept {}
 inline void StreamlineProxy_RecordInner(uint64_t, uint64_t, uint64_t) noexcept {}
 inline bool StreamlineProxy_Unavailable(char* = nullptr, size_t = 0) noexcept { return false; }
 inline void StreamlineProxy_MarkUnavailable(const char*) noexcept {}
+inline void StreamlineProxy_NoteVtableCopy(uint64_t, uint64_t) noexcept {}
+inline bool StreamlineProxy_IsProxyClass(uint64_t) noexcept { return false; }
 #endif

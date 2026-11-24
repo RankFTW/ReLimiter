@@ -262,6 +262,7 @@ Enable **Show OSD** in the OSD section. The default visibility key is **PageUp**
 
 | Group | Readings |
 |-------|----------|
+| **Clock** | Time of day, 24-hour HH:MM, as the first line. Off by default |
 | **Performance** | FPS, 1% Low, 0.1% Low, Frametime and Frametime Graph |
 | **Quality** | Jitter, Frame Pacing |
 | **Latency** | CPU Latency, GPU Render, Frame Cost, FG Time, PCL (PC Latency) and its Breakdown |
@@ -650,6 +651,8 @@ Individual OSD readings have `osd_show_*` keys. Use the OSD checkboxes or preset
 ---
 
 ## Troubleshooting
+
+The version is shown at the top of ReLimiter's settings panel and on the second line of the log (`ReLimiter 4.1.0 (64-bit)`). Include it when you report a problem.
 
 ### The GPU wait is not used
 

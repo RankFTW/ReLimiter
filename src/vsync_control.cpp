@@ -14,6 +14,10 @@
 #include "vtable_copy.h"
 #include "logger.h"
 #include "fg_present_order.h"
+#include "streamline_proxy_probe.h"
+#include "streamline_base_present.h"
+#include "streamline_discovery.h"
+#include "enforcement_dispatcher.h"
 #include "gpu_hold_order.h"
 #include <dxgi1_2.h>
 #include <array>
@@ -342,7 +346,7 @@ static bool NativeGateHeld(const NativeGateTrace& trace) noexcept {
 // an uninstrumented replacement (Unknown), else no ReLimiter hold.
 // plan_status precedence: the GPU gate's, then H2's when it ran for this
 // call, then the PRESENT_START executor's.
-static void PushPacingPresent(uint64_t native_swapchain, const PacingPresentAttempt& attempt,
+static void PushPacingPresent(uint64_t physical_swapchain, const PacingPresentAttempt& attempt,
     const NativeGateTrace& native_trace, bool replaced) noexcept {
     const auto demand = attempt.demand;
     if (!(demand & kPacingReadout)) {
@@ -353,7 +357,7 @@ static void PushPacingPresent(uint64_t native_swapchain, const PacingPresentAtte
         if (!attempt.Requested()) return;
     }
     PacingPresentRecord record{};
-    record.native_swapchain = native_swapchain;
+    record.native_swapchain = physical_swapchain; // ETW joins the DXGI receiver, thread and P/E, not the routing alias
     record.thread_id = GetCurrentThreadId();
     if (native_trace.cross_thread) {
         record.cross_thread_key = {PacingIdentityDomain::NvApiFrame, native_trace.producer_epoch,
@@ -412,7 +416,7 @@ static void PushPacingPresent(uint64_t native_swapchain, const PacingPresentAtte
     else record.plan_status = attribution.plan_status;
     PacingTelemetry_PushPresent(record);
     PacingTelemetry_RecordDxgiPresent(
-        reinterpret_cast<IDXGISwapChain*>(static_cast<uintptr_t>(native_swapchain)), record);
+        reinterpret_cast<IDXGISwapChain*>(static_cast<uintptr_t>(physical_swapchain)), record);
 }
 
 // Native route diagnostics: a Present that reaches a hooked Present body on a swapchain other than the
@@ -428,7 +432,8 @@ static std::atomic<uint64_t> s_diag_installed_present{0};  // hooked IDXGISwapCh
 static std::atomic<uint64_t> s_diag_installed_present1{0}; // hooked IDXGISwapChain1::Present1 address
 static_assert(DXGI_HOOK_TARGET_CAPACITY <= vtable_copy::kRecordCapacity, "first-call flags are indexed by either path's slot");
 static std::atomic<bool> s_first_call_logged[2][2][vtable_copy::kRecordCapacity]; // [inline, vtable][Present, Present1][slot]
-static std::atomic<uint64_t> s_diag_rejected_self{0};     // the newest rejected Present's self
+static std::atomic<uint64_t> s_diag_rejected_self{0}; // newest aligned COM self; bit 0 requests its next live slot sample
+static void DescribeLiveRejectedSlots(uint64_t self) noexcept;
 
 // ── Native route diagnostics: the hooked bytes, MinHook state of our calls, who calls ReShade's Present ──
 // Log text only. The relaxed stores of the first call and the install are the only work outside the 10 s tick.
@@ -650,8 +655,11 @@ void VSync_NoteCapturedSwapchain(void* swapchain) {
 }
 static void NoteRejectedPresent(bool present1, uint64_t self, uint64_t native) noexcept {
     NativeGate_NotePresentRejected(present1);
-    if (s_diag_rejected_self.load(std::memory_order_relaxed) != self)
+    const auto last = s_diag_rejected_self.load(std::memory_order_relaxed);
+    if (last != self) {
         s_diag_rejected_self.store(self, std::memory_order_relaxed);
+        if (last & 1) DescribeLiveRejectedSlots(self);
+    }
     uint64_t logged = s_rejected_logged_native.load(std::memory_order_relaxed);
     if (logged != native &&
         s_rejected_logged_native.compare_exchange_strong(logged, native, std::memory_order_relaxed))
@@ -706,29 +714,38 @@ struct VtableBinding {
     uintptr_t copy_vptr = 0;     // the copy this binding installed or adopted (0: never): kept until the object's destroy or teardown
     uint32_t reinstalls = 0;
     bool left_alone = false;     // another module's vptr is on the object: nothing more is done to it
+    bool output_alias = false;   // no destroy callback of its own: never inspect this object during retirement
 };
 static std::array<VtableBinding, 8> s_bindings; // s_vtable_lock
 static std::atomic<uintptr_t> s_vtable_object{0};   // the object the present event last reconciled ...
 static std::atomic<uintptr_t> s_vtable_expected{0}; // ... and the vptr for which nothing is left to do
 static std::atomic<uint32_t> s_vtable_installs{0}, s_vtable_failures{0}, s_vtable_restores{0},
-    s_vptr_replacements{0}, s_vptr_restored{0}, s_vtable_adopted{0};
+    s_vptr_replacements{0}, s_vptr_restored{0}, s_vtable_adopted{0}, s_vtable_deferred{0};
 // The inline pair's fallback: the object whose vtable entry carries the route, how many vtable entries ran in all,
 // the selected object's entries at the previous finished present scope, and the run of scopes without one
 // (vtable_copy::FallbackCounter). s_vtable_entries counts every vtable entry (diagnostics); the fallback reads only
-// s_selected_vtable_entries, the entries whose body ran for the swap manager's selected object, so another object's
-// entries never count or reset the selected object's run.
+// s_selected_vtable_entries. With a published base, only B's body is evidence of output; N just forwards.
 static std::atomic<uintptr_t> s_route_object{0};   // the fallback's selected identity: the object (its run's generation lives in s_fallback)
 static std::atomic<uint64_t> s_vtable_entries{0};
 static std::atomic<uint64_t> s_selected_vtable_entries{0};
 static std::atomic<uint64_t> s_entries_at_last_finish{0};
 static std::atomic<uint32_t> s_copy_changes{0}; // copies installed or adopted (s_vtable_lock)
 static vtable_copy::FallbackCounter s_fallback;
+#ifdef _WIN64
+// The alias has its own generation-qualified coverage, independent of the lifetime inline one-shot.
+// Low six bits: misses since the last output, or kBaseSeen when B ran since the last finish.
+static constexpr uint64_t kBaseSeen = 63;
+static std::atomic<uint64_t> s_base_health{0}, s_base_retry{0};
+#endif
 // Publishes the fallback's selected identity (0: the selected object carries no copy): a new generation, the run
 // reset and the entry counter snapshotted, so only entries after this point of this selection count.
 static void PublishFallbackIdentity(uintptr_t object) noexcept {
     // Order: the owner, then the generation, then the run's baseline and the counter's generation. A finisher that
     // reads the new generation sees the new owner; one that counted for the old generation is refused by the counter
     // (its generation is no longer current), also at the commit of the one-shot.
+#ifdef _WIN64
+    if (object && StreamlineBase_Carries(object)) object = 0; // the ordinary one-shot cannot fire for a carried N
+#endif
     s_route_object.store(object, std::memory_order_release);
     s_entries_at_last_finish.store(s_selected_vtable_entries.load(std::memory_order_relaxed), std::memory_order_relaxed);
     s_fallback.Advance(); // the generation and the run's reset are ONE step in the counter
@@ -858,6 +875,14 @@ static void DescribeVtableSlot(const char* name, uint64_t object, size_t slot, b
                       name, slot, static_cast<unsigned long long>(dispatched),
                       static_cast<unsigned long long>(first_hooked));
 }
+// No reference is held on a rejected receiver (in particular, an unpublished or retired B).
+// Only its own Present proves its vptr readable, never the later diagnostic tick.
+static void DescribeLiveRejectedSlots(uint64_t self) noexcept {
+    char p[200], p1[200];
+    DescribeVtableSlot("rejected-self Present", self, 8, false, s_present_targets, p, sizeof(p));
+    DescribeVtableSlot("rejected-self Present1", self, 22, true, s_present1_targets, p1, sizeof(p1));
+    LOG_DEBUG("NativeGate route hook: rejected self=0x%llX: %s; %s", static_cast<unsigned long long>(self), p, p1);
+}
 // The native object's vptr against our copies at the diagnostic tick, the counts of the copy's life.
 static void DescribeVtableRoute(uint64_t native, char* out, size_t size) noexcept {
     uintptr_t vptr = 0;
@@ -883,7 +908,7 @@ static void DescribeVtableRoute(uint64_t native, char* out, size_t size) noexcep
         std::snprintf(inline_state, sizeof(inline_state), "inline pair: installed at the first present (no vtable entry for this object)");
     std::snprintf(out, size, "object 0x%llX vptr %s is %s (our copy 0x%llX, replaced vptr 0x%llX); records=%zu "
                   "installs=%u adopted=%u failures=%u restores=%u vptr_replacements=%u vptr_restored=%u vtable_entries=%llu "
-                  "(on the selected object %llu) fallback_generation=%u; %s",
+                  "(on the selected output %llu) fallback_generation=%u; %s",
                   static_cast<unsigned long long>(native), vptr_text, ours ? "OURS" : "NOT ours",
                   static_cast<unsigned long long>(copy), static_cast<unsigned long long>(replaced), s_records.Size(),
                   s_vtable_installs.load(std::memory_order_relaxed), s_vtable_adopted.load(std::memory_order_relaxed),
@@ -926,20 +951,16 @@ void VSync_RouteDiagnosticsTick() {
     if (!Log_IsEnabled(LogLevel::Debug)) return;
     char counters[1400];
     NativeGate_DiagnosticsText(counters, sizeof(counters));
-    char present[200], present1[200], rejected_present[200], rejected_present1[200];
+    char present[200], present1[200];
     DescribeVtableSlot("Present", native, 8, false, s_present_targets, present, sizeof(present));
     DescribeVtableSlot("Present1", native, 22, true, s_present1_targets, present1, sizeof(present1));
     // The object the game actually presented on when it was not the swap manager's native one.
-    const uint64_t rejected = s_diag_rejected_self.load(std::memory_order_relaxed);
-    DescribeVtableSlot("rejected-self Present", rejected, 8, false, s_present_targets, rejected_present,
-                       sizeof(rejected_present));
-    DescribeVtableSlot("rejected-self Present1", rejected, 22, true, s_present1_targets, rejected_present1,
-                       sizeof(rejected_present1));
+    const auto rejected = s_diag_rejected_self.fetch_or(1, std::memory_order_relaxed) & ~uint64_t{1};
     // Two lines: the log line limit (1024 characters) would cut the hook description behind the counters.
     LOG_DEBUG("NativeGate route diagnostics (not qualified): %s; generation_lock_failures=%llu",
              counters, static_cast<unsigned long long>(FrameTimeline_PresentGenerationLockFailures()));
-    LOG_DEBUG("NativeGate route hook: %s; %s; last rejected self=0x%llX: %s; %s",
-             present, present1, static_cast<unsigned long long>(rejected), rejected_present, rejected_present1);
+    LOG_DEBUG("NativeGate route hook: %s; %s; last rejected self=0x%llX",
+             present, present1, static_cast<unsigned long long>(rejected));
     // The hooked bytes against what MinHook wrote, and who calls ReShade's Present (second and third line of
     // the same tick; the stack is captured at the first present event after each tick).
     char watch_present[420], watch_present1[420];
@@ -976,12 +997,9 @@ void VSync_RouteDiagnosticsTick() {
     s_stack_armed.store(true, std::memory_order_relaxed); // the next present event captures the stack again
 }
 
-// One native Present call has one body. Two entries reach it for the same object: the private vtable copy's
-// detour (the route's normal entry) and the inline patch's detour (reached from the vtable detour's original
-// when the patch survives, and by callers that cached DXGI's function address). Whichever is outermost for the
-// object on this thread runs the body; an inner entry for the same object passes straight to its original
-// with the arguments the outer entry chose. A Present on another swapchain, or a genuine recursion from inside
-// the original for another object, is its own outermost entry.
+// One body per logical native Present. The copy and any surviving inline trampoline dedup on the
+// selected identity on this thread; for Streamline's base B that identity is the carried N.
+// The original and its receiver stay physical. An unrelated swapchain remains a separate call.
 enum class PresentEntryKind : uint8_t { Inline, Vtable };
 static thread_local vtable_copy::DedupStack t_dedup;
 
@@ -996,18 +1014,19 @@ static PFN_Present1 LoadPresent1Original(PresentEntryKind kind, size_t slot) noe
 }
 
 __declspec(noinline) static HRESULT PresentBody(
-    PFN_Present original, bool vtable, size_t Slot, void* caller, IDXGISwapChain* self, UINT SyncInterval, UINT Flags) {
+    PFN_Present original, bool vtable, size_t Slot, void* caller, IDXGISwapChain* self, uint64_t identity,
+    UINT SyncInterval, UINT Flags, bool count_selected_entry) {
 
     // One implementation target can serve native, proxy and auxiliary objects.
     // Discovery of a target is not selection/ownership of every instance.
     const uint64_t native_handle = SwapMgr_GetNativeHandle();
-    if (reinterpret_cast<uint64_t>(self) != native_handle) {
+    if (identity != native_handle) {
         NoteRejectedPresent(false, reinterpret_cast<uint64_t>(self), native_handle);
         NoteFirstPresentCall(false, vtable, Slot, reinterpret_cast<uint64_t>(self), native_handle, false, Flags, caller);
         return InvokePresent(original, self, SyncInterval, Flags);
     }
     NoteFirstPresentCall(false, vtable, Slot, reinterpret_cast<uint64_t>(self), native_handle, true, Flags, caller);
-    if (vtable) s_selected_vtable_entries.fetch_add(1, std::memory_order_relaxed); // an entry on the selected object
+    if (count_selected_entry) s_selected_vtable_entries.fetch_add(1, std::memory_order_relaxed);
 
     s_game_sync_interval.store(SyncInterval, std::memory_order_relaxed);
 
@@ -1019,9 +1038,8 @@ __declspec(noinline) static HRESULT PresentBody(
         override_interval = 0;
         // Add ALLOW_TEARING if the swapchain supports it
         override_flags |= DXGI_PRESENT_ALLOW_TEARING;
-        static bool s_off_logged = false;
-        if (!s_off_logged) {
-            s_off_logged = true;
+        static std::atomic<bool> s_off_logged{false};
+        if (!s_off_logged.load(std::memory_order_relaxed) && !s_off_logged.exchange(true, std::memory_order_relaxed)) {
             LOG_INFO("VSync: first present with mode=off (interval=0, ALLOW_TEARING added, "
                      "game_interval=%u, game_flags=0x%X)", SyncInterval, Flags);
         }
@@ -1033,7 +1051,7 @@ __declspec(noinline) static HRESULT PresentBody(
 
     PresentTimelineCall timeline_call{};
     const bool capture_call = FrameTimeline_BeginPresentCall(
-        reinterpret_cast<uint64_t>(self),
+        identity,
         PresentTimelineEntryPoint::DxgiPresent,
         &timeline_call, GpuPresent_RequiresReadiness());
     PresentTimelineSpan first_attempt{};
@@ -1041,10 +1059,10 @@ __declspec(noinline) static HRESULT PresentBody(
         timeline_call, 0, override_interval, override_flags, &first_attempt);
 
     PacingTelemetry_ResetGpuOutputAttribution();
-    NativeGateCall native_gate(GetNativeCallContext(reinterpret_cast<uint64_t>(self)), override_flags);
+    NativeGateCall native_gate(GetNativeCallContext(identity), override_flags);
     const bool early_readiness=GpuPresent_GetConfig().mode!=ReadyPresentMode::Off &&
         native_gate.trace.status==NativeGateStatus::Native;
-    if(!early_readiness)NativeGate_Execute(&native_gate, reinterpret_cast<uint64_t>(self));
+    if(!early_readiness)NativeGate_Execute(&native_gate, identity);
     first_attempt.native_gate = native_gate.trace;
     GpuReadinessCall readiness(capture_first_attempt ? &first_attempt : nullptr,early_readiness);
     bool replaced=false;
@@ -1052,7 +1070,7 @@ __declspec(noinline) static HRESULT PresentBody(
         replaced=GpuPresent_Execute(&native_gate,&readiness,capture_first_attempt?&first_attempt:nullptr)!=
             GpuPresentExecution::Fallback;
         if(!replaced)
-            NativeGate_Execute(&native_gate,reinterpret_cast<uint64_t>(self));
+            NativeGate_Execute(&native_gate,identity);
         first_attempt.native_gate=native_gate.trace;
     }
     // fg_present_ahead (no thread woken ahead: one load and a branch): the real frame's Present of a presenting thread
@@ -1081,9 +1099,8 @@ __declspec(noinline) static HRESULT PresentBody(
     if (hr == DXGI_ERROR_INVALID_CALL && mode == 1 &&
         (override_flags & DXGI_PRESENT_ALLOW_TEARING)) {
         retried = true;
-        static bool s_tearing_fail_logged = false;
-        if (!s_tearing_fail_logged) {
-            s_tearing_fail_logged = true;
+        static std::atomic<bool> s_tearing_fail_logged{false};
+        if (!s_tearing_fail_logged.load(std::memory_order_relaxed) && !s_tearing_fail_logged.exchange(true, std::memory_order_relaxed)) {
             LOG_WARN("VSync: DXGI_PRESENT_ALLOW_TEARING rejected (swapchain missing flag?), "
                      "falling back to SyncInterval=0 without tearing");
 
@@ -1124,22 +1141,76 @@ __declspec(noinline) static HRESULT PresentBody(
     return hr;
 }
 
+#ifdef _WIN64
+static bool BeginBaseScope(const StreamlineBaseBinding& b, UINT flags, uint64_t* generation) noexcept {
+    const uint64_t epoch = b.revision << 6;
+    auto health = s_base_health.load(std::memory_order_relaxed);
+    while ((health & ~kBaseSeen) == epoch && (health & kBaseSeen) < vtable_copy::FallbackCounter::kScopes &&
+           !s_base_health.compare_exchange_weak(health, epoch | kBaseSeen, std::memory_order_relaxed)) {}
+    if (flags & DXGI_PRESENT_TEST) return false;
+    if ((flags & DXGI_PRESENT_DO_NOT_WAIT) && s_base_retry.load(std::memory_order_relaxed) == ((b.revision << 1) | 1))
+        return false; // one output event, but each native body runs; this retry owns no TLS scope
+    *generation = FrameTimeline_GetPresentSwapchainGeneration(b.alias);
+    StreamlineDiscovery_RecordBoundary({StreamlineBoundaryStage::Present, b.alias, b.queue, b.device,
+        *generation, 0, false, b.queue ? b.device : 0});
+    FgPresentOrder_NotePresentQueue(reinterpret_cast<void*>(b.queue));
+    EnfDisp_NoteOutputPresent(CapturePresentQpc());
+    GpuReadiness_BeginScope(b.alias, b.queue, b.device);
+    NativeGate_BeginScope(b.alias, *generation);
+    return true;
+}
+static void FinishBaseScope(const StreamlineBaseBinding& b, uint64_t generation, UINT flags, HRESULT hr, bool owns_scope) noexcept {
+    if (flags & DXGI_PRESENT_TEST) return; // TEST does not disturb a pending nonblocking retry
+    const auto epoch = b.revision << 1;
+    const auto next = epoch | static_cast<uint64_t>(hr == DXGI_ERROR_WAS_STILL_DRAWING);
+    auto previous = s_base_retry.load(std::memory_order_relaxed);
+    while ((previous & ~uint64_t{1}) == epoch && previous != next &&
+           !s_base_retry.compare_exchange_weak(previous, next, std::memory_order_relaxed)) {}
+    if (!owns_scope) return; // every scope ends on the thread and in the call that began it, even on failure
+    GpuReadiness_EndScope(b.alias);
+    NativeGate_EndScope(b.alias, generation);
+}
+static bool AliasPassThrough(const StreamlineBaseBinding& b, uint64_t self) noexcept {
+    if (!StreamlineBase_Carries(self, b)) return false;
+    NativeGate_NoteEntry(NativeGateEntry::AliasPassThrough);
+    return true;
+}
+#endif
+
 // See Present1Outermost.
+template<bool Base = false>
 __declspec(noinline) static HRESULT PresentOutermost(
-    PFN_Present original, bool vtable, size_t Slot, void* caller, IDXGISwapChain* self, UINT SyncInterval, UINT Flags) {
+    PFN_Present original, bool vtable, size_t Slot, void* caller, IDXGISwapChain* self, uint64_t identity,
+    UINT SyncInterval, UINT Flags, const StreamlineBaseBinding* base = nullptr) {
     vtable_copy::DedupNode node;
-    if (!t_dedup.Link(&node, reinterpret_cast<uintptr_t>(self))) {
+    if (!t_dedup.Link(&node, static_cast<uintptr_t>(identity))) {
         NativeGate_NoteEntry(NativeGateEntry::InnerPassThrough);
         return InvokePresent(original, self, SyncInterval, Flags);
     }
     HRESULT hr = DXGI_ERROR_INVALID_CALL;
+#ifdef _WIN64
+    bool scope = false;
+    uint64_t generation = 0;
+#endif
     __try {
-        hr = PresentBody(original, vtable, Slot, caller, self, SyncInterval, Flags);
+#ifdef _WIN64
+        if constexpr (Base) scope = BeginBaseScope(*base, Flags, &generation);
+#endif
+        hr = PresentBody(original, vtable, Slot, caller, self, identity, SyncInterval, Flags, Base || vtable);
     } __finally {
+#ifdef _WIN64
+        if constexpr (Base) FinishBaseScope(*base, generation, Flags, hr, scope);
+#endif
         t_dedup.Unlink(&node);
     }
     return hr;
 }
+#ifdef _WIN64
+HRESULT VSync_PresentBase(PFN_Present original, bool vtable, size_t slot, void* caller, IDXGISwapChain* self,
+    UINT sync, UINT flags, const StreamlineBaseBinding& binding) {
+    return PresentOutermost<true>(original, vtable, slot, caller, self, binding.alias, sync, flags, &binding);
+}
+#endif
 
 // Start-up breadcrumb: the first native Present of either kind entered (the first thing the hooked body does) and
 // returned. One relaxed load and a not-taken branch per entry and per return once both are stored.
@@ -1187,7 +1258,18 @@ __declspec(noinline) static HRESULT PresentEntry(
     NativeGate_NoteEntry(kind == PresentEntryKind::Inline ? NativeGateEntry::TypedPresent : NativeGateEntry::VtablePresent);
     if (kind == PresentEntryKind::Vtable) s_vtable_entries.fetch_add(1, std::memory_order_relaxed);
     if (callback.IsStopping()) return InvokePresent(original, self, SyncInterval, Flags);
-    return PresentOutermost(original, kind == PresentEntryKind::Vtable, Slot, caller, self, SyncInterval, Flags);
+    const uint64_t object = reinterpret_cast<uint64_t>(self);
+#ifdef _WIN64
+    // Usual order / no Streamline: one relaxed load and a compare; no alias snapshot or extra scopes.
+    if (const uint64_t publication = g_streamline_base_publication.load(std::memory_order_relaxed)) {
+        const auto b = StreamlineBase_Read(publication);
+        const bool vtable = kind == PresentEntryKind::Vtable;
+        if (AliasPassThrough(b, object)) return InvokePresent(original, self, SyncInterval, Flags);
+        if (StreamlineBase_AliasOf(object, b) && b.alias == SwapMgr_GetNativeHandle())
+            return VSync_PresentBase(original, vtable, Slot, caller, self, SyncInterval, Flags, b);
+    }
+#endif
+    return PresentOutermost(original, kind == PresentEntryKind::Vtable, Slot, caller, self, object, SyncInterval, Flags);
 }
 
 template <size_t Slot>
@@ -1201,22 +1283,22 @@ static HRESULT STDMETHODCALLTYPE VtableDetour_Present(IDXGISwapChain* self, UINT
 }
 
 __declspec(noinline) static HRESULT Present1Body(
-    PFN_Present1 original, bool vtable, size_t Slot, void* caller, IDXGISwapChain1* self, UINT SyncInterval,
-    UINT PresentFlags, const DXGI_PRESENT_PARAMETERS* PresentParameters)
+    PFN_Present1 original, bool vtable, size_t Slot, void* caller, IDXGISwapChain1* self, uint64_t identity, UINT SyncInterval,
+    UINT PresentFlags, const DXGI_PRESENT_PARAMETERS* PresentParameters, bool count_selected_entry)
 {
 
     const uint64_t native_handle = SwapMgr_GetNativeHandle();
-    if (reinterpret_cast<uint64_t>(self) != native_handle) {
+    if (identity != native_handle) {
         NoteRejectedPresent(true, reinterpret_cast<uint64_t>(self), native_handle);
         NoteFirstPresentCall(true, vtable, Slot, reinterpret_cast<uint64_t>(self), native_handle, false, PresentFlags, caller);
         return InvokePresent1(original, self, SyncInterval, PresentFlags, PresentParameters);
     }
     NoteFirstPresentCall(true, vtable, Slot, reinterpret_cast<uint64_t>(self), native_handle, true, PresentFlags, caller);
-    if (vtable) s_selected_vtable_entries.fetch_add(1, std::memory_order_relaxed); // an entry on the selected object
+    if (count_selected_entry) s_selected_vtable_entries.fetch_add(1, std::memory_order_relaxed);
 
     PresentTimelineCall timeline_call{};
     const bool capture_call = FrameTimeline_BeginPresentCall(
-        reinterpret_cast<uint64_t>(self),
+        identity,
         PresentTimelineEntryPoint::DxgiPresent1,
         &timeline_call, GpuPresent_RequiresReadiness());
     PresentTimelineSpan attempt{};
@@ -1224,10 +1306,10 @@ __declspec(noinline) static HRESULT Present1Body(
         timeline_call, 0, SyncInterval, PresentFlags, &attempt);
 
     PacingTelemetry_ResetGpuOutputAttribution();
-    NativeGateCall native_gate(GetNativeCallContext(reinterpret_cast<uint64_t>(self)), PresentFlags);
+    NativeGateCall native_gate(GetNativeCallContext(identity), PresentFlags);
     const bool early_readiness=GpuPresent_GetConfig().mode!=ReadyPresentMode::Off &&
         native_gate.trace.status==NativeGateStatus::Native;
-    if(!early_readiness)NativeGate_Execute(&native_gate, reinterpret_cast<uint64_t>(self));
+    if(!early_readiness)NativeGate_Execute(&native_gate, identity);
     attempt.native_gate = native_gate.trace;
     GpuReadinessCall readiness(capture_attempt ? &attempt : nullptr,early_readiness);
     bool replaced=false;
@@ -1235,7 +1317,7 @@ __declspec(noinline) static HRESULT Present1Body(
         replaced=GpuPresent_Execute(&native_gate,&readiness,capture_attempt?&attempt:nullptr)!=
             GpuPresentExecution::Fallback;
         if(!replaced)
-            NativeGate_Execute(&native_gate,reinterpret_cast<uint64_t>(self));
+            NativeGate_Execute(&native_gate,identity);
         attempt.native_gate=native_gate.trace;
     }
     // fg_present_ahead: as in PresentBody.
@@ -1271,23 +1353,40 @@ __declspec(noinline) static HRESULT Present1Body(
 // with __try cannot have one), so a structured exception that leaves the body and is caught by a caller still
 // unlinks the dedup node; a destructor-based scope would not run on a SEH unwind and would leave the thread's
 // list pointing at a dead frame.
+template<bool Base = false>
 __declspec(noinline) static HRESULT Present1Outermost(
-    PFN_Present1 original, bool vtable, size_t Slot, void* caller, IDXGISwapChain1* self, UINT SyncInterval,
-    UINT PresentFlags, const DXGI_PRESENT_PARAMETERS* PresentParameters)
+    PFN_Present1 original, bool vtable, size_t Slot, void* caller, IDXGISwapChain1* self, uint64_t identity, UINT SyncInterval,
+    UINT PresentFlags, const DXGI_PRESENT_PARAMETERS* PresentParameters, const StreamlineBaseBinding* base = nullptr)
 {
     vtable_copy::DedupNode node;
-    if (!t_dedup.Link(&node, reinterpret_cast<uintptr_t>(self))) {
+    if (!t_dedup.Link(&node, static_cast<uintptr_t>(identity))) {
         NativeGate_NoteEntry(NativeGateEntry::InnerPassThrough);
         return InvokePresent1(original, self, SyncInterval, PresentFlags, PresentParameters);
     }
     HRESULT result = DXGI_ERROR_INVALID_CALL;
+#ifdef _WIN64
+    bool scope = false;
+    uint64_t generation = 0;
+#endif
     __try {
-        result = Present1Body(original, vtable, Slot, caller, self, SyncInterval, PresentFlags, PresentParameters);
+#ifdef _WIN64
+        if constexpr (Base) scope = BeginBaseScope(*base, PresentFlags, &generation);
+#endif
+        result = Present1Body(original, vtable, Slot, caller, self, identity, SyncInterval, PresentFlags, PresentParameters, Base || vtable);
     } __finally {
+#ifdef _WIN64
+        if constexpr (Base) FinishBaseScope(*base, generation, PresentFlags, result, scope);
+#endif
         t_dedup.Unlink(&node);
     }
     return result;
 }
+#ifdef _WIN64
+HRESULT VSync_Present1Base(PFN_Present1 original, bool vtable, size_t slot, void* caller, IDXGISwapChain1* self,
+    UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* parameters, const StreamlineBaseBinding& binding) {
+    return Present1Outermost<true>(original, vtable, slot, caller, self, binding.alias, sync, flags, parameters, &binding);
+}
+#endif
 
 __declspec(noinline) static HRESULT Present1Entry(
     PresentEntryKind kind, size_t Slot, void* caller, IDXGISwapChain1* self, UINT SyncInterval,
@@ -1302,7 +1401,18 @@ __declspec(noinline) static HRESULT Present1Entry(
     if (callback.IsStopping())
         return InvokePresent1(
             original, self, SyncInterval, PresentFlags, PresentParameters);
-    return Present1Outermost(original, kind == PresentEntryKind::Vtable, Slot, caller, self, SyncInterval,
+    const uint64_t object = reinterpret_cast<uint64_t>(self);
+#ifdef _WIN64
+    // Same single inactive check as PresentEntry.
+    if (const uint64_t publication = g_streamline_base_publication.load(std::memory_order_relaxed)) {
+        const auto b = StreamlineBase_Read(publication);
+        const bool vtable = kind == PresentEntryKind::Vtable;
+        if (AliasPassThrough(b, object)) return InvokePresent1(original, self, SyncInterval, PresentFlags, PresentParameters);
+        if (StreamlineBase_AliasOf(object, b) && b.alias == SwapMgr_GetNativeHandle())
+            return VSync_Present1Base(original, vtable, Slot, caller, self, SyncInterval, PresentFlags, PresentParameters, b);
+    }
+#endif
+    return Present1Outermost(original, kind == PresentEntryKind::Vtable, Slot, caller, self, object, SyncInterval,
                              PresentFlags, PresentParameters);
 }
 
@@ -1488,6 +1598,9 @@ static bool InstallCopyLocked(VtableBinding& binding, uintptr_t vptr, const char
     }
     const vtable_copy::Record* record = s_records.Get(index);
     if (!record) return false;
+    // On Streamline's proxy (ReShade above Streamline) the FG route's proxy check must know the copy before any
+    // Present can show it.
+    StreamlineProxy_NoteVtableCopy(record->original_vptr, record->CopyVptr());
     if (!CompareExchangeVptr(binding.object, vptr, record->CopyVptr())) {
         // Another thread or module wrote the vptr between the read and the exchange; the present event
         // judges the vptr it finds, no retry here.
@@ -1527,6 +1640,29 @@ static void AdoptCopyLocked(VtableBinding& binding, size_t record_index, const c
                  static_cast<unsigned long long>(binding.replaced_vptr));
 }
 
+// Developer key vtable_copy_at_present: the record of the class vtable as it is at the selection, the object left
+// untouched. Another module can write its hook into the class vtable in place between the swapchain's creation and
+// its first Present (REFramework does), and a first copy made at the present event then holds that hook as its
+// copy-time Present: no record names the implementation's own function, and ResolveNativeTargets has nothing to
+// put the inline patch on when the copy is refused later. The record made here is the earliest of its class
+// vtable, as the copy made at a selection is without the key. The rules are InstallCopyLocked's; silent, because
+// the install at the present event reports what it refuses.
+static void PrepareRecordLocked(uintptr_t vptr) noexcept {
+    if (s_history.IsForeign(vptr) || !s_vptr_in_module(vptr)) return;
+    ReadRegion region;
+    const vtable_copy::Memory memory{&region, CheckedReadPointer};
+    vtable_copy::Image image;
+    if (vtable_copy::ReadImage(memory, vptr, &image) != vtable_copy::ExtentStatus::Ok) return;
+    size_t bad_slot = 0;
+    const vtable_copy::Pinner pinner{nullptr, PinModuleOf};
+    if (vtable_copy::PinSuppliers(image, pinner, &bad_slot) != vtable_copy::PinStatus::Ok) return;
+    if (s_records.Find(image) != vtable_copy::kNoRecord) return;
+    const size_t next = s_records.Size();
+    if (next >= vtable_copy::kRecordCapacity || !s_history.Note(vptr, vtable_copy::VptrHistory::Kind::Replaced)) return;
+    s_records.Append(image, reinterpret_cast<uintptr_t>(s_vtable_present_thunks[next]),
+                     reinterpret_cast<uintptr_t>(s_vtable_present1_thunks[next]));
+}
+
 // The object's vptr as found now against what we did to it, by one judge for a selection (init) and a present
 // event, whatever the history of the object's address:
 //  - one of OUR copies: the object is ours (adopted when the binding does not know it yet); a copy is never copied;
@@ -1537,16 +1673,33 @@ static void AdoptCopyLocked(VtableBinding& binding, size_t record_index, const c
 // One binding per object address: a missed destroy is picked up by the next selection or present of that address,
 // and a binding is never claimed twice. The copy installed on a binding stays its identity until the object's
 // destroy callback or teardown.
-static void ReconcileLocked(uintptr_t object, uintptr_t vptr, bool selected) noexcept {
+static bool ReconcileLocked(uintptr_t object, uintptr_t vptr, bool selected, bool output_alias = false) noexcept {
     // Admission is decided here, under the lock teardown's restoration takes: a callback admitted before shutdown
     // that was paused cannot install after the restoration.
-    if (RuntimeLifecycle_IsStopping()) return;
+    if (RuntimeLifecycle_IsStopping()) return false;
     VtableBinding* binding = FindBinding(object);
     const uint32_t copy_changes_before = s_copy_changes.load(std::memory_order_relaxed);
     const size_t own = s_records.IndexOfCopy(vptr);
     bool installed = false; // the object's vptr is ours after this call
-    const char* why = selected ? "selected" : "present event";
+    const char* why = output_alias ? "Streamline base" : selected ? "selected" : "present event";
+    const bool new_binding = !binding;
     if (!binding) {
+        if (selected && own == vtable_copy::kNoRecord && g_config.vtable_copy_at_present) {
+            // Developer key vtable_copy_at_present: the first copy of an object is left to its first present event,
+            // which runs in front of that event's native Present (VSync_ObserveNativeVptr), so a layer above that
+            // inspects the native object when the creation call returns to it finds the vtable DXGI gave it. No
+            // binding is claimed and no vptr is published as examined: the present event takes the first-install
+            // path. A selection of an object without a copy names no owner of the fallback's run. The record of the
+            // class vtable as it is now is made here (PrepareRecordLocked).
+            PrepareRecordLocked(vptr);
+            PublishFallbackIdentity(0);
+            if (s_vtable_object.load(std::memory_order_relaxed) == object) PublishExpected(0, 0);
+            if (s_vtable_deferred.fetch_add(1, std::memory_order_relaxed) < 8)
+                LOG_INFO("VSync vtable copy: object 0x%llX (selected): vptr 0x%llX left as it is until the object's first present "
+                         "event (vtable_copy_at_present)", static_cast<unsigned long long>(object),
+                         static_cast<unsigned long long>(vptr));
+            return false;
+        }
         binding = ClaimBinding(object);
         if (!binding) {
             // Every binding is taken (kept until its object's destroy callback or teardown): none is evicted. This
@@ -1557,14 +1710,14 @@ static void ReconcileLocked(uintptr_t object, uintptr_t vptr, bool selected) noe
                 LOG_WARN("VSync vtable copy: not installed on object 0x%llX (%s): all %zu bindings are taken; inline patch only",
                          static_cast<unsigned long long>(object), why, s_bindings.size());
             if (selected) PublishFallbackIdentity(0);
-            PublishExpected(object, vptr);
-            return;
+            if (!output_alias) PublishExpected(object, vptr);
+            return false;
         }
         if (own != vtable_copy::kNoRecord) {
             AdoptCopyLocked(*binding, own, why);
             installed = true;
         } else {
-            installed = InstallCopyLocked(*binding, vptr, selected ? "selected" : "present event, no copy yet");
+            installed = InstallCopyLocked(*binding, vptr, output_alias ? why : selected ? "selected" : "present event, no copy yet");
         }
     } else {
         if (selected) binding->reinstalls = 0; // a selection is a new lifetime of the address
@@ -1610,6 +1763,13 @@ static void ReconcileLocked(uintptr_t object, uintptr_t vptr, bool selected) noe
             installed = InstallCopyLocked(*binding, vptr, selected ? "selected, vptr changed" : "present event, vptr changed");
         }
     }
+    if (output_alias) {
+        // Only N owns ReShade's vptr observation and inline fallback. A refused new B has no destroy
+        // callback of its own; release the reservation rather than leaking a binding per refusal.
+        if (!installed && new_binding) *binding = {};
+        if (installed) binding->output_alias = true;
+        return installed;
+    }
     // The fallback's selected identity follows every ACTUAL selection, also when an existing binding with its copy is
     // kept (no install, no adoption): a selected object that carries a copy owns the run, any other selection clears
     // the owner. A present event only publishes when it made the copy of the swap manager's selected object.
@@ -1620,6 +1780,7 @@ static void ReconcileLocked(uintptr_t object, uintptr_t vptr, bool selected) noe
         PublishFallbackIdentity(object);
     // Nothing is left to do for the vptr the object has now (installed, adopted, examined and refused, or left).
     PublishExpected(object, installed ? binding->copy_vptr : vptr);
+    return installed;
 }
 
 // Restores the vptr the object had before our copy, only while the object still has our copy.
@@ -1632,11 +1793,108 @@ static bool RestoreVptrLocked(const VtableBinding& binding) noexcept {
     return true;
 }
 
+#ifdef _WIN64
+// Protected by the vtable lock. slGetNativeInterface, queue discovery and Release run OUTSIDE it.
+static uint64_t s_alias_ticket = 0, s_alias_selection = 0;
+static uint64_t s_probe_proxy = 0, s_next_probe_ms = 0; // includes an outstanding resolver before a base is known
+static std::atomic<uint64_t> s_alias_owner{0}; // resolving, pending, published or refused
+static StreamlineBaseBinding s_output_binding{}, s_refused_binding{}; // vtable lock; identities only
+static void DropOutputBaseLocked() noexcept {
+    const auto b = s_output_binding;
+    if (!b.base) return;
+    // Only the resolver and the Present receiver prove B alive. On EVERY retirement forget only
+    // our bookkeeping; even reading its vptr to check for our copy can touch a different allocation.
+    if (auto* slot = FindBinding(static_cast<uintptr_t>(b.base)); slot && slot->output_alias) *slot = {};
+    s_output_binding = {};
+    if (!g_streamline_base_publication.load(std::memory_order_relaxed)) return; // pending only
+    StreamlineBase_PublishLocked({});
+    s_base_health.store(0, std::memory_order_relaxed);
+    s_base_retry.store(0, std::memory_order_relaxed);
+    const auto* selected = FindBinding(static_cast<uintptr_t>(s_alias_selection));
+    PublishFallbackIdentity(selected && selected->copy_vptr ? selected->object : 0);
+}
+
+uint64_t VSync_BeginOutputAlias(uint64_t alias, uint64_t proxy, uint64_t now_ms, uint64_t* refused_base) noexcept {
+    VtableLock lock;
+    if (!alias || !proxy || alias != s_alias_selection || RuntimeLifecycle_IsStopping() || alias != SwapMgr_GetNativeHandle()) return 0;
+    if (proxy == s_probe_proxy &&
+        (g_streamline_base_publication.load(std::memory_order_relaxed) || now_ms < s_next_probe_ms)) return 0;
+    DropOutputBaseLocked(); // proxy replacement bypasses throttling, including while the old ticket is pending
+    s_probe_proxy = proxy;
+    s_next_probe_ms = now_ms + 1000;
+    if (s_refused_binding.alias != alias || s_refused_binding.proxy != proxy) s_refused_binding = {};
+    if (refused_base) *refused_base = s_refused_binding.base;
+    s_alias_owner.store(alias, std::memory_order_relaxed);
+    return ++s_alias_ticket;
+}
+
+bool VSync_AbandonOutputAlias(uint64_t ticket) noexcept {
+    VtableLock lock;
+    if (!ticket || ticket != s_alias_ticket || g_streamline_base_publication.load(std::memory_order_relaxed)) return false;
+    DropOutputBaseLocked();
+    ++s_alias_ticket; // an external resolution on the abandoned event may still be returning
+    s_next_probe_ms = 0;
+    return true;
+}
+
+bool VSync_BindOutputAlias(uint64_t ticket, const StreamlineBaseBinding& b) noexcept {
+    VtableLock lock;
+    if (!ticket || ticket != s_alias_ticket || s_alias_owner.load(std::memory_order_relaxed) != b.alias ||
+        s_output_binding.base) return false;
+    if (b.base && b.base != s_refused_binding.base) s_refused_binding = {};
+    uintptr_t vptr = 0;
+    if (b.base && b.alias && b.base != b.alias && b.base != b.proxy && b.base != s_refused_binding.base &&
+        !RuntimeLifecycle_IsStopping() && b.alias == SwapMgr_GetNativeHandle() &&
+        GuardedReadPointer(nullptr, static_cast<uintptr_t>(b.base), &vptr) &&
+        ReconcileLocked(static_cast<uintptr_t>(b.base), vptr, false, true)) {
+        s_output_binding = b;
+        s_output_binding.revision = ticket;
+        return true; // installed, NOT published; B is still an unselected self
+    }
+    ++s_alias_ticket;
+    return false;
+}
+
+void VSync_ActivateOutputAlias(uint64_t ticket, uint64_t alias) noexcept {
+    VtableLock lock;
+    if (ticket && ticket == s_alias_ticket && !s_output_binding.base) {
+        ++s_alias_ticket; // the event finished reentrantly before its external resolution returned
+        return;
+    }
+    if (!ticket || s_output_binding.revision != ticket || s_output_binding.alias != alias ||
+        alias != s_alias_selection || alias != SwapMgr_GetNativeHandle() || RuntimeLifecycle_IsStopping() ||
+        g_streamline_base_publication.load(std::memory_order_relaxed)) return;
+    PublishFallbackIdentity(0); // invalidate old finishers before exposing the carried N
+    s_base_health.store(ticket << 6, std::memory_order_relaxed);
+    s_base_retry.store(ticket << 1, std::memory_order_relaxed);
+    StreamlineBase_PublishLocked(s_output_binding);
+}
+
+static bool UnbindOutputAliasLocked(uint64_t alias) noexcept {
+    if (!alias || s_alias_owner.load(std::memory_order_relaxed) != alias) return false;
+    ++s_alias_ticket; // invalidate any resolver or late event still holding this owner's reservation
+    s_alias_owner.store(0, std::memory_order_relaxed);
+    s_probe_proxy = s_next_probe_ms = 0;
+    s_refused_binding = {};
+    DropOutputBaseLocked();
+    return true;
+}
+bool VSync_UnbindOutputAlias(uint64_t alias) noexcept {
+    if (alias != s_alias_owner.load(std::memory_order_relaxed)) return false;
+    VtableLock lock;
+    return UnbindOutputAliasLocked(alias);
+}
+#endif
+
 void VSync_OnNativeSelected(uint64_t native) {
     if (!native) return;
     uintptr_t vptr = 0;
     if (!GuardedReadPointer(nullptr, static_cast<uintptr_t>(native), &vptr)) return;
     VtableLock lock;
+#ifdef _WIN64
+    if (native != s_alias_selection) UnbindOutputAliasLocked(s_alias_selection);
+    s_alias_selection = native;
+#endif
     ReconcileLocked(static_cast<uintptr_t>(native), vptr, true); // stopping is checked under this lock
 }
 
@@ -1654,8 +1912,16 @@ void VSync_ObserveNativeVptr(uint64_t native) {
 void VSync_OnNativeDestroyed(uint64_t native) {
     if (!native) return;
     VtableLock lock;
+#ifdef _WIN64
+    // Also close discovery across the gap between the Streamline destroy and swap-manager callbacks.
+    if (s_alias_selection == native) s_alias_selection = 0;
+    UnbindOutputAliasLocked(native);
+#endif
     VtableBinding* binding = FindBinding(static_cast<uintptr_t>(native));
     if (!binding) return;
+#ifdef _WIN64
+    if (binding->output_alias) { UnbindOutputAliasLocked(s_output_binding.alias); return; }
+#endif
     if (RestoreVptrLocked(*binding))
         LOG_INFO("VSync vtable copy: object 0x%llX destroyed: vptr back to 0x%llX",
                  static_cast<unsigned long long>(native), static_cast<unsigned long long>(binding->replaced_vptr));
@@ -1675,11 +1941,21 @@ void VSync_RestoreVtables() {
     unsigned restored = 0, foreign = 0;
     for (VtableBinding& binding : s_bindings) {
         if (!binding.object) continue;
+        if (binding.output_alias) { binding = {}; continue; } // stored identity is not a lifetime guarantee
         if (RestoreVptrLocked(binding)) ++restored;
         else if (binding.copy_vptr != 0) ++foreign;
         NoteForeignBeforeDrop(binding);
         binding = VtableBinding{};
     }
+#ifdef _WIN64
+    s_alias_selection = 0;
+    s_probe_proxy = s_next_probe_ms = 0;
+    s_alias_owner.store(0, std::memory_order_relaxed);
+    s_output_binding = s_refused_binding = {};
+    s_base_health.store(0, std::memory_order_relaxed);
+    s_base_retry.store(0, std::memory_order_relaxed);
+    StreamlineBase_PublishLocked({});
+#endif
     s_vtable_object.store(0, std::memory_order_release);
     s_vtable_expected.store(0, std::memory_order_relaxed);
     PublishFallbackIdentity(0);
@@ -1858,6 +2134,32 @@ static void InstallInlineFallback(uint64_t native) noexcept {
 }
 
 void VSync_NoteFinishedPresent(uint64_t native) {
+#ifdef _WIN64
+    const auto b = StreamlineBase_Current();
+    if (StreamlineBase_Carries(native, b)) {
+        const uint64_t epoch = b.revision << 6;
+        auto state = s_base_health.load(std::memory_order_relaxed);
+        while ((state & ~kBaseSeen) == epoch) {
+            const auto misses = state & kBaseSeen;
+            if (misses == vtable_copy::FallbackCounter::kScopes) break;
+            const auto next = misses == kBaseSeen ? 0 : misses + 1;
+            if (!s_base_health.compare_exchange_weak(state, epoch | next, std::memory_order_relaxed)) continue;
+            if (next == vtable_copy::FallbackCounter::kScopes) {
+                VtableLock lock;
+                if (s_output_binding.revision == b.revision) {
+                    s_refused_binding = b;
+                    DropOutputBaseLocked();
+                    LOG_WARN("VSync: no base Present entry in %u finished scopes; returning Present to native 0x%llX. "
+                             "Base 0x%llX is refused until destroy or proxy/base replacement; no inline patch installed.",
+                             vtable_copy::FallbackCounter::kScopes, static_cast<unsigned long long>(native),
+                             static_cast<unsigned long long>(b.base));
+                }
+            }
+            break;
+        }
+        return;
+    }
+#endif
     if (!native || s_fallback.Fired()) return;
     // Only the finish of the swapchain that is selected NOW and whose copy the fallback's identity names counts: a
     // finish of any other swapchain neither counts nor consumes the one-shot.

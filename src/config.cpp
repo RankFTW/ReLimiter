@@ -380,6 +380,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.osd_position_cycle_key = ReadINIString(S, "osd_position_cycle_key", "", P);
     g_config.osd_preset_prev_key     = ReadINIString(S, "osd_preset_prev_key", "", P);
     g_config.osd_preset_next_key     = ReadINIString(S, "osd_preset_next_key", "", P);
+    g_config.osd_show_clock          = ReadINIBool(S, "osd_show_clock", false, P);
     g_config.osd_show_fps            = ReadINIBool(S, "osd_show_fps", true, P);
     g_config.osd_show_frametime      = ReadINIBool(S, "osd_show_frametime", false, P);
     g_config.osd_show_frametime_graph = ReadINIBool(S, "osd_show_frametime_graph", false, P);
@@ -408,6 +409,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.native_pcl_enabled      = ReadINIBool(S, "native_pcl_enabled", false, P);
     g_config.gpu_present_gate_probes=ReadINIBool(S,"gpu_present_gate_probes",true,P);
     g_config.flip_metering_off=ReadINIBool(S,"flip_metering_off",false,P);
+    g_config.vtable_copy_at_present=ReadINIBool(S,"vtable_copy_at_present",true,P);
     g_config.gpu_queue_probe=ReadINIBool(S,"gpu_queue_probe",kPacingGpuQueueProbeDefault,P);
     g_config.gpu_queue_probe_source=ReadINIInt(S,"gpu_queue_probe_source",kPacingGpuQueueProbeSourceDefault,P);
     g_config.fg_present_order=ReadINIBool(S,"fg_present_order",true,P);
@@ -588,6 +590,7 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     WriteINIString(S, "osd_toggle_key", config.osd_toggle_key.c_str(), P);
 
     // ── OSD Elements ──
+    WriteINIBool(S, "osd_show_clock", config.osd_show_clock, P);
     WriteINIBool(S, "osd_show_fps", config.osd_show_fps, P);
     WriteINIBool(S, "osd_show_frametime", config.osd_show_frametime, P);
     WriteINIBool(S, "osd_show_frametime_graph", config.osd_show_frametime_graph, P);
@@ -646,6 +649,7 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
 
     // ── Pacing pipeline (developer) ──
     WriteINIBool(S, "flip_metering_off", config.flip_metering_off, P);
+    WriteINIBool(S, "vtable_copy_at_present", config.vtable_copy_at_present, P);
     WriteINIBool(S, "gpu_wait_late_guard", config.gpu_wait_late_guard, P);
     WriteINIBool(S, "gpu_wait_present_first", config.gpu_wait_present_first, P);
     WriteINIBool(S, "gpu_wait_start_limit", config.gpu_wait_start_limit, P);
@@ -1091,6 +1095,7 @@ int Config_DeveloperOverrides() {
     const Config& d = s_default_config;
     return (g_config.gpu_present_gate_probes != d.gpu_present_gate_probes) +
         (g_config.flip_metering_off != d.flip_metering_off) +
+        (g_config.vtable_copy_at_present != d.vtable_copy_at_present) +
         (g_config.gpu_wait_late_guard != d.gpu_wait_late_guard) +
         (g_config.gpu_wait_present_first != d.gpu_wait_present_first) +
         (g_config.gpu_wait_start_limit != d.gpu_wait_start_limit) +
@@ -1118,6 +1123,7 @@ void Config_ResetDeveloperSettings() {
     const Config& d = s_default_config;
     g_config.gpu_present_gate_probes = d.gpu_present_gate_probes;
     g_config.flip_metering_off = d.flip_metering_off;
+    g_config.vtable_copy_at_present = d.vtable_copy_at_present;
     g_config.gpu_wait_late_guard = d.gpu_wait_late_guard;
     g_config.gpu_wait_present_first = d.gpu_wait_present_first;
     g_config.gpu_wait_start_limit = d.gpu_wait_start_limit;
@@ -1177,6 +1183,10 @@ void ApplyConfig() {
     if (g_config.flip_metering_off)
         LOG_WARN("Diagnostic flip metering off: NvAPI_D3D12_SetFlipConfig is hidden from later NvAPI requests, so "
                  "frame generation that asks for it afterwards runs without hardware flip metering (set at launch)");
+    // On by default: a line only when it is off its default.
+    if (!g_config.vtable_copy_at_present)
+        LOG_WARN("Diagnostic vtable copy at present off: a native swapchain gets ReLimiter's Present entry at its "
+                 "selection during swapchain creation, not at its first present event (from the next swapchain)");
     if (g_config.gpu_wait_late_guard)
         LOG_WARN("Diagnostic GPU wait late guard on: while the newest 64 frames all arrived late for their slot, "
                  "the limit on the GPU queue wait's lead follows their lateness and earliest heavy GPU work "
@@ -1293,6 +1303,7 @@ OSDPreset OSDPreset_FromConfig() {
     p.osd_y                 = g_config.osd_y;
     p.osd_scale             = g_config.osd_scale;
     p.osd_opacity           = g_config.osd_opacity;
+    p.show_clock            = g_config.osd_show_clock;
     p.show_fps              = g_config.osd_show_fps;
     p.show_frametime        = g_config.osd_show_frametime;
     p.show_frametime_graph  = g_config.osd_show_frametime_graph;
@@ -1328,6 +1339,7 @@ void OSDPreset_ApplyToConfig(const OSDPreset& p) {
     g_config.osd_y                     = osd_position_policy::ClampCoordinate(p.osd_y);
     g_config.osd_scale                 = p.osd_scale;
     g_config.osd_opacity               = p.osd_opacity;
+    g_config.osd_show_clock            = p.show_clock;
     g_config.osd_show_fps              = p.show_fps;
     g_config.osd_show_frametime        = p.show_frametime;
     g_config.osd_show_frametime_graph  = p.show_frametime_graph;
@@ -1357,6 +1369,7 @@ void OSDPreset_ApplyToConfig(const OSDPreset& p) {
 }
 
 void OSDPreset_ApplyTogglesOnly(const OSDPreset& p) {
+    g_config.osd_show_clock            = p.show_clock;
     g_config.osd_show_fps              = p.show_fps;
     g_config.osd_show_frametime        = p.show_frametime;
     g_config.osd_show_frametime_graph  = p.show_frametime_graph;
@@ -1417,6 +1430,7 @@ static bool ReadPresetSection(const char* S, const char* P, OSDPreset* out) {
     p.osd_y                 = static_cast<float>(ReadINIDouble(S, "osd_y", 0.005, P));
     p.osd_scale             = static_cast<float>(ReadINIDouble(S, "osd_scale", 1.0, P));
     p.osd_opacity           = static_cast<float>(ReadINIDouble(S, "osd_opacity", 0.6, P));
+    p.show_clock            = ReadINIBool(S, "show_clock", false, P);
     p.show_fps              = ReadINIBool(S, "show_fps", false, P);
     p.show_frametime        = ReadINIBool(S, "show_frametime", false, P);
     p.show_frametime_graph  = ReadINIBool(S, "show_frametime_graph", false, P);
@@ -1533,6 +1547,7 @@ static void WritePresetSection(const char* S, const OSDPreset& p, const char* P)
     WriteINIDouble(S, "osd_y", p.osd_y, P);
     WriteINIDouble(S, "osd_scale", p.osd_scale, P);
     WriteINIDouble(S, "osd_opacity", p.osd_opacity, P);
+    WriteINIBool(S, "show_clock", p.show_clock, P);
     WriteINIBool(S, "show_fps", p.show_fps, P);
     WriteINIBool(S, "show_frametime", p.show_frametime, P);
     WriteINIBool(S, "show_frametime_graph", p.show_frametime_graph, P);

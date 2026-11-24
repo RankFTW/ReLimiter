@@ -564,6 +564,7 @@ config_key advanced_settings
 config_key developer_settings
 config_key config_version
 config_key flip_metering_off
+config_key vtable_copy_at_present
 config_key gpu_wait_late_guard
 config_key gpu_wait_present_first
 config_key gpu_wait_start_limit
@@ -596,6 +597,7 @@ config_key hang_report
 config_key hang_report_dump
 config_key hang_report_test_after_s
 config_key streamline_compat
+config_key osd_show_clock
 config_key osd_show_fps
 config_key osd_show_frametime
 config_key osd_show_frametime_graph

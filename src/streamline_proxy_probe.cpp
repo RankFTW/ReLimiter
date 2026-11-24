@@ -2,6 +2,7 @@
 #include "streamline_proxy_search.h"
 #include "streamline_queue_hooks.h"
 #include "streamline_gpu_handoff.h"
+#include "streamline_base_present.h"
 #include "hooks.h"
 #include "logger.h"
 #include "runtime_lifecycle.h"
@@ -9,6 +10,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 
 namespace streamline_proxy_probe {
 using Present = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
@@ -16,6 +18,11 @@ using Present1 = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT, const
 std::atomic<Present> original_present{nullptr};
 std::atomic<Present1> original_present1{nullptr};
 std::atomic<uint64_t> expected_vtable{0};
+// VSync vtable copies and the class vtable each one replaced (StreamlineProxy_NoteVtableCopy): append-only, one writer.
+constexpr size_t kCopyCapacity = 16;
+std::atomic<uint64_t> copy_vptrs[kCopyCapacity]{};
+std::atomic<uint64_t> copy_originals[kCopyCapacity]{};
+std::atomic<size_t> copy_count{0};
 std::atomic<unsigned> queue_offer_state{0};
 StreamlineComEvidence queue_methods; // single producer after CAS, release published
 // The installer worker writes the cause once, then publishes the flag.
@@ -33,12 +40,80 @@ bool CopyQueue(uint64_t queue, StreamlineComEvidence* methods) noexcept {
         return methods->entries[6] && methods->entries[7] && methods->entries[8];
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
+// Diagnostics, logged once each: whose vtable ReShade's native swapchain and queue have, and what Streamline's base
+// interface leads to from them and from Streamline's own swapchain proxy (StreamlineRetrieveBaseInterface: the IID a
+// Streamline proxy answers with the object it wraps; another module's proxy that forwards unknown IIDs passes it on).
+// A frame generation mod can put its own proxy and Streamline's BELOW ReShade (Kingdom Come: Deliverance II with
+// KCD2FrameGeneration): ReShade's native objects are then proxies, DXGI's and Direct3D's own lie further down, and
+// the native Present entry and the standard queue hooks do not reach them.
+constexpr GUID kStreamlineBase{0xadec44e2, 0x61f0, 0x45c3, {0xad, 0x9f, 0x1b, 0x37, 0x37, 0x92, 0x84, 0xff}};
+void OwnerName(uint64_t address, char* out, size_t size) noexcept {
+    HMODULE owner = nullptr;
+    wchar_t path[MAX_PATH]{};
+    if (!address || !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(address), &owner) || !owner || !GetModuleFileNameW(owner, path, MAX_PATH)) {
+        std::snprintf(out, size, "no module");
+        return;
+    }
+    path[MAX_PATH - 1] = L'\0';
+    // "(system)": ReShade's own module is often named dxgi.dll too, in the game's folder.
+    wchar_t system[MAX_PATH]{};
+    const UINT system_length = GetSystemDirectoryW(system, MAX_PATH);
+    const bool in_system = system_length && system_length < MAX_PATH && !_wcsnicmp(path, system, system_length);
+    const wchar_t* name = std::wcsrchr(path, L'\\');
+    std::snprintf(out, size, "%ls%s", name ? name + 1 : path, in_system ? " (system)" : "");
+}
+uint64_t StreamlineBaseOf(uint64_t object) noexcept {
+    __try {
+        IUnknown* base = nullptr;
+        if (reinterpret_cast<IUnknown*>(object)->QueryInterface(kStreamlineBase, reinterpret_cast<void**>(&base)) != S_OK || !base)
+            return 0;
+        base->Release(); // the layer above keeps it alive; only its address and vtable are read
+        return reinterpret_cast<uint64_t>(base);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+void DescribeLayers(uint64_t object, char* out, size_t size) noexcept {
+    size_t used = 0;
+    out[0] = '\0';
+    for (int layer = 0; layer < 4 && object; ++layer) {
+        char owner[96];
+        OwnerName(ReadVtable(reinterpret_cast<const void*>(object)), owner, sizeof(owner));
+        const int written = std::snprintf(out + used, size - used, "%s0x%llX (vtable in %s)", layer ? " -> " : "",
+            static_cast<unsigned long long>(object), owner);
+        if (written <= 0 || static_cast<size_t>(written) >= size - used) break;
+        used += static_cast<size_t>(written);
+        const uint64_t base = StreamlineBaseOf(object);
+        if (!base || base == object) break;
+        object = base;
+    }
+}
+std::atomic<bool> proxy_layers_logged{false};
+// The proxy's vptr names Streamline's proxy class: the class vtable itself, or one of our VSync copies of it.
+bool ExpectedClass(uint64_t table) noexcept {
+    const uint64_t expected = expected_vtable.load(std::memory_order_acquire);
+    if (!table || !expected) return false;
+    if (table == expected) return true;
+    const size_t count = copy_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < count; ++i)
+        if (copy_vptrs[i].load(std::memory_order_relaxed) == table)
+            return copy_originals[i].load(std::memory_order_relaxed) == expected;
+    return false;
+}
 template<class Forward> HRESULT Observe(void* proxy, UINT sync, UINT flags, Forward forward) {
     const DWORD incoming = GetLastError();
     RuntimeCallbackGuard callback;
     if (callback.IsStopping()) { SetLastError(incoming); return forward(); }
     const auto table = ReadVtable(proxy);
-    const bool valid = table && table == expected_vtable.load(std::memory_order_acquire);
+    const bool valid = ExpectedClass(table);
+    if (valid && !proxy_layers_logged.load(std::memory_order_relaxed) &&
+        !proxy_layers_logged.exchange(true, std::memory_order_relaxed)) {
+        char layers[400];
+        DescribeLayers(reinterpret_cast<uint64_t>(proxy), layers, sizeof(layers));
+        LOG_INFO("Streamline GPU: layers from Streamline's swap chain proxy: %s", layers);
+    }
+    // The proxy the game presents under the swap chain of ReShade's present event on this thread
+    // (streamline_base_present.h): one load and a compare once it is known.
+    if (valid) StreamlineBase_NoteProxyPresent(reinterpret_cast<uint64_t>(proxy));
     StreamlineInputScope input(valid ? reinterpret_cast<uint64_t>(proxy) : 0, sync, flags);
     SetLastError(incoming);
     const HRESULT result = forward();
@@ -101,7 +176,19 @@ void StreamlineProxy_Install(HMODULE module, uint64_t table, const StreamlineCom
         result.anchor.address, result.anchor.expected, result.candidates, result.rejected, result.candidate_check,
         result.candidate_index, static_cast<unsigned long long>(result.hooked_slots));
 }
-void StreamlineProxy_RecordInner(uint64_t, uint64_t queue, uint64_t) noexcept {
+void StreamlineProxy_NoteVtableCopy(uint64_t original, uint64_t copy) noexcept {
+    using namespace streamline_proxy_probe;
+    if (!original || !copy) return;
+    const size_t count = copy_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < count; ++i)
+        if (copy_vptrs[i].load(std::memory_order_relaxed) == copy) return; // a copy replaces one class for good
+    if (count >= kCopyCapacity) return;
+    copy_vptrs[count].store(copy, std::memory_order_relaxed);
+    copy_originals[count].store(original, std::memory_order_relaxed);
+    copy_count.store(count + 1, std::memory_order_release);
+}
+bool StreamlineProxy_IsProxyClass(uint64_t vptr) noexcept { return streamline_proxy_probe::ExpectedClass(vptr); }
+void StreamlineProxy_RecordInner(uint64_t swapchain, uint64_t queue, uint64_t) noexcept {
     using namespace streamline_proxy_probe;
     if (!queue || !expected_vtable.load(std::memory_order_acquire)) return;
     unsigned expected = 0;
@@ -109,6 +196,12 @@ void StreamlineProxy_RecordInner(uint64_t, uint64_t queue, uint64_t) noexcept {
     const DWORD error = GetLastError();
     const bool copied = CopyQueue(queue, &queue_methods);
     queue_offer_state.store(copied ? 2u : 0u, std::memory_order_release);
+    char swapchain_layers[400], queue_layers[400], method[96];
+    DescribeLayers(swapchain, swapchain_layers, sizeof(swapchain_layers));
+    DescribeLayers(queue, queue_layers, sizeof(queue_layers));
+    OwnerName(queue_methods.entries[6], method, sizeof(method));
+    LOG_INFO("Streamline GPU: layers under ReShade: swap chain %s; queue %s, its ExecuteCommandLists 0x%llX in %s",
+        swapchain_layers, queue_layers, static_cast<unsigned long long>(queue_methods.entries[6]), method);
     SetLastError(error);
 }
 void StreamlineProxy_Drain(bool) noexcept {

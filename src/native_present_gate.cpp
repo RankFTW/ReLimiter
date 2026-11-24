@@ -552,7 +552,7 @@ size_t NativeGate_DiagnosticsText(char* out, size_t size) noexcept {
     const int written = std::snprintf(out, size,
         "entries on_present=%llu(t%lu) typed_present=%llu(t%lu) typed_present1=%llu(t%lu) "
         "begin_scope=%llu(t%lu) end_scope=%llu(t%lu) gate_call=%llu(t%lu) "
-        "vtable_present=%llu(t%lu) vtable_present1=%llu(t%lu) inner_pass_through=%llu(t%lu); "
+        "vtable_present=%llu(t%lu) vtable_present1=%llu(t%lu) inner_pass_through=%llu(t%lu) alias_pass_through=%llu(t%lu); "
         "present_rejected=%llu present1_rejected=%llu scopes_without_call=%llu; "
         "begin_call mapped=%llu unmapped_no_pending=%llu unmapped_no_scope=%llu unmapped_invalid=%llu "
         "nested=%llu stale=%llu special=%llu multiple=%llu; "
@@ -564,6 +564,7 @@ size_t NativeGate_DiagnosticsText(char* out, size_t size) noexcept {
         ull(entry(E::EndScope)), thread(E::EndScope), ull(entry(E::GateCall)), thread(E::GateCall),
         ull(entry(E::VtablePresent)), thread(E::VtablePresent), ull(entry(E::VtablePresent1)), thread(E::VtablePresent1),
         ull(entry(E::InnerPassThrough)), thread(E::InnerPassThrough),
+        ull(entry(E::AliasPassThrough)), thread(E::AliasPassThrough),
         ull(d.present_rejected), ull(d.present1_rejected), ull(d.scopes_without_call),
         call(C::Mapped), call(C::UnmappedNoPending), call(C::UnmappedNoScope), call(C::UnmappedInvalid),
         call(C::Nested), call(C::Stale), call(C::SpecialPresent), call(C::MultipleCalls),

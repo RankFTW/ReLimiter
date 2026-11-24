@@ -12,6 +12,7 @@
 #include "instrumentation_state.h"
 #include "pacing_resolver.h"
 #include "gpu_queue_probe.h"
+#include "native_queue.h"
 #include <array>
 #include <atomic>
 
@@ -413,7 +414,7 @@ bool GpuReadiness_ReleaseAfterRundown() noexcept {
 }
 void GpuReadiness_OnQueueDestroy(reshade::api::command_queue* queue) noexcept {
     if (!queue || queue->get_device()->get_api() != reshade::api::device_api::d3d12) return;
-    const auto native = reinterpret_cast<ID3D12CommandQueue*>(queue->get_native());
+    const auto native = reinterpret_cast<ID3D12CommandQueue*>(NativeQueue_Peek(queue->get_native()));
     GpuPresent_OnQueueDestroy(reinterpret_cast<uint64_t>(native));
     AcquireSRWLockShared(&s_registration);
     for (auto& slot : s_queues) {
@@ -422,35 +423,50 @@ void GpuReadiness_OnQueueDestroy(reshade::api::command_queue* queue) noexcept {
     ReleaseSRWLockShared(&s_registration);
     WakeWorker();
 }
-void GpuReadiness_OnPresent(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain) noexcept {
-    if (s_scope.depth != 0) { s_scope.valid = false; return; }
+static bool PrepareReadinessScope() noexcept {
+    if (s_scope.depth != 0) { s_scope.valid = false; return false; }
     if (s_scope.queue || s_scope.sample || s_scope.valid || s_scope.calls != 0) FinishScope(false); // missing previous finish callback
-    if (!queue || !swapchain || queue->get_device()->get_api() != reshade::api::device_api::d3d12 ||
-        swapchain->get_device()->get_api() != reshade::api::device_api::d3d12) return;
-    const uint64_t native = swapchain->get_native();
-    if (native != SwapMgr_GetNativeHandle()) return;
+    return true;
+}
+template<class DeviceHandle>
+static void BeginReadinessScope(uint64_t native, uint64_t native_queue, DeviceHandle device_handle) noexcept {
     // GpuQueue capability discovery: runs before any H3 plan exists, so the
     // resolver can select the rung that later makes readiness required.
-    if (!RuntimeLifecycle_IsStopping()) GpuPresent_ObservePresentQueue(queue->get_native(), native);
+    if (!RuntimeLifecycle_IsStopping()) GpuPresent_ObservePresentQueue(native_queue, native);
     // gpu_queue_probe (key off: one load and a branch): the presenting queue of this Present, for
     // the readiness site that follows on this thread.
     if (g_gpu_queue_probe.load(std::memory_order_relaxed))
-        GpuQueueProbe_NotePresentQueue(reinterpret_cast<void*>(queue->get_native()));
+        GpuQueueProbe_NotePresentQueue(reinterpret_cast<void*>(native_queue));
     if (!Eligible() || (!FrameTimeline_IsEnabled() && !GpuPresent_RequiresReadiness()) || s_scope.depth != 0) return;
-    if(!swapchain->get_device()->get_native())return;
+    const uint64_t device = device_handle();
+    if (!device) return;
     s_scope.native = native;
     s_scope.generation = FrameTimeline_GetPresentSwapchainGeneration(native);
     s_scope.settings = GpuReadiness_Settings();
-    s_scope.queue = FindOrRequest(reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()),swapchain->get_device()->get_native());
+    s_scope.queue = FindOrRequest(reinterpret_cast<ID3D12CommandQueue*>(native_queue), device);
     s_scope.valid = s_scope.queue && s_scope.generation;
 }
-void GpuReadiness_OnFinishPresent(reshade::api::swapchain* swapchain) noexcept {
-    const bool valid = swapchain && s_scope.valid && s_scope.completed && s_scope.calls == 1 && s_scope.depth == 0 &&
-        swapchain->get_native() == s_scope.native && s_scope.settings == GpuReadiness_Settings() && Eligible() &&
+void GpuReadiness_OnPresent(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain) noexcept {
+    if (!PrepareReadinessScope() || !queue || !swapchain || queue->get_device()->get_api() != reshade::api::device_api::d3d12 ||
+        swapchain->get_device()->get_api() != reshade::api::device_api::d3d12) return;
+    const uint64_t native = swapchain->get_native();
+    if (native != SwapMgr_GetNativeHandle()) return;
+    BeginReadinessScope(native, NativeQueue_Of(queue->get_native()), [swapchain] { return swapchain->get_device()->get_native(); });
+}
+void GpuReadiness_BeginScope(uint64_t native, uint64_t native_queue, uint64_t native_device) noexcept {
+    if (PrepareReadinessScope() && native == SwapMgr_GetNativeHandle())
+        BeginReadinessScope(native, native_queue, [native_device] { return native_device; });
+}
+void GpuReadiness_EndScope(uint64_t native) noexcept {
+    const bool valid = native && s_scope.valid && s_scope.completed && s_scope.calls == 1 && s_scope.depth == 0 &&
+        native == s_scope.native && s_scope.settings == GpuReadiness_Settings() && Eligible() &&
         FrameTimeline_GetPresentSwapchainGeneration(s_scope.native) == s_scope.generation;
     // Source key (key off: one load and a branch): the Present scope of this thread ends here.
     if (g_gpu_queue_probe.load(std::memory_order_relaxed)) GpuQueueProbe_DependencyScopeEnd();
     FinishScope(valid);
+}
+void GpuReadiness_OnFinishPresent(reshade::api::swapchain* swapchain) noexcept {
+    GpuReadiness_EndScope(swapchain && s_scope.valid ? swapchain->get_native() : 0);
 }
 GpuReadinessCall::GpuReadinessCall(const PresentTimelineSpan* span, bool before_gate) noexcept {
     // gpu_queue_probe (key off: one load and a branch): this Present's boundary, in front of every

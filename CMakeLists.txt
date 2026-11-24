@@ -113,6 +113,8 @@ set(ADDON_SOURCES
     src/nvapi_marker_census.h
     src/present_association.cpp
     src/vsync_control.cpp
+    src/streamline_base_present.h
+    src/streamline_base_present.cpp
     src/vtable_copy.h
     src/vtable_copy.cpp
     src/vk_enforce.cpp

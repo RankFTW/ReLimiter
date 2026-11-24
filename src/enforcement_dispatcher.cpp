@@ -109,32 +109,35 @@ void EnfDisp_OnSwapchainDestroy(bool full_teardown) {
 
 // ── Present event routing ──
 
-void EnfDisp_OnPresent(int64_t now_qpc) {
+void EnfDisp_NoteOutputPresent(int64_t now_qpc) noexcept {
     // ── Output FPS + 1% low: rolling 1-second window of present timestamps ──
-    if (!s_present_telemetry_owner.test_and_set(std::memory_order_acquire)) {
-        // Record this present
-        s_present_ts[s_present_head] = now_qpc;
-        s_present_head = (s_present_head + 1) % MAX_PRESENT_TIMESTAMPS;
-        if (s_present_count < MAX_PRESENT_TIMESTAMPS)
-            s_present_count++;
+    if (s_present_telemetry_owner.test_and_set(std::memory_order_acquire)) return;
+    // Record this present
+    s_present_ts[s_present_head] = now_qpc;
+    s_present_head = (s_present_head + 1) % MAX_PRESENT_TIMESTAMPS;
+    if (s_present_count < MAX_PRESENT_TIMESTAMPS)
+        s_present_count++;
 
-        // Collect timestamps within the last 1 second into a sorted array
-        LARGE_INTEGER freq;
-        QueryPerformanceFrequency(&freq);
-        int64_t one_sec = freq.QuadPart;
-        int64_t cutoff = now_qpc - one_sec;
+    // Collect timestamps within the last 1 second into a sorted array
+    LARGE_INTEGER freq;
+    QueryPerformanceFrequency(&freq);
+    int64_t one_sec = freq.QuadPart;
+    int64_t cutoff = now_qpc - one_sec;
 
-        static int64_t window_ts[MAX_PRESENT_TIMESTAMPS];
-        int wcount = 0;
-        for (int i = 0; i < s_present_count; i++) {
-            if (s_present_ts[i] >= cutoff)
-                window_ts[wcount++] = s_present_ts[i];
-        }
-
-        // Output FPS: simply the count of presents in the window
-        g_output_fps.store(static_cast<double>(wcount), std::memory_order_relaxed);
-        s_present_telemetry_owner.clear(std::memory_order_release);
+    static int64_t window_ts[MAX_PRESENT_TIMESTAMPS];
+    int wcount = 0;
+    for (int i = 0; i < s_present_count; i++) {
+        if (s_present_ts[i] >= cutoff)
+            window_ts[wcount++] = s_present_ts[i];
     }
+
+    // Output FPS: simply the count of presents in the window
+    g_output_fps.store(static_cast<double>(wcount), std::memory_order_relaxed);
+    s_present_telemetry_owner.clear(std::memory_order_release);
+}
+
+void EnfDisp_OnPresent(int64_t now_qpc, bool count_output) {
+    if (count_output) EnfDisp_NoteOutputPresent(now_qpc);
 
     // DMFG passthrough: skip enforcement dispatch, FPS counter already updated
     if (IsDmfgActive())

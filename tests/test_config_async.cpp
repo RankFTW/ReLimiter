@@ -2248,7 +2248,7 @@ std::vector<std::string> WrittenValues(const char* key) {
     return values;
 }
 
-// The 26 OSD element toggles of the live config and of a preset, written once here as the fixture of the contract:
+// The 27 OSD element toggles of the live config and of a preset, written once here as the fixture of the contract:
 // the INI key of the config flag, the key of the preset section, and the two fields.
 struct OsdToggle {
     const char* config_key;
@@ -2258,6 +2258,7 @@ struct OsdToggle {
 };
 #define OSD_TOGGLE(name) { "osd_show_" #name, "show_" #name, &Config::osd_show_##name, &OSDPreset::show_##name }
 const OsdToggle osd_toggles[] = {
+    OSD_TOGGLE(clock),
     OSD_TOGGLE(fps), OSD_TOGGLE(frametime), OSD_TOGGLE(frametime_graph), OSD_TOGGLE(fg), OSD_TOGGLE(limiter),
     OSD_TOGGLE(jitter), OSD_TOGGLE(cpu_latency), OSD_TOGGLE(native_pcl), OSD_TOGGLE(native_pcl_breakdown),
     OSD_TOGGLE(1pct_low), OSD_TOGGLE(pacing_quality),
@@ -2267,9 +2268,9 @@ const OsdToggle osd_toggles[] = {
     OSD_TOGGLE(dlss_presets), OSD_TOGGLE(dlss_versions)};
 #undef OSD_TOGGLE
 constexpr size_t osd_toggle_count = sizeof(osd_toggles) / sizeof(osd_toggles[0]);
-static_assert(osd_toggle_count == 26, "the contract lists 26 OSD element toggles");
+static_assert(osd_toggle_count == 27, "the contract lists 27 OSD element toggles");
 
-// The 60 keys of the [FrameLimiter] section that are not OSD element toggles (86 with the 26 toggles), each with a value
+// The 61 keys of the [FrameLimiter] section that are not OSD element toggles (88 with the 27 toggles), each with a value
 // away from its default as an earlier launch left it, and the value the clean rewrite saves back. The keybind keys are
 // written to the local INI only while the presets are not shared. Derived by running the writer, then pinned. Which keys
 // exist is not decided here: ExpectedIniKeys reads the config_key lines of the shared fixture.
@@ -2291,6 +2292,7 @@ const IniKey non_default_ini[] = {
     {"osd_preset_prev_key", "F1", "F1"}, {"osd_preset_next_key", "F2", "F2"}, {"blackout_key", "F3", "F3"},
     {"pacing_preference", "smooth", "smooth"}, {"advanced_settings", "true", "true"},
     {"developer_settings", "true", "true"}, {"config_version", "6", "6"}, {"flip_metering_off", "true", "true"},
+    {"vtable_copy_at_present", "false", "false"},
     {"gpu_wait_late_guard", "true", "true"}, {"gpu_wait_present_first", "false", "false"},
     {"gpu_wait_start_limit", "false", "false"},
     {"lead_queue_correction", "false", "false"}, {"fg_flip_gate_cover", "80", "80"},
@@ -2308,7 +2310,7 @@ const IniKey non_default_ini[] = {
     {"hang_report", "true", "true"}, {"hang_report_dump", "false", "false"}, {"hang_report_test_after_s", "30", "30"},
     {"streamline_compat", "force_false", "force_false"}};
 constexpr size_t non_default_ini_count = sizeof(non_default_ini) / sizeof(non_default_ini[0]);
-static_assert(non_default_ini_count == 63, "the contract lists 63 further keys");
+static_assert(non_default_ini_count == 64, "the contract lists 64 further keys");
 bool IsKeybindKey(const std::string& key) {
     return key == "osd_preset_prev_key" || key == "osd_preset_next_key" || key == "blackout_key" ||
            key == "osd_position_cycle_key" || key == "oled_care_key" || key == "oled_care_all_monitors" ||
@@ -2591,7 +2593,7 @@ void TestOnlyTheListedKeysAreLive() {
         CHECK(std::strstr(unknown, "not a live key") != nullptr);
         ++refused;
     }
-    CHECK(refused == 86 - 20);
+    CHECK(refused == 88 - 20);
     SaveConfig();
     CHECK(SectionFields(local_path, "FrameLimiter") == before); // nothing a refused key named changed
     ReleaseStart();CHECK(OwnerShutdown());
@@ -2608,6 +2610,7 @@ struct DeveloperField {
 const DeveloperField developer_fields[] = {
     {"gpu_present_gate_probes", [] { g_config.gpu_present_gate_probes = false; }, [] { return g_config.gpu_present_gate_probes; }},
     {"flip_metering_off", [] { g_config.flip_metering_off = true; }, [] { return !g_config.flip_metering_off; }},
+    {"vtable_copy_at_present", [] { g_config.vtable_copy_at_present = false; }, [] { return g_config.vtable_copy_at_present; }},
     {"gpu_wait_late_guard", [] { g_config.gpu_wait_late_guard = true; }, [] { return !g_config.gpu_wait_late_guard; }},
     {"gpu_wait_present_first", [] { g_config.gpu_wait_present_first = false; }, [] { return g_config.gpu_wait_present_first; }},
     {"gpu_wait_start_limit", [] { g_config.gpu_wait_start_limit = false; }, [] { return g_config.gpu_wait_start_limit; }},
@@ -2630,7 +2633,7 @@ const DeveloperField developer_fields[] = {
     {"unified_queue_allow_us", [] { g_config.unified_queue_allow_us = 2500; }, [] { return g_config.unified_queue_allow_us == 4000; }},
     {"hang_report_dump", [] { g_config.hang_report_dump = false; }, [] { return g_config.hang_report_dump; }},
     {"hang_report_test_after_s", [] { g_config.hang_report_test_after_s = 30; }, [] { return g_config.hang_report_test_after_s == 0; }}};
-static_assert(sizeof(developer_fields) / sizeof(developer_fields[0]) == 23, "the contract lists 23 developer fields");
+static_assert(sizeof(developer_fields) / sizeof(developer_fields[0]) == 24, "the contract lists 24 developer fields");
 void TestDeveloperFieldsAreCountedAndResetOneByOne() {
     Reset();
     CHECK(Config_DeveloperOverrides() == 0);

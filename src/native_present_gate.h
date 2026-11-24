@@ -155,11 +155,11 @@ uint64_t NativeGate_ScopesWithoutCalls() noexcept;
 // qualifies can be told apart from the log. TypedPresent/TypedPresent1 count entries of the inline
 // patch's detours, VtablePresent/VtablePresent1 entries of the private vtable copy's detours (the route's
 // normal entry); InnerPassThrough counts the entries of either kind that passed straight to their
-// original because the same object was already inside a detour on that thread (the body runs once, in
-// the outermost entry).
+// original because the same logical swapchain was already inside a detour on that thread. AliasPassThrough
+// counts input entries that forward unchanged because the native body runs at Streamline's base instead.
 enum class NativeGateEntry : uint8_t {
     OnPresent, TypedPresent, TypedPresent1, BeginScope, EndScope, GateCall,
-    VtablePresent, VtablePresent1, InnerPassThrough, Count };
+    VtablePresent, VtablePresent1, InnerPassThrough, AliasPassThrough, Count };
 // One increment, and the thread id when it differs from the last seen.
 void NativeGate_NoteEntry(NativeGateEntry entry) noexcept;
 enum class NativeGateCallOutcome : uint8_t {

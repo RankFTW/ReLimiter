@@ -4,9 +4,12 @@
 // Windows x64/Win32, C++17. This validates hook ownership/routing, not real
 // instruction patching, loader-lock behavior, driver calls or frame pacing.
 #include "../src/vsync_control.cpp"
+#include "../src/streamline_base_present.cpp"
 #include "../src/loadlib_hooks.cpp"
 #include "presentation_gate.h" // PresentGate_MakeAttribution (header-only)
 #include "pacing_resolver.h"   // H3 pipeline publication for the GPU gate route
+#include "native_queue.h"
+#include <new>
 
 #ifdef _WIN64
 void FgInput_BeginWorkerLifetime() noexcept {}
@@ -15,6 +18,11 @@ void FgInput_Drain() noexcept {}
 void StreamlineFactoryProbe_Drain(bool) noexcept {}
 void StreamlineFactoryProbe_TryWorker(HMODULE, bool) noexcept {}
 void StreamlineProxy_Drain(bool) noexcept {}
+void StreamlineProxy_NoteVtableCopy(uint64_t, uint64_t) noexcept {}
+bool StreamlineProxy_IsProxyClass(uint64_t) noexcept { return false; }
+thread_local StreamlineInputScope* StreamlineInputScope::current_ = nullptr;
+StreamlineInputScope::StreamlineInputScope(uint64_t, UINT sync, UINT) noexcept : sync_interval(sync), previous_(current_) { current_ = this; }
+StreamlineInputScope::~StreamlineInputScope() { current_ = previous_; }
 void StreamlineQueue_Drain(bool) noexcept {}
 #endif
 
@@ -73,6 +81,7 @@ GpuPresentExecution s_gpu_execution=GpuPresentExecution::WaitCommitted;
 // Pacing telemetry sink: Present records pushed by the production hooks.
 unsigned s_pacing_present_records = 0;
 PacingPresentRecord s_last_pacing_present{};
+uint64_t s_last_timeline_native = 0, s_last_gate_native = 0, s_last_dxgi_receiver = 0;
 constexpr uint64_t kFakeGpuTicketBase = 5000;
 
 HRESULT STDMETHODCALLTYPE NativeProbe(IDXGISwapChain*, UINT, UINT) {
@@ -472,6 +481,7 @@ void* NonModuleCode() {
 }
 
 void TestVtableCopyEntry() {
+    const auto initial_restores = s_vtable_restores.load();
     static void* vtable_storage[1 + kVtSlots];
     static void* foreign_storage[1 + kVtSlots];
     struct FakeObject { void** vptr; };
@@ -592,7 +602,7 @@ void TestVtableCopyEntry() {
 
     // Destroy: the vptr goes back only while it still equals our copy.
     VSync_OnNativeDestroyed(object_handle);
-    Check(object.vptr == foreign_vptr && s_vtable_restores.load() == 0, "destroy leaves a vptr that is not ours");
+    Check(object.vptr == foreign_vptr && s_vtable_restores.load() == initial_restores, "destroy leaves a vptr that is not ours");
 
     // The history is process-global: destroy and init of the same native object do not forget the foreign vptr, and
     // it is left alone on the next selection of this object and of any other (no copy over it, no chain into a cycle).
@@ -619,7 +629,57 @@ void TestVtableCopyEntry() {
     Check(s_records.IndexOfCopy(reinterpret_cast<uintptr_t>(object.vptr)) == first && s_records.Size() == records_before,
           "the same vtable image shares its copy and record");
     VSync_OnNativeDestroyed(object_handle);
-    Check(object.vptr == original_vptr && s_vtable_restores.load() == 1, "destroy restores the vptr it replaced");
+    Check(object.vptr == original_vptr && s_vtable_restores.load() == initial_restores + 1, "destroy restores the vptr it replaced");
+
+    // Developer key vtable_copy_at_present: a selection leaves an object without a copy as DXGI made it (a layer
+    // above inspects it when the creation call returns) and names no owner; the object's first present event makes
+    // the copy; a later selection of the object (a resize) keeps it; with the key off a selection copies again.
+    {
+        const unsigned restores_before = s_vtable_restores.load();
+        const uint64_t override_before = s_native_handle_override;
+        s_native_handle_override = object_handle;
+        g_config.vtable_copy_at_present = true;
+        VSync_OnNativeSelected(object_handle);
+        Check(object.vptr == original_vptr && s_route_object.load() == 0 && s_records.Size() == records_before,
+              "with vtable_copy_at_present a selection leaves the vptr and names no owner");
+        VSync_ObserveNativeVptr(object_handle);
+        Check(s_records.IndexOfCopy(reinterpret_cast<uintptr_t>(object.vptr)) == first && s_records.Size() == records_before &&
+              s_route_object.load() == object_handle,
+              "the object's first present event makes the copy and names the selected object as the owner");
+        void** const copy_vptr = object.vptr;
+        VSync_ObserveNativeVptr(object_handle);
+        VSync_OnNativeSelected(object_handle);
+        Check(object.vptr == copy_vptr && s_route_object.load() == object_handle,
+              "a later present event and a later selection keep the copy");
+        VSync_OnNativeDestroyed(object_handle);
+        Check(object.vptr == original_vptr && s_vtable_restores.load() == restores_before + 1,
+              "destroy restores the vptr the deferred copy replaced");
+        // The record of the class vtable as it is at the deferred selection is made there, so a hook another module
+        // writes into the class vtable before the first Present is not the earliest record's Present.
+        void* const slot5 = vtable_storage[1 + 5];
+        vtable_storage[1 + 5] = reinterpret_cast<void*>(&VtQueryInterface); // a class vtable image without a record
+        VSync_OnNativeSelected(object_handle);
+        Check(object.vptr == original_vptr && s_records.Size() == records_before + 1,
+              "a deferred selection makes the record of the class vtable as it is then and leaves the object");
+        const size_t prepared = s_records.Size() - 1;
+        Check(s_records.Get(prepared)->original_present == reinterpret_cast<uintptr_t>(&VtPresent),
+              "the record's Present is the implementation's own");
+        vtable_storage[1 + 8] = reinterpret_cast<void*>(&ForeignPresent); // another module hooks the class slot in place
+        VSync_ObserveNativeVptr(object_handle);
+        Check(s_records.Size() == records_before + 2 &&
+              s_records.IndexOfCopy(reinterpret_cast<uintptr_t>(object.vptr)) == prepared + 1,
+              "the first present event copies the class vtable as it is then, in a later record");
+        VSync_OnNativeDestroyed(object_handle);
+        vtable_storage[1 + 8] = reinterpret_cast<void*>(&VtPresent);
+        vtable_storage[1 + 5] = slot5;
+        g_config.vtable_copy_at_present = false;
+        VSync_OnNativeSelected(object_handle);
+        Check(s_records.IndexOfCopy(reinterpret_cast<uintptr_t>(object.vptr)) == first,
+              "with the key off a selection makes the copy again");
+        VSync_OnNativeDestroyed(object_handle);
+        s_vtable_restores.store(restores_before);
+        s_native_handle_override = override_before;
+    }
 
     // Teardown restores the vptrs that are still ours, no others.
     VSync_OnNativeSelected(object_handle);
@@ -1058,6 +1118,271 @@ void TestVtableForwardsLiveClassSlot() {
     Check(rf::s_object.vptr == class_vptr, "destroy restores the class vtable");
 }
 
+#ifdef _WIN64
+void TestNativeQueueOverflow() {
+    constexpr size_t capacity = sizeof(native_queue::entries) / sizeof(native_queue::entries[0]);
+    for (uint64_t i = 1; i <= capacity; ++i)
+        Check(native_queue::Remember(i, i + 100) == i + 100 && NativeQueue_Peek(i) == i + 100, "stored queue is discoverable at destroy");
+    const uint64_t overflow = capacity + 1;
+    Check(native_queue::Remember(overflow, overflow + 100) == overflow && NativeQueue_Peek(overflow) == overflow,
+          "overflow returns the reported queue, not an undiscoverable resolution");
+    for (uint64_t i = 1; i <= capacity; ++i) NativeQueue_Forget(i);
+}
+namespace output_test {
+VtObject input{}, output{};
+void* table[1 + vtable_copy::kMaxEntries]{};
+StreamlineBaseBinding route{};
+bool bind_inside_input = false, linked = false;
+HRESULT output_result = S_OK;
+uint64_t receiver = 0, scope_native = 0, scope_queue = 0, scope_device = 0, finished_native = 0;
+UINT interval = 0, flags = 0;
+const DXGI_PRESENT_PARAMETERS* parameters = nullptr;
+unsigned boundaries = 0, outputs = 0, scope_begins = 0, scope_ends = 0;
+thread_local unsigned scope_depth = 0;
+StreamlineBoundaryEvidence boundary{};
+HRESULT STDMETHODCALLTYPE Present1(IDXGISwapChain1* self, UINT sync, UINT f, const DXGI_PRESENT_PARAMETERS* p) {
+    receiver = reinterpret_cast<uint64_t>(self);
+    linked = t_dedup.Contains(route.alias);
+    interval = sync; flags = f; parameters = p;
+    return receiver == route.base ? output_result : S_OK;
+}
+HRESULT STDMETHODCALLTYPE Present(IDXGISwapChain* self, UINT sync, UINT f) {
+    const auto result = Present1(reinterpret_cast<IDXGISwapChain1*>(self), sync, f, nullptr);
+    if (bind_inside_input && receiver == route.alias) {
+        bind_inside_input = false;
+        Check(VSync_BindOutputAlias(ReserveProxyForEvent(route.proxy), route), "first discovery installs pending B");
+        const auto calls = EntryCount(NativeGateEntry::GateCall);
+        std::thread output_while_pending([&] {
+            Check(reinterpret_cast<PFN_Present1>(output.vptr[22])(reinterpret_cast<IDXGISwapChain1*>(&output), sync, f, nullptr) == S_OK &&
+                  receiver == route.base && !linked && EntryCount(NativeGateEntry::GateCall) == calls &&
+                  !boundaries && !outputs, "pending B forwards on a different thread without overlapping N's body");
+        });
+        output_while_pending.join();
+        return reinterpret_cast<PFN_Present1>(output.vptr[22])(reinterpret_cast<IDXGISwapChain1*>(&output), sync, f, nullptr);
+    }
+    return result;
+}
+void TestOutputAlias() {
+    for (size_t i = 0; i < kVtSlots; ++i) table[1 + i] = reinterpret_cast<void*>(&VtSlot);
+    table[1] = reinterpret_cast<void*>(&VtQueryInterface);
+    table[1 + 8] = reinterpret_cast<void*>(&Present);
+    table[1 + 22] = reinterpret_cast<void*>(&Present1);
+    input.vptr = output.vptr = table + 1;
+    route = {reinterpret_cast<uint64_t>(&output), reinterpret_cast<uint64_t>(&input), 0x1234, 0x4321, 0x9876};
+    s_native_handle_override = route.alias;
+    VSync_OnNativeSelected(route.alias);
+    const auto input_present = [&] { return reinterpret_cast<PFN_Present>(input.vptr[8])(
+        reinterpret_cast<IDXGISwapChain*>(&input), 3, DXGI_PRESENT_ALLOW_TEARING); };
+    const auto e = [](NativeGateEntry entry) { return EntryCount(entry); };
+    const auto gate = NativeGateEntry::GateCall, pass = NativeGateEntry::AliasPassThrough;
+    const uint64_t calls = e(gate), passes = e(pass), inner = e(NativeGateEntry::InnerPassThrough);
+    const int saved_mode = s_vsync_mode.exchange(2); // N must not override its caller's interval on the carried path.
+    const auto discovery = s_alias_ticket;
+    StreamlineBase_NoteProxyPresent(route.proxy); // usual order: Streamline calls into ReShade, not vice versa
+    {
+        StreamlineInputScope above(route.proxy, 3, 0);
+        Check(!StreamlineBase_Carries(route.alias) && !StreamlineBase_AliasOf(route.base) &&
+              !StreamlineBase_NoteGamePresent(route.alias, route.device, 0x5678), "no published base: the event owns output");
+    }
+    StreamlineBase_NoteProxyPresent(route.proxy); // the host may defer the previous event's finish on DO_NOT_WAIT
+    Check(s_alias_ticket == discovery, "an event beneath the proxy cannot establish an output alias");
+    Check(input_present() == S_OK && linked && interval == 1 && flags == 0 && e(gate) == calls + 1 &&
+          e(pass) == passes && s_last_timeline_native == route.alias && s_last_pacing_present.native_swapchain == route.alias,
+          "ordinary N runs the original body and owns the timeline and physical row");
+    Check(!StreamlineBase_NoteGamePresentDone(route.alias), "ordinary event finishes its scopes");
+
+    auto& events = streamline_base_present::events;
+    {
+        StreamlineInputScope above(route.proxy, 3, 0);
+        for (unsigned i = 0; i < 128; ++i) {
+            StreamlineBase_NoteGamePresent(route.alias, route.device, route.queue);
+            Check(events.depth == 1, "repeating an abandoned event stays at depth one, without needing a pending binding");
+        }
+        for (uint64_t i = 1; i <= 4; ++i) StreamlineBase_NoteGamePresent(i, 0, 0);
+        Check(events.depth == 4 && events.Find(3) == events.depth && events.Find(4) == 3,
+              "overflow replaces only the top entry");
+        StreamlineBase_NoteGamePresentDone(1);
+        Check(events.depth == 1 && events.Find(route.alias) == 0, "finishing a parent drops its unfinished children");
+        StreamlineBase_NoteGamePresentDone(route.alias);
+    }
+    Check(!StreamlineBase_NoteGamePresent(route.base, route.device, route.queue) &&
+          !StreamlineBase_NoteGamePresent(route.alias, route.device, route.queue) && events.depth == 2,
+          "distinct nested events retain the outer while the selected inner discovers its binding");
+    bind_inside_input = true;
+    Check(input_present() == S_OK && receiver == route.base && linked && e(gate) == calls + 2 &&
+          e(NativeGateEntry::InnerPassThrough) == inner && boundaries == 0 && outputs == 0 && !scope_begins,
+          "pending B also forwards on the discovering thread without running a second native body");
+    std::thread unmatched_finish([&] {
+        Check(!StreamlineBase_NoteGamePresentDone(route.alias) && streamline_base_present::events.depth == 0 &&
+              !StreamlineBase_Carries(route.alias), "a finish on a different thread cannot activate the pending pair");
+    });
+    unmatched_finish.join();
+    Check(!StreamlineBase_Carries(route.alias) && !StreamlineBase_NoteGamePresentDone(route.alias) &&
+          StreamlineBase_AliasOf(route.base) == route.alias, "only the matching finish publishes the pending binding");
+    Check(events.depth == 1 && events.Find(route.base) == 0 && !StreamlineBase_NoteGamePresentDone(route.base) &&
+          !events.depth, "publishing the inner pair preserved the outer event until its own finish");
+
+    Check(StreamlineBase_NoteGamePresent(route.alias, route.device, 0x5678), "carried input event skips output scopes");
+    const auto selected = s_selected_vtable_entries.load();
+    const auto rows = s_pacing_present_records;
+    Check(input_present() == S_OK && receiver == route.alias && !linked && interval == 3 && flags == DXGI_PRESENT_ALLOW_TEARING &&
+          e(pass) == passes + 1 && e(gate) == calls + 2 && s_selected_vtable_entries.load() == selected &&
+          s_pacing_present_records == rows, "carried N forwards unchanged without output evidence");
+    DXGI_PRESENT_PARAMETERS p{};
+    Check(reinterpret_cast<PFN_Present1>(input.vptr[22])(reinterpret_cast<IDXGISwapChain1*>(&input), 4, 8, &p) == S_OK &&
+          !linked && interval == 4 && flags == 8 && parameters == &p && e(pass) == passes + 2 &&
+          s_selected_vtable_entries.load() == selected, "carried N Present1 neither counts as B nor changes arguments");
+
+    const auto begins = e(NativeGateEntry::BeginScope), ends = e(NativeGateEntry::EndScope);
+    Check(reinterpret_cast<PFN_Present>(output.vptr[8])(reinterpret_cast<IDXGISwapChain*>(&output), 3, DXGI_PRESENT_ALLOW_TEARING) == S_OK &&
+          receiver == route.base && linked && interval == 1 && !flags && e(gate) == calls + 3 && scope_begins == 1 && scope_ends == 1,
+          "synchronous B Present owns one scoped body even on the input event's thread");
+    DWORD worker_id = 0;
+    std::thread worker([&] {
+        worker_id = GetCurrentThreadId();
+        Check(reinterpret_cast<PFN_Present1>(output.vptr[22])(reinterpret_cast<IDXGISwapChain1*>(&output), 3, 4, &p) == S_OK &&
+              linked && receiver == route.base && parameters == &p, "worker B Present1 reaches the physical original");
+    });
+    worker.join();
+    Check(e(gate) == calls + 4 && e(NativeGateEntry::BeginScope) == begins + 2 && e(NativeGateEntry::EndScope) == ends + 2 &&
+          boundaries == 2 && outputs == 2 && scope_begins == 2 && scope_ends == 2 && finished_native == route.alias &&
+          scope_native == route.alias && scope_queue == route.queue && scope_device == route.device &&
+          boundary.swapchain == route.alias && boundary.queue == route.queue && boundary.device == route.device &&
+          boundary.generation == 1 && boundary.queue_device == route.device &&
+          boundary.stage == StreamlineBoundaryStage::Present && s_last_gate_native == route.alias &&
+          s_last_timeline_native == route.alias && s_last_dxgi_receiver == route.base && s_last_pacing_present.native_swapchain == route.base &&
+          s_last_pacing_present.thread_id == worker_id && s_pacing_present_records == rows + 2 &&
+          s_selected_vtable_entries.load() == selected + 2, "one body per output; logical timeline/scopes, physical ETW row and thread");
+    const auto output_present = [&](UINT f) { return reinterpret_cast<PFN_Present>(output.vptr[8])(
+        reinterpret_cast<IDXGISwapChain*>(&output), 3, f); };
+    const auto output_present1 = [&](UINT f) { return reinterpret_cast<PFN_Present1>(output.vptr[22])(
+        reinterpret_cast<IDXGISwapChain1*>(&output), 3, f, &p); };
+    vtable_copy::DedupNode outer;
+    Check(t_dedup.Link(&outer, route.alias) && output_present(0) == S_OK &&
+          e(NativeGateEntry::InnerPassThrough) == inner + 1 && e(gate) == calls + 4, "active B deduplicates under N");
+    t_dedup.Unlink(&outer);
+    Check(output_present(DXGI_PRESENT_TEST) == S_OK && e(gate) == calls + 5 && boundaries == 2 &&
+          outputs == 2 && scope_begins == 2 && scope_ends == 2, "TEST runs the native body but neither event");
+    output_result = DXGI_ERROR_WAS_STILL_DRAWING;
+    Check(output_present(DXGI_PRESENT_DO_NOT_WAIT) == output_result && outputs == 3 && scope_begins == 3 &&
+          scope_ends == 3 && !scope_depth && e(NativeGateEntry::EndScope) == ends + 3,
+          "still-drawing releases both scopes on the calling thread even if there is never a retry");
+    Check(output_present1(DXGI_PRESENT_DO_NOT_WAIT) == output_result && e(gate) == calls + 7 && outputs == 3 &&
+          scope_begins == 3 && scope_ends == 3 && !scope_depth, "a repeated still-drawing attempt is a body with no event");
+    output_result = S_OK;
+    Check(output_present1(DXGI_PRESENT_TEST) == S_OK && scope_ends == 3 && outputs == 3, "TEST preserves retry suppression");
+    std::thread retry([&] {
+        Check(!scope_depth && output_present1(DXGI_PRESENT_DO_NOT_WAIT) == S_OK && !scope_depth,
+              "a retry on another thread runs its body without acquiring or releasing a readiness scope");
+    });
+    retry.join();
+    Check(e(gate) == calls + 9 && boundaries == 3 && outputs == 3 && scope_begins == 3 && scope_ends == 3 &&
+          !scope_depth && e(NativeGateEntry::BeginScope) == begins + 3 && e(NativeGateEntry::EndScope) == ends + 3,
+          "retry does not count another output or take ownership of any scope");
+    output_result = DXGI_ERROR_DEVICE_REMOVED;
+    Check(output_present(DXGI_PRESENT_DO_NOT_WAIT) == output_result && outputs == 4 && !scope_depth &&
+          scope_begins == 4 && scope_ends == 4 && e(NativeGateEntry::EndScope) == ends + 4,
+          "the next event after a successful retry closes its own scopes even on device loss");
+    output_result = S_OK;
+    Check(StreamlineBase_NoteGamePresentDone(route.alias), "carried input event still skips its finish");
+
+    VSync_NoteFinishedPresent(route.alias); // consumes B's evidence, not N's
+    void** const old_copy = output.vptr;
+    for (unsigned i = 0; i < vtable_copy::FallbackCounter::kScopes; ++i) {
+        Check(input_present() == S_OK && !linked && StreamlineBase_Carries(route.alias), "input shells cannot provide output evidence");
+        VSync_NoteFinishedPresent(route.alias);
+    }
+    Check(!StreamlineBase_Carries(route.alias) && !s_fallback.Fired() && s_fallback.Count() == 0 &&
+          output.vptr == old_copy && !FindBinding(route.base) && input_present() == S_OK && linked &&
+          s_last_pacing_present.native_swapchain == route.alias, "32 missing outputs retire B, not the inline one-shot");
+    auto ticket = VSync_BeginOutputAlias(route.alias, route.proxy, s_next_probe_ms);
+    Check(!VSync_BindOutputAlias(ticket, route), "the same missed base is refused");
+
+    const auto bind = [](const StreamlineBaseBinding& b) {
+        const auto t = VSync_BeginOutputAlias(b.alias, b.proxy, s_next_probe_ms);
+        Check(VSync_BindOutputAlias(t, b), "install the new pending binding");
+        VSync_ActivateOutputAlias(t, b.alias);
+        Check(StreamlineBase_AliasOf(b.base) == b.alias, "publish the exact installed binding");
+    };
+    VtObject replacement{table + 1};
+    auto next = route; next.base = reinterpret_cast<uint64_t>(&replacement);
+    bind(next); // a different base under the same proxy clears refusal
+    auto other_proxy = route; ++other_proxy.proxy;
+    bind(other_proxy);
+    Check(replacement.vptr != table + 1 && output.vptr == old_copy && !FindBinding(next.base),
+          "proxy replacement abandons the old copy and adopts B's surviving one");
+    void* const page = VirtualAlloc(nullptr, sizeof(VtObject), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    Check(page != nullptr, "allocate an observable stale receiver");
+    auto guard_route = route;
+    guard_route.proxy += 2;
+    guard_route.base = reinterpret_cast<uint64_t>(new(page) VtObject{table + 1});
+    const auto protect = [&](DWORD protection) {
+        DWORD old = 0;
+        Check(VirtualProtect(page, sizeof(VtObject), protection, &old) != FALSE, "protect the simulated stale B");
+    };
+    const auto untouched = [&] {
+        MEMORY_BASIC_INFORMATION m{};
+        return VirtualQuery(page, &m, sizeof(m)) == sizeof(m) && (m.Protect & PAGE_GUARD);
+    };
+    bind(guard_route);
+    protect(PAGE_READWRITE | PAGE_GUARD);
+    StreamlineBase_OnDestroyed(route.alias);
+    Check(!StreamlineBase_Carries(route.alias) && output.vptr == old_copy && !FindBinding(route.base),
+          "destroy never dereferences B; its surviving thunk is now an unselected forward");
+    Check(untouched(), "destruction did not even read the unowned base vptr");
+    protect(PAGE_READWRITE);
+    const auto gate_after_destroy = e(gate);
+    Check(output_present(0) == S_OK && e(gate) == gate_after_destroy && !linked, "abandoned copy is safe to call");
+    ticket = VSync_BeginOutputAlias(route.alias, route.proxy, s_next_probe_ms);
+    Check(VSync_BindOutputAlias(ticket, route), "stage binding before destruction");
+    VSync_OnNativeDestroyed(route.alias);
+    VSync_ActivateOutputAlias(ticket, route.alias);
+    Check(!StreamlineBase_Carries(route.alias) && !VSync_BeginOutputAlias(route.alias, route.proxy, s_next_probe_ms),
+          "late activation and resolution cannot resurrect the dead selection");
+    VSync_OnNativeSelected(route.alias);
+    StreamlineBase_NoteGamePresent(route.alias, route.device, route.queue);
+    Check(VSync_BindOutputAlias(ReserveProxyForEvent(route.proxy), route), "P1 stages B1 on its own event");
+    s_next_probe_ms = UINT64_MAX; // freeze the same-proxy probe interval; replacement cannot depend on wall time
+    auto changed = next;
+    ++changed.proxy;
+    std::thread new_proxy([&] {
+        StreamlineBase_NoteGamePresent(changed.alias, changed.device, changed.queue);
+        Check(!ReserveProxyForEvent(route.proxy), "P1 does not supersede itself during its pending probe interval");
+        auto t = ReserveProxyForEvent(changed.proxy);
+        Check(t && !FindBinding(route.base) && VSync_BindOutputAlias(t, changed), "P2 immediately supersedes pending P1");
+        StreamlineBase_NoteGamePresentDone(changed.alias);
+    });
+    new_proxy.join();
+    StreamlineBase_NoteGamePresentDone(route.alias);
+    Check(!StreamlineBase_AliasOf(route.base) && StreamlineBase_AliasOf(changed.base) == changed.alias,
+          "P1's late finish cannot publish B1 or retire B2");
+    StreamlineBase_OnDestroyed(route.alias);
+    StreamlineBase_NoteGamePresent(route.base, route.device, route.queue);
+    StreamlineBase_NoteGamePresent(route.alias, route.device, route.queue);
+    const auto abandoned = ReserveProxyForEvent(route.proxy);
+    Check(VSync_BindOutputAlias(abandoned, route), "stage a nested event that is abandoned by its outer finish");
+    StreamlineBase_NoteGamePresentDone(route.base);
+    VSync_ActivateOutputAlias(abandoned, route.alias);
+    Check(!events.depth && !FindBinding(route.base) && !StreamlineBase_Carries(route.alias),
+          "out-of-order finish drops, rather than publishes, the unfinished child's reservation");
+    Check(!StreamlineBase_NoteGamePresent(route.alias, route.device, route.queue) &&
+          VSync_BindOutputAlias(ReserveProxyForEvent(route.proxy), route), "stage an event which misses its finish");
+    Check(!StreamlineBase_NoteGamePresent(route.alias, route.device, route.queue) && !StreamlineBase_Carries(route.alias) &&
+          VSync_BindOutputAlias(ReserveProxyForEvent(next.proxy), next) && !StreamlineBase_NoteGamePresentDone(next.alias) &&
+          StreamlineBase_AliasOf(next.base) == next.alias, "a later event resolves afresh and publishes on its own finish");
+    bind(guard_route);
+    protect(PAGE_READWRITE | PAGE_GUARD);
+    VSync_RestoreVtables();
+    Check(input.vptr == table + 1 && replacement.vptr != table + 1 && output.vptr == old_copy &&
+          !StreamlineBase_Carries(next.alias), "common teardown restores N but leaves every B untouched");
+    Check(untouched(), "teardown did not even read the unowned base vptr");
+    VirtualFree(page, 0, MEM_RELEASE);
+    s_native_handle_override = 0;
+    s_vsync_mode.store(saved_mode);
+}
+} // namespace output_test
+#endif
+
 // The optional description query can fault after the gate/readiness scopes opened.
 // It must neither abort the retry nor unwind the Present detour's owners.
 unsigned s_desc_queries = 0;
@@ -1081,7 +1406,7 @@ bool CallOutermostCatching(IDXGISwapChain* self) {
     __try {
         // Independently exercise the dedup termination handler. Raise at selection,
         // before the body constructs the native gate or readiness objects.
-        PresentOutermost(RejectTearing, false, 0, nullptr, self, 3, 4);
+        PresentOutermost(RejectTearing, false, 0, nullptr, self, reinterpret_cast<uint64_t>(self), 3, 4);
         return false;
     } __except (GetExceptionCode() == 0xE0000042u ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
         return true;
@@ -1274,7 +1599,10 @@ std::atomic<bool> g_fg_presenting{false};
 void NGXHooks_TryInstall() { ++s_synchronous_installs; }
 #endif
 bool FrameTimeline_BeginPresentCall(
-      uint64_t, PresentTimelineEntryPoint, PresentTimelineCall*, bool runtime) noexcept { return s_capture_native || runtime; }
+      uint64_t native, PresentTimelineEntryPoint, PresentTimelineCall*, bool runtime) noexcept {
+      s_last_timeline_native = native;
+      return s_capture_native || runtime;
+}
 bool FrameTimeline_BeginPresentAttempt(
       const PresentTimelineCall&, uint32_t, PresentTimelineSpan* span, bool runtime) noexcept {
       span->capture_epoch=s_capture_native?1:0;return s_capture_native || runtime;
@@ -1286,7 +1614,8 @@ uint64_t SwapMgr_GetNativeHandle() {
       return s_native_handle_override ? s_native_handle_override : 0x1000;
 }
 NativeGateContext NativeGate_GetContext(int64_t now) noexcept { auto c = s_native_context; c.now_qpc = now; return c; }
-void NativeGate_Execute(NativeGateCall* call, uint64_t) noexcept {
+void NativeGate_Execute(NativeGateCall* call, uint64_t native) noexcept {
+      s_last_gate_native = native;
       if (call->trace.status != NativeGateStatus::Native) return;
       ++s_native_holds;
       s_native_release_qpc = CapturePresentQpc();
@@ -1361,6 +1690,9 @@ extern "C" MH_STATUS WINAPI MH_ApplyQueued(VOID) {
 }
 
 int main() {
+    // The copy at a selection is the path most of these tests drive, so the key starts off here; the default (the
+    // copy at the first present event) has its own block in TestVtableCopyEntry.
+    g_config.vtable_copy_at_present = false;
     PacingPresentAttribution previous{};
     previous.key = {PacingIdentityDomain::NvApiFrame, 1, 1};
     previous.marker_qpc = 1;
@@ -1387,6 +1719,10 @@ int main() {
     TestRetainedEnableFailure();
     TestExactTargetThunks();
       TestNativeGateHookPlacement();
+#ifdef _WIN64
+      TestNativeQueueOverflow();
+      output_test::TestOutputAlias(); // verify loss of B leaves the ordinary inline one-shot for the next test
+#endif
       TestVtableCopyEntry();
       TestVtableForwardsLiveClassSlot();
       TestLoaderNotifications();
@@ -1425,6 +1761,19 @@ void GpuReadinessCall::Complete(bool success, bool retried) noexcept {
       ++s_readiness_completions;
 }
 #ifdef _WIN64
+void StreamlineDiscovery_RecordBoundary(const StreamlineBoundaryEvidence& value) noexcept {
+      ++output_test::boundaries; output_test::boundary = value;
+}
+void GpuReadiness_BeginScope(uint64_t native, uint64_t queue, uint64_t device) noexcept {
+      Check(!output_test::scope_depth, "no previous B readiness scope was left on this thread");
+      ++output_test::scope_depth;
+      ++output_test::scope_begins; output_test::scope_native = native; output_test::scope_queue = queue; output_test::scope_device = device;
+}
+void GpuReadiness_EndScope(uint64_t native) noexcept {
+      Check(output_test::scope_depth == 1, "readiness scope is closed by its opening thread");
+      --output_test::scope_depth; ++output_test::scope_ends; output_test::finished_native = native;
+}
+void EnfDisp_NoteOutputPresent(int64_t) noexcept { ++output_test::outputs; }
 GpuPresentExecution GpuPresent_Execute(NativeGateCall* native,GpuReadinessCall*,PresentTimelineSpan* span) noexcept {
       if(s_gpu_execution==GpuPresentExecution::Fallback)return s_gpu_execution;
       Check(span!=nullptr,"owned GPU call has a runtime Present span");
@@ -1447,5 +1796,7 @@ void PacingTelemetry_PushPresent(const PacingPresentRecord& record) noexcept {
 }
 // DXGI display source intake (pacing_telemetry.cpp); the hook tests do not
 // exercise frame statistics.
-void PacingTelemetry_RecordDxgiPresent(IDXGISwapChain*, const PacingPresentRecord&) noexcept {}
+void PacingTelemetry_RecordDxgiPresent(IDXGISwapChain* receiver, const PacingPresentRecord&) noexcept {
+      s_last_dxgi_receiver = reinterpret_cast<uint64_t>(receiver);
+}
 int64_t GetQPCFrequency() { return 10'000'000; }
