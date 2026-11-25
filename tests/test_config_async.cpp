@@ -545,7 +545,7 @@ void TestPacingPipelineDefaults() {
     CHECK(Value(local_path, "FrameLimiter", "flip_metering_off") == "false");
     CHECK(Value(local_path, "FrameLimiter", "control_file") == "false");
     CHECK(Value(local_path, "FrameLimiter", "developer_settings") == "false");
-    CHECK(Value(local_path, "FrameLimiter", "config_version") == "6");
+    CHECK(Value(local_path, "FrameLimiter", "config_version") == "7");
     CHECK(Value(local_path, "FrameLimiter", "pacing_preference") == "balanced");
     CHECK(Value(local_path, "FrameLimiter", "pacing_test_mode") == "off");
     CHECK(Value(local_path, "FrameLimiter", "gpu_present_gate_probes") == "true");
@@ -555,7 +555,7 @@ void TestPacingPipelineDefaults() {
 // An INI from before config_version 5 saved the old defaults of the queue law, the queue probe and the
 // probe's source key (false, false, 0): it moves to the new defaults once and keeps every other value; a
 // version-5 INI keeps its explicit choices; keys the INI does not carry take the new defaults; a first
-// launch (no INI) takes the defaults and is written at version 6.
+// launch (no INI) takes the defaults and is written at version 7.
 void TestQueueDefaultsMigration() {
     const bool is64 = sizeof(void*) == 8;
     // An INI of version 4 as the earlier build wrote it.
@@ -567,7 +567,7 @@ void TestQueueDefaultsMigration() {
     CheckPipelineMatchesConfig();
     CHECK(g_gpu_queue_probe.load() == is64 && g_gpu_queue_law_feed.load() == is64);
     CHECK(g_gpu_queue_probe_source.load() == (is64 ? 1 : 0));
-    CHECK(Value(local_path, "FrameLimiter", "config_version") == "6");
+    CHECK(Value(local_path, "FrameLimiter", "config_version") == "7");
     CHECK(Value(local_path, "FrameLimiter", "unified_queue_law") == "true");
     CHECK(Value(local_path, "FrameLimiter", "gpu_queue_probe") == "true");
     CHECK(Value(local_path, "FrameLimiter", "gpu_queue_probe_source") == "1");
@@ -578,7 +578,7 @@ void TestQueueDefaultsMigration() {
     Reset(false, false, {{"gpu_queue_probe_source", "0"}});
     CHECK(g_config.unified_queue_law && g_config.gpu_queue_probe && g_config.gpu_queue_probe_source == 1);
     CHECK(Value(local_path, "FrameLimiter", "gpu_queue_probe_source") == "1");
-    CHECK(Value(local_path, "FrameLimiter", "config_version") == "6");
+    CHECK(Value(local_path, "FrameLimiter", "config_version") == "7");
     ReleaseStart();CHECK(OwnerShutdown());
 
     // Keys the old INI does not carry take the new defaults.
@@ -595,14 +595,14 @@ void TestQueueDefaultsMigration() {
     CHECK(Value(local_path, "FrameLimiter", "unified_queue_law") == "false");
     CHECK(Value(local_path, "FrameLimiter", "gpu_queue_probe") == "false");
     CHECK(Value(local_path, "FrameLimiter", "gpu_queue_probe_source") == "0");
-    CHECK(Value(local_path, "FrameLimiter", "config_version") == "6");
+    CHECK(Value(local_path, "FrameLimiter", "config_version") == "7");
     CHECK(Config_DeveloperOverrides() == 3);
     ReleaseStart();CHECK(OwnerShutdown());
 
-    // A first launch (no INI at all) takes the defaults and writes version 6.
+    // A first launch (no INI at all) takes the defaults and writes version 7.
     Reset();
     CHECK(g_config.unified_queue_law && g_config.gpu_queue_probe && g_config.gpu_queue_probe_source == 1);
-    CHECK(Value(local_path, "FrameLimiter", "config_version") == "6");
+    CHECK(Value(local_path, "FrameLimiter", "config_version") == "7");
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
@@ -1510,7 +1510,7 @@ constexpr RemovedSetting removed_settings[] = {
     {"gpu_wait_headroom_us", "2000", "1000"}};
 static_assert(sizeof(removed_settings) / sizeof(removed_settings[0]) == 30, "the contract lists 30 removed settings");
 
-// No removed key is on the fake disk, in any section of the INI, and the INI is at version 6.
+// No removed key is on the fake disk, in any section of the INI, and the INI is at version 7.
 void CheckNoRemovedKeysOnDisk() {
     {
         std::lock_guard<std::mutex> lock(mutex);
@@ -1521,7 +1521,8 @@ void CheckNoRemovedKeysOnDisk() {
         }
     }
     for (const RemovedSetting& setting : removed_settings) CHECK(Value(local_path, "FrameLimiter", setting.key).empty());
-    CHECK(Value(local_path, "FrameLimiter", "config_version") == "6");
+    CHECK(Value(local_path, "FrameLimiter", "hook_installer_thread").empty());
+    CHECK(Value(local_path, "FrameLimiter", "config_version") == "7");
 }
 // A version-5 INI as an earlier build wrote it: the kept settings the user set, every removed key away from its default.
 std::vector<IniEntry> OldIniWithRemovedKeys(const char* developer_settings, const char* test_mode) {
@@ -1578,7 +1579,7 @@ void RunMigrationMatrix(const char* developer_settings, const char* test_mode, P
 
 // A version-5 INI that sets every removed key to a non-default value loads to the production behavior: no developer
 // override, the unified owner (64-bit), no test mode, the Reflex Sleep bypass in effect, the kept caps and preference
-// preserved; the INI is rewritten at version 6 without any removed key and loads again to the same state. With
+// preserved; the INI is rewritten at version 7 without any removed key and loads again to the same state. With
 // developer_settings on and every old arm key set (unified_pacer=false, source_placement=driver,
 // reflex_sleep_bypass=false, adaptive_cap=true, ...) it is still no test mode; only an explicit pacing_test_mode
 // enters one, and only with developer_settings.
@@ -1703,7 +1704,7 @@ void TestRemovedKeysAreNotLiveKeys() {
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
-// A first launch (no INI) writes version 6 and no removed key and logs nothing about removed settings. A version-5 INI
+// A first launch (no INI) writes version 7 and no removed key and logs nothing about removed settings. A version-5 INI
 // that carries only default-valued removed keys loads to the same defaults and logs nothing either; one key away from
 // its default is the only one the info line names (a default spelled differently is still a default); a version-6 INI
 // that still carries removed keys (edited by hand) drops them silently.
@@ -1754,6 +1755,40 @@ void TestFirstLaunchAndDefaultValuedRemovedKeys() {
     CHECK(RemovedInfoLine().empty() && g_config.target_fps == 60);
     CheckNoRemovedKeysOnDisk();
     ReleaseStart();CHECK(OwnerShutdown());
+}
+
+// config_version 7 removed hook_installer_thread (the installer thread is off in the build, hooks.h). Every earlier
+// build wrote the key: true, its default then, is dropped without a word; false is named once; neither comes back.
+void TestHookInstallerThreadKeyIsDropped() {
+    Reset(false, false, {{"config_version", "6"}, {"target_fps", "75"}, {"hook_installer_thread", "true"}});
+    CHECK(!Config_IsFirstLaunch() && RemovedInfoLine().empty() && g_config.target_fps == 75);
+    ReleaseStart();CHECK(OwnerShutdown());
+    CheckNoRemovedKeysOnDisk();
+    CHECK(Value(local_path, "FrameLimiter", "target_fps") == "75");
+
+    // A version-6 INI: the keys version 6 removed are past their report, this one is not.
+    Reset(false, false, {{"config_version", "6"}, {"adaptive_cap", "true"}, {"hook_installer_thread", "false"}});
+    CHECK(RemovedInfoLine() == std::string(removed_info_prefix) + "hook_installer_thread=false");
+    ReleaseStart();CHECK(OwnerShutdown());
+    CheckNoRemovedKeysOnDisk();
+    Relaunch(); // the rewritten file, at version 7
+    CHECK(RemovedInfoLine().empty());
+    ReleaseStart();CHECK(OwnerShutdown());
+    CheckNoRemovedKeysOnDisk();
+
+    // An older INI names it beside the keys version 6 removed, in the one line.
+    Reset(false, false, {{"config_version", "5"}, {"adaptive_cap", "true"}, {"hook_installer_thread", "false"}});
+    const std::string line = RemovedInfoLine();
+    CHECK(ListedInLine(line, "adaptive_cap", "true") && ListedInLine(line, "hook_installer_thread", "false") &&
+          std::count(line.begin(), line.end(), '=') == 2);
+    ReleaseStart();CHECK(OwnerShutdown());
+    CheckNoRemovedKeysOnDisk();
+
+    // A version-7 INI that carries the key (edited by hand): not read, not reported, dropped.
+    Reset(false, false, {{"config_version", "7"}, {"hook_installer_thread", "true"}});
+    CHECK(RemovedInfoLine().empty());
+    ReleaseStart();CHECK(OwnerShutdown());
+    CheckNoRemovedKeysOnDisk();
 }
 
 // ── The preset key of the removed OSD element ──
@@ -1834,7 +1869,7 @@ void TestRemovedPresetKeyIsDropped() {
     CHECK(EntriesOf(shared_path) == 0);
     ReleaseStart();CHECK(OwnerShutdown());
     CHECK(PresetFields(local_path) == AsFields(PresetSections(local_path, false)));
-    CHECK(Value(local_path, "FrameLimiter", "config_version") == "6");
+    CHECK(Value(local_path, "FrameLimiter", "config_version") == "7");
 
     // (2) shared_presets on, the key in the SHARED presets file (and none in the local INI): gone there, the other
     // fields unchanged, the shared presets loaded intact.
@@ -1890,7 +1925,7 @@ void TestRemovedPresetKeyIsDropped() {
 }
 
 // A deletion that fails is not abandoned: the key stays on disk, one warning names the file, the rest of the start
-// goes on (the INI is rewritten at version 6), and the next start removes the key once the file is writable again.
+// goes on (the INI is rewritten at version 7), and the next start removes the key once the file is writable again.
 void TestFailedPresetKeyDeletionIsRetriedAtTheNextStart() {
     const char* const warning = "obsolete preset key";
     // (a) The key in the shared presets file, which cannot be written at the first launch.
@@ -1901,11 +1936,11 @@ void TestFailedPresetKeyDeletionIsRetriedAtTheNextStart() {
     CHECK(Value(shared_path, "OSD_Preset_1", "show_adaptive_smoothing") == "true");
     CHECK(Value(shared_path, "OSD_Preset_2", "show_adaptive_smoothing") == "false");
     CHECK(PresetFields(shared_path) == AsFields(PresetSections(shared_path, true)));
-    CHECK(Value(local_path, "FrameLimiter", "config_version") == "6");
+    CHECK(Value(local_path, "FrameLimiter", "config_version") == "7");
     CHECK(PresetFields(local_path).empty());
     ReleaseStart();CHECK(OwnerShutdown());
     fail_path.clear();
-    Relaunch(); // the same fake disk, the file writable now, the INI already at version 6
+    Relaunch(); // the same fake disk, the file writable now, the INI already at version 7
     CHECK(WarnCount(warning) == 0);
     CheckPresetKeyGone(shared_path);
     CHECK(PresetFields(shared_path) == AsFields(PresetSections(shared_path, false)));
@@ -1919,7 +1954,7 @@ void TestFailedPresetKeyDeletionIsRetriedAtTheNextStart() {
     CHECK(WarnCount(warning) == 1 && WarnCount(local_path) == 1);
     CHECK(PresetFields(local_path) == AsFields(PresetSections(local_path, true)));
     CheckPresetsIntact();
-    CHECK(Value(local_path, "FrameLimiter", "config_version") == "6");
+    CHECK(Value(local_path, "FrameLimiter", "config_version") == "7");
     ReleaseStart();CHECK(OwnerShutdown());
     fail_delete_path.clear();
     Relaunch();
@@ -2270,7 +2305,7 @@ const OsdToggle osd_toggles[] = {
 constexpr size_t osd_toggle_count = sizeof(osd_toggles) / sizeof(osd_toggles[0]);
 static_assert(osd_toggle_count == 27, "the contract lists 27 OSD element toggles");
 
-// The 61 keys of the [FrameLimiter] section that are not OSD element toggles (88 with the 27 toggles), each with a value
+// The 63 keys of the [FrameLimiter] section that are not OSD element toggles (90 with the 27 toggles), each with a value
 // away from its default as an earlier launch left it, and the value the clean rewrite saves back. The keybind keys are
 // written to the local INI only while the presets are not shared. Derived by running the writer, then pinned. Which keys
 // exist is not decided here: ExpectedIniKeys reads the config_key lines of the shared fixture.
@@ -2291,7 +2326,7 @@ const IniKey non_default_ini[] = {
     {"shared_presets", "false", "false"}, // true is the shared-file variant below
     {"osd_preset_prev_key", "F1", "F1"}, {"osd_preset_next_key", "F2", "F2"}, {"blackout_key", "F3", "F3"},
     {"pacing_preference", "smooth", "smooth"}, {"advanced_settings", "true", "true"},
-    {"developer_settings", "true", "true"}, {"config_version", "6", "6"}, {"flip_metering_off", "true", "true"},
+    {"developer_settings", "true", "true"}, {"config_version", "7", "7"}, {"flip_metering_off", "true", "true"},
     {"vtable_copy_at_present", "false", "false"},
     {"gpu_wait_late_guard", "true", "true"}, {"gpu_wait_present_first", "false", "false"},
     {"gpu_wait_start_limit", "false", "false"},
@@ -2306,11 +2341,11 @@ const IniKey non_default_ini[] = {
     {"flip_model_override", "true", "true"}, {"log_level", "debug", "debug"},
     {"csv_enabled", "true", "false"}, // telemetry needs an explicit activation each launch
     {"native_pcl_enabled", "true", "true"}, {"gpu_present_gate_probes", "false", "false"},
-    {"dlss_info_hooks", "false", "false"}, {"hook_installer_thread", "false", "false"},
+    {"dlss_info_hooks", "false", "false"},
     {"hang_report", "true", "true"}, {"hang_report_dump", "false", "false"}, {"hang_report_test_after_s", "30", "30"},
     {"streamline_compat", "force_false", "force_false"}};
 constexpr size_t non_default_ini_count = sizeof(non_default_ini) / sizeof(non_default_ini[0]);
-static_assert(non_default_ini_count == 64, "the contract lists 64 further keys");
+static_assert(non_default_ini_count == 63, "the contract lists 63 further keys");
 bool IsKeybindKey(const std::string& key) {
     return key == "osd_preset_prev_key" || key == "osd_preset_next_key" || key == "blackout_key" ||
            key == "osd_position_cycle_key" || key == "oled_care_key" || key == "oled_care_all_monitors" ||
@@ -2389,7 +2424,7 @@ void TestIniWritesExactlyTheKeysThatExist() {
     CHECK(g_config.unified_queue_need_frames == 6 && g_config.unified_queue_upstream == 1 && g_config.unified_queue_allow_us == 2500);
     CHECK(g_config.dynamic_mfg_passthrough && g_config.reflex_inject && g_config.flip_model_override);
     CHECK(g_config.log_level == "debug" && g_config.native_pcl_enabled && !g_config.csv_enabled);
-    CHECK(!g_config.dlss_info_hooks && !g_config.hook_installer_thread && !g_config.streamline_compat);
+    CHECK(!g_config.dlss_info_hooks && !g_config.streamline_compat);
     for (const OsdToggle& toggle : osd_toggles)
         CHECK(g_config.*(toggle.config_field) == (std::strcmp(toggle.config_key, "osd_show_fps") != 0));
 #ifdef _WIN64
@@ -2593,7 +2628,7 @@ void TestOnlyTheListedKeysAreLive() {
         CHECK(std::strstr(unknown, "not a live key") != nullptr);
         ++refused;
     }
-    CHECK(refused == 88 - 20);
+    CHECK(refused == 90 - 23); // every key of the section that is not a live one
     SaveConfig();
     CHECK(SectionFields(local_path, "FrameLimiter") == before); // nothing a refused key named changed
     ReleaseStart();CHECK(OwnerShutdown());
@@ -2902,6 +2937,7 @@ int main() {
     TestSaveNeverResurrectsRemovedKeys();
     TestRemovedKeysAreNotLiveKeys();
     TestFirstLaunchAndDefaultValuedRemovedKeys();
+    TestHookInstallerThreadKeyIsDropped();
     TestRemovedPresetKeyIsDropped();
     TestFailedPresetKeyDeletionIsRetriedAtTheNextStart();
     TestRetiredKeysIgnoredAndDropped();

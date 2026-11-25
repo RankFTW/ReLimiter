@@ -87,7 +87,7 @@ INI_KEYS = frozenset({
     "unified_hold_share", "unified_queue_law", "unified_queue_rank", "unified_queue_need_frames",
     "unified_queue_upstream", "unified_queue_margin_end", "unified_queue_allow_us", "control_file",
     "dynamic_mfg_passthrough", "reflex_inject", "flip_model_override", "log_level", "csv_enabled",
-    "native_pcl_enabled", "gpu_present_gate_probes", "dlss_info_hooks", "hook_installer_thread", "hang_report", "hang_report_dump",
+    "native_pcl_enabled", "gpu_present_gate_probes", "dlss_info_hooks", "hang_report", "hang_report_dump",
     "hang_report_test_after_s", "streamline_compat",
     "osd_show_clock",
     "osd_show_fps", "osd_show_frametime", "osd_show_frametime_graph", "osd_show_fg", "osd_show_limiter",

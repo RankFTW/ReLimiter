@@ -36,8 +36,9 @@ static const Config s_default_config{};
 // INI layout version. 5: the queue law, the queue probe and the probe's source key (queue that carries the rendering)
 // became the defaults; earlier builds saved unified_queue_law=false, gpu_queue_probe=false and
 // gpu_queue_probe_source=0. 6: the pacing settings listed in kRemovedKeys no longer exist; a file written before
-// carries them, they are neither read nor written, and the startup rewrite drops them.
-static constexpr int kConfigVersion = 6;
+// carries them, they are neither read nor written, and the startup rewrite drops them. 7: hook_installer_thread no
+// longer exists (the installer thread is off in this build, hooks.h); every earlier build wrote it.
+static constexpr int kConfigVersion = 7;
 
 static char s_ini_path[MAX_PATH] = {};
 static bool s_first_launch = false;
@@ -241,13 +242,14 @@ void ValidateConfig() {
 }
 
 // ── Pacing pipeline keys ──
-// The pacing settings that no longer exist. An INI written before configuration version 6 carries them: they are
-// neither read nor written, and the startup rewrite drops them (nothing resurrects a key). Each is listed with the
-// value it had by default, to name in one info line those that held something else (for a user mostly
+// The settings that no longer exist. An INI written before the configuration version that removed a key carries it:
+// it is neither read nor written, and the startup rewrite drops it (nothing resurrects a key). Each is listed with
+// the value it had by default, to name in one info line those that held something else (for a user mostly
 // adaptive_cap=true); nothing is logged for defaults. A saved value never enters a pacing_test_mode.
 struct RemovedKey {
     const char* name;
     const char* default_text;
+    int removed_in = 6; // the configuration version without it
 };
 static const RemovedKey kRemovedKeys[] = {
     {"adaptive_cap", "false"}, {"adaptive_cap_percentile", "75"}, {"adaptive_cap_hold_room", "true"},
@@ -260,6 +262,7 @@ static const RemovedKey kRemovedKeys[] = {
     {"marker_forward_order", "before_wait"}, {"sleep_status_every_frame", "false"}, {"gpu_start_probe", "false"},
     {"gpu_priority_probe", "false"}, {"fg_presenter_probe_us", "0"}, {"unified_pacer", "true"},
     {"unified_every_frame_service", "true"}, {"unified_queue_target_us", "2000"}, {"gpu_wait_headroom_us", "1000"},
+    {"hook_installer_thread", "true", 7},
 };
 
 // True when a saved value reads as the default the way the key was read: booleans as ReadINIBool does, numbers by
@@ -277,9 +280,10 @@ static bool SameAsDefault(const std::string& value, const char* default_text) {
     return _stricmp(value.c_str(), default_text) == 0;
 }
 
-static void LogRemovedKeysWithValues(const char* S, const char* P) {
+static void LogRemovedKeysWithValues(const char* S, const char* P, int saved_version) {
     std::string names;
     for (const RemovedKey& key : kRemovedKeys) {
+        if (saved_version >= key.removed_in) continue;
         const std::string value = ReadINIString(S, key.name, "", P);
         if (value.empty() || SameAsDefault(value, key.default_text)) continue;
         if (!names.empty()) names += ", ";
@@ -450,7 +454,7 @@ void LoadConfig(HMODULE hModule) {
     // Defaults changed by kConfigVersion: an existing INI written before them
     // moves to them once; its other values stay.
     const int saved_version = ReadINIInt(S, "config_version", 1, P);
-    if (!s_first_launch && saved_version < 6) LogRemovedKeysWithValues(S, P);
+    if (!s_first_launch && saved_version < kConfigVersion) LogRemovedKeysWithValues(S, P, saved_version);
     DropRemovedPresetKeys(P);
     if (!s_first_launch && saved_version < 5 &&
         (g_config.unified_queue_law != kPacingUnifiedQueueLawDefault ||
@@ -502,8 +506,6 @@ void LoadConfig(HMODULE hModule) {
 #else
     g_config.dlss_info_hooks         = false;  // NGX/DLSS doesn't exist on 32-bit
 #endif
-    // Compatibility switch of the hook installer thread (hooks.h), read once at initialisation; both addons.
-    g_config.hook_installer_thread   = ReadINIBool(S, "hook_installer_thread", true, P);
     // The stall report (hang_report.h), off by default; read once at initialisation.
     g_config.hang_report             = ReadINIBool(S, "hang_report", false, P);
     g_config.hang_report_dump        = ReadINIBool(S, "hang_report_dump", true, P);
@@ -681,7 +683,6 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     WriteINIBool(S, "native_pcl_enabled", config.native_pcl_enabled, P);
     WriteINIBool(S,"gpu_present_gate_probes",config.gpu_present_gate_probes,P);
     WriteINIBool(S, "dlss_info_hooks", config.dlss_info_hooks, P);
-    WriteINIBool(S, "hook_installer_thread", config.hook_installer_thread, P);
     WriteINIBool(S, "hang_report", config.hang_report, P);
     WriteINIBool(S, "hang_report_dump", config.hang_report_dump, P);
     WriteINIInt(S, "hang_report_test_after_s", config.hang_report_test_after_s, P);

@@ -631,15 +631,15 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
     }
     s_minhook_initialised = true;
     Hooks_ResetInstallAdmission();
-    // The hook installer thread (hooks.h): one thread other engines cannot suspend runs the freezing MinHook calls.
-    // The key is read once, here, before the thread exists; false keeps every call on its requester. The call only
-    // creates the thread and returns: until the thread reports ready (after its protection self-check) calls run
-    // inline. DoInit runs from AddonInit, never from DllMain or a loader callback.
-    if (Hooks_StartInstallerThread(g_config.hook_installer_thread))
+    // The hook installer thread (hooks.h) is off in this build (kHookInstallerThread): every freezing MinHook call
+    // runs on its requester. With it on, the call only creates the thread and returns: until the thread reports
+    // ready (after its protection self-check) calls run inline. DoInit runs from AddonInit, never from DllMain or a
+    // loader callback.
+    if (Hooks_StartInstallerThread(kHookInstallerThread))
         LOG_INFO("Hooks: installer thread created (it serves freezing MinHook calls once its self-check passed)");
     else
         LOG_INFO("Hooks: no installer thread (%s); freezing MinHook calls run on the calling thread",
-                 g_config.hook_installer_thread ? "creation failed or MinHook unusable" : "hook_installer_thread=false");
+                 kHookInstallerThread ? "creation failed or MinHook unusable" : "off in this build");
     LOG_INFO(
         reactivating_retained_hooks
             ? "MinHook retained lifetime reactivated"

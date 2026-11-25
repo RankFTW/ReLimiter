@@ -1,5 +1,6 @@
 #include "streamline_queue_hooks.h"
 #include "streamline_gpu_handoff.h"
+#include "streamline_plugin.h"
 #include "streamline_com_evidence.h"
 #include "hooks.h"
 #include "logger.h"
@@ -31,7 +32,9 @@ std::atomic<bool> first_execute{false}, first_signal{false}, first_wait{false};
 bool targets_set = false;                 // install guard only
 std::atomic<bool> install_status_valid{false}; // the three InstallHook calls were made (statuses below are valid)
 std::array<MH_STATUS, 3> install_status{};
-std::atomic<uint64_t> plugin_begin{0}, plugin_end{0};
+// The DLSS-G plugin's images (streamline_plugin.h): filled from the front, 0 ends the list, [0] == 0 is none. Only the
+// installer worker writes: [0] to 0 first, the others, then [0] last.
+std::array<std::atomic<uint64_t>, StreamlinePluginImages::kMax> plugin_ranges{};
 bool feature_blocked = false; // installer worker only; public hooks do not rebind
 thread_local unsigned depth = 0;
 struct Depth { Depth() noexcept { ++depth; } ~Depth() { --depth; } };
@@ -41,19 +44,25 @@ bool MatchesQueue(ID3D12CommandQueue* queue) noexcept {
         return table[10] == targets[0] && table[14] == targets[1] && table[15] == targets[2];
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
+bool InPlugin(uint64_t pc) noexcept {
+    for (const auto& slot : plugin_ranges) {
+        const auto range = slot.load(std::memory_order_acquire);
+        if (!range) return false;
+        if (streamline_plugin::RangeContains(range, pc)) return true;
+    }
+    return false;
+}
 uint64_t PluginSite(uint64_t caller) noexcept {
-    const auto begin = plugin_begin.load(std::memory_order_acquire);
-    const auto end = plugin_end.load(std::memory_order_acquire);
-    if (!begin || end <= begin) return 0;
+    if (!plugin_ranges[0].load(std::memory_order_acquire)) return 0;
     // A call directly from the selected DLL is already the first plugin frame. A shared
     // wrapper can be called by several plugin sites (or none) on the very same queue;
     // its caller PC is never authority to reuse a previous unwind.
-    if (caller >= begin && caller < end) return caller;
+    if (InPlugin(caller)) return caller;
     void* stack[12]{};
     const auto count = CaptureStackBackTrace(1, 12, stack, nullptr);
     for (unsigned i = 0; i < count; ++i) {
         const auto pc = reinterpret_cast<uint64_t>(stack[i]);
-        if (pc >= begin && pc < end) return pc;
+        if (InPlugin(pc)) return pc;
     }
     return 0; // missing/truncated stack is never an authorization
 }
@@ -215,16 +224,6 @@ bool RuntimeMethods(const std::array<uint64_t, 3>& methods) noexcept {
     return valid;
 #endif
 }
-uint32_t ImageSize(HMODULE module) noexcept {
-    __try {
-        const auto* base = reinterpret_cast<const BYTE*>(module);
-        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-        if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 || dos->e_lfanew > 4096) return 0;
-        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-        return nt->Signature == IMAGE_NT_SIGNATURE && nt->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64 &&
-            nt->OptionalHeader.SizeOfImage <= 32 * 1024 * 1024 ? nt->OptionalHeader.SizeOfImage : 0;
-    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
-}
 }
 // The one owner of the native queue detours. Idempotent: under the install guard, identical
 // targets already installed answer true without touching MinHook; other targets answer false
@@ -307,18 +306,25 @@ void StreamlineQueue_SetFeatureModule(void* options, void* state) noexcept {
     using namespace streamline_queue;
     // Existing public resolver pins/rechecks these entry points before this call.
     // A changed selected implementation invalidates every learned site/binding.
-    plugin_begin.store(0, std::memory_order_release);
+    plugin_ranges[0].store(0, std::memory_order_release);
     StreamlineHandoff_Invalidate("feature_implementation_changed");
     if (feature_blocked) return;
-    HMODULE a = nullptr, b = nullptr;
-    const bool found = options && state && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-        reinterpret_cast<LPCWSTR>(options), &a) && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-        reinterpret_cast<LPCWSTR>(state), &b);
-    const auto size = found && a == b ? ImageSize(a) : 0;
-    plugin_end.store(reinterpret_cast<uint64_t>(a) + size, std::memory_order_release);
-    plugin_begin.store(size ? reinterpret_cast<uint64_t>(a) : 0, std::memory_order_release);
-    if (a) FreeLibrary(a);
-    if (b) FreeLibrary(b);
+    const auto images = StreamlinePlugin_Find(options, state);
+    for (unsigned i = StreamlinePluginImages::kMax; i-- > 0;)
+        plugin_ranges[i].store(i < images.count ? images.ranges[i] : 0, std::memory_order_release);
+    if (!images.own_lookup) return;
+    // Another module answers for the two functions: say whose code the fence calls are expected from.
+    for (unsigned i = 0; i < images.count; ++i) {
+        wchar_t path[1024]{};
+        const DWORD length = GetModuleFileNameW(
+            reinterpret_cast<HMODULE>(streamline_plugin::RangeBase(images.ranges[i])), path, 1024);
+        LOG_INFO("Streamline GPU: slDLSSGSetOptions and slDLSSGGetState are another module's functions; DLSS-G plugin "
+            "%u of %u by its own slGetPluginFunction: %ls", i + 1, images.plugins,
+            length && length < 1024 ? path : L"unavailable/truncated");
+    }
+    if (images.plugins > images.count)
+        LOG_WARN("Streamline GPU: %u loaded Streamline plugins name slDLSSGSetOptions and slDLSSGGetState; fence calls "
+            "are attributed to the first %u only", images.plugins, images.count);
 }
 void StreamlineQueue_Drain(bool final) noexcept { StreamlineHandoff_Service(final); }
 StreamlineQueue_SignalFn StreamlineQueue_NativeSignal() noexcept {
@@ -331,6 +337,6 @@ StreamlineQueueOwnedScope::StreamlineQueueOwnedScope() noexcept { ++streamline_q
 StreamlineQueueOwnedScope::~StreamlineQueueOwnedScope() { --streamline_queue::depth; }
 void StreamlineQueue_BlockFeature() noexcept {
     streamline_queue::feature_blocked = true;
-    streamline_queue::plugin_begin.store(0, std::memory_order_release);
+    streamline_queue::plugin_ranges[0].store(0, std::memory_order_release);
     StreamlineHandoff_Invalidate("feature_implementation_blocked");
 }

@@ -172,11 +172,6 @@ struct Config {
     // Disable if experiencing crashes related to DLSS pipeline.
     bool dlss_info_hooks = true;
 
-    // Compatibility switch, not a tuning option: the freezing MinHook calls run on one installer thread that other
-    // engines cannot suspend (hooks.h). false runs every call on the thread that asks, as before. Read once at
-    // initialisation, before the thread is created (restart required); 64- and 32-bit.
-    bool hook_installer_thread = true;
-
     // Stall report (hang_report.h): a watchdog writes relimiter_<exe>.hang.txt and .hang.dmp next to the log when the
     // present events stop. Off by default; while it is off nothing of it runs (no thread, no log-level window, no marks
     // on the hook paths). Read once at initialisation (restart required).

@@ -143,21 +143,41 @@ MH_STATUS Hooks_RemoveHook(void* target) noexcept;
 // allocates nothing of its own; creating, publishing, queueing and every log stay on the requester, which keeps
 // the install lock, posts the job and waits (no timeout) for the job's completion or the thread's death.
 //
+// The deny is on for the thread's whole life, and an engine that must register every thread before it patches
+// (Detours with DetourUpdateThread for each thread, as the MFG Unlock add-on does) therefore finds one thread it
+// cannot open and refuses to patch: with the thread, that add-on installs none of its hooks (105 of 105 attempts
+// refused in Phantom Blade Zero). That is why kHookInstallerThread below is false and there is no setting: the
+// thread and its tests stay for the day the overlapping-freeze hang needs it. Taking the deny off while
+// the thread is idle and putting it back around each job was built and measured, and is not sound:
+//   - a handle opened while the deny was off still suspends the thread after it is back on;
+//   - the handle count cannot show that none is left: an OpenThread whose access check passed before the deny went
+//     on turns up in the count afterwards (in 37% of rounds against a thread opening in a tight loop);
+//   - an engine that closes its handle after the suspend and opens the thread again to resume it (MinHook) is
+//     refused while the deny is on, so the thread stays suspended with a job posted (the stress test stalled in 4
+//     of 14 runs).
+// A thread that was ever open to others cannot be closed again without a window; only one born with the deny has
+// none.
+//
 // It is used only when it passed its self-check (OpenThread for suspend on its own id must fail: a process with
-// the debug privilege enabled bypasses the descriptor). Otherwise, with the kill switch `hook_installer_thread`
-// off, before it is ready, after Hooks_StopInstallerThread, and inside a HookInlineOnlyScope, every call runs on
-// the requester as it always did. If the thread ends before it took a job the requester runs the job itself; if
-// it ends with a job in flight MinHook is not used again in this process (its spinlock may be orphaned): every
-// later call fails with MH_ERROR_DISABLED, install admission closes, and nothing is replayed or terminated.
+// the debug privilege enabled bypasses the descriptor). Otherwise, with the thread not started
+// (kHookInstallerThread), before it is ready, after Hooks_StopInstallerThread, and inside a HookInlineOnlyScope,
+// every call runs on the requester as it always did. If the thread ends before it took a job the requester runs the
+// job itself; if it ends with a job in flight MinHook is not used again in this process (its spinlock may be
+// orphaned): every later call fails with MH_ERROR_DISABLED, install admission closes, and nothing is replayed or
+// terminated.
 enum class HookInstallerState : uint8_t {
-    None = 0,       // not created (kill switch, never started, creation failed)
+    None = 0,       // not created (kHookInstallerThread false, never started, creation failed)
     Starting,       // created, self-check not finished
     Ready,          // protected and serving jobs
     Unprotected,    // the self-check failed: not used
     Stopped,        // stopped or dead: not used
 };
 
-// Creates the thread when `enabled` (the `hook_installer_thread` key, read once at initialisation). Returns at
+// Whether initialisation starts the installer thread. False: every freezing call runs on its requester, and other
+// engines can register every thread of the process. The one place to turn the thread back on.
+inline constexpr bool kHookInstallerThread = false;
+
+// Creates the thread when `enabled` (production passes kHookInstallerThread, at initialisation). Returns at
 // once, never waits for the thread (the thread's start needs the loader lock, so a caller under it cannot wait):
 // until the thread reports Ready every call runs on the requester. Call outside DllMain and loader callbacks
 // when possible; the call only creates a thread.

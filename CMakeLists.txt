@@ -186,6 +186,7 @@ if(RELIMITER_64BIT)
         src/streamline_proxy_probe.h
         src/streamline_queue_hooks.cpp
         src/streamline_queue_hooks.h
+        src/streamline_plugin.h
         src/streamline_gpu_handoff.cpp
         src/streamline_gpu_handoff.h
         src/fg_input_observer.cpp

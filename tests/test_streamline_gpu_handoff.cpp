@@ -890,15 +890,24 @@ int main() {
     CHECK(q::RuntimeMethods(q::targets));
     CHECK(!q::RuntimeMethods({1,2,3})); CHECK(!q::RuntimeMethods({q::targets[0],q::targets[0],q::targets[2]}));
     q::original_execute = &Execute; q::original_signal = &Signal; q::original_wait = &Wait;
-    q::streamline_ready = true; q::plugin_begin = 0x100; q::plugin_end = 0x200;
+    q::streamline_ready = true; q::plugin_ranges[0] = 1; // one page at 0: [0, 0x1000)
     {
         const auto reads = stack_reads;
-        CHECK(q::PluginSite(0x100) == 0x100 && q::PluginSite(0x1ff) == 0x1ff && stack_reads == reads);
+        CHECK(q::PluginSite(0x100) == 0x100 && q::PluginSite(0xfff) == 0xfff && stack_reads == reads);
         // One non-plugin thunk, two different plugin ancestors, then none:
         // neither the queue nor the thunk PC can identify the originating site.
-        stack_site = 0x123; CHECK(q::PluginSite(0x200) == 0x123);
-        stack_site = 0x157; CHECK(q::PluginSite(0x200) == 0x157);
-        stack_site = 0; CHECK(q::PluginSite(0x200) == 0 && stack_reads == reads + 3);
+        stack_site = 0x123; CHECK(q::PluginSite(0x1000) == 0x123);
+        stack_site = 0x157; CHECK(q::PluginSite(0x1000) == 0x157);
+        stack_site = 0; CHECK(q::PluginSite(0x1000) == 0 && stack_reads == reads + 3);
+        // A second mapped image of the plugin: a call or an ancestor in either image is a plugin site, nothing
+        // between them is, and without the first image there is none at all.
+        q::plugin_ranges[1] = 0x20000 | 2; // [0x20000, 0x22000)
+        CHECK(q::PluginSite(0x21fff) == 0x21fff && q::PluginSite(0x100) == 0x100 && stack_reads == reads + 3);
+        stack_site = 0x20010; CHECK(q::PluginSite(0x22000) == 0x20010);
+        stack_site = 0x1f000; CHECK(q::PluginSite(0x1000) == 0);
+        q::plugin_ranges[0] = 0;
+        CHECK(q::PluginSite(0x20010) == 0 && q::PluginSite(0x100) == 0 && stack_reads == reads + 5);
+        q::plugin_ranges[0] = 1; q::plugin_ranges[1] = 0;
         stack_site = 0x110;
     }
         // Rejections before the first retained route must remain observable. No
@@ -1389,6 +1398,6 @@ int main() {
     // later resolver success must not revive authority from stale mode telemetry.
     StreamlineQueue_BlockFeature();
     StreamlineQueue_SetFeatureModule(reinterpret_cast<void*>(&Factory),reinterpret_cast<void*>(&FactoryA));
-    CHECK(!q::plugin_begin);
+    CHECK(!q::plugin_ranges[0]);
     std::puts("Streamline retained handoff, forwarding and acquisition tests passed");
 }
