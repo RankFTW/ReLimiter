@@ -1,5 +1,11 @@
 # Changelog
 
+## 4.1.1
+
+### Frame generation
+
+- **Improved compatibility with FG and MFG mods.** Tested working with MFG Ada Unlock.
+
 ## 4.1.0
 
 ### Frame generation
