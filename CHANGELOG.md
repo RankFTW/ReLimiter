@@ -1,5 +1,11 @@
 # Changelog
 
+## 4.1.2
+
+### OSD and settings
+
+- **A warning when NVIDIA Low Latency Mode is on.** The driver setting overrides ReLimiter and lowers GPU usage and frame rate. The OSD and the settings panel now say to set it to Off.
+
 ## 4.1.1
 
 ### Frame generation
