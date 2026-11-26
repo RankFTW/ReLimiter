@@ -354,6 +354,13 @@ static void DrawPacingSummary(reshade::api::effect_runtime* runtime, bool* confi
     SchedulerPacingStatus status;
     const bool has_status = Scheduler_ReadPacingStatus(&status);
     DrawPacingSummaryLine(pipeline, has_status, status);
+    if (g_driver_low_latency_override.load(std::memory_order_relaxed)) {
+        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "NVIDIA Low Latency Mode is on in the driver settings");
+        HelpTip("The Low Latency Mode setting of the NVIDIA Control Panel or NVIDIA App keeps the driver's "
+            "Reflex low latency on although ReLimiter turns it off. The driver then waits on its own after "
+            "ReLimiter releases each frame, which holds back the GPU and lowers the frame rate. Set Low "
+            "Latency Mode to Off for this game or globally; restart the game if this message stays.");
+    }
     const int overrides = Config_DeveloperOverrides();
     if (overrides > 0) {
         ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "%d developer setting%s changed from the defaults",
@@ -2239,6 +2246,11 @@ static void DrawOSDImpl(reshade::api::effect_runtime* runtime) {
             }
             OSDTextColored(ColSystem(), s_clock_text);
         }
+
+        // The driver's Low Latency Mode overriding ReLimiter's (g_driver_low_latency_override): shown
+        // whichever elements are on, since the driver's Sleep then paces the game.
+        if (g_driver_low_latency_override.load(std::memory_order_relaxed))
+            OSDTextColored(ColWarning(), "NVIDIA Low Latency Mode is on: set it to Off in the NVIDIA settings");
 
         // ═══════════════════════════════════
         // PERFORMANCE (cyan)

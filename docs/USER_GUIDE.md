@@ -189,6 +189,8 @@ The main view shows one plain line under the FPS controls:
 
 If a developer setting differs from its default, an amber line `N developer setting(s) changed from the defaults` with a **Reset** button appears under the status line; see [Developer Settings](#developer-settings).
 
+If the NVIDIA Control Panel's or NVIDIA App's **Low Latency Mode** is on, an amber line `NVIDIA Low Latency Mode is on in the driver settings` appears under the status line, and the OSD shows `NVIDIA Low Latency Mode is on: set it to Off in the NVIDIA settings` whichever elements are enabled. The setting keeps the driver's Reflex low latency on although ReLimiter turns it off. The driver then waits on its own after ReLimiter releases each frame, which holds back the GPU and lowers the frame rate. Set Low Latency Mode to Off for the game or globally; restart the game if the message stays.
+
 The technical lines are under **Details**, a collapsed node below the status line. They are for troubleshooting and bug reports; the [Developer Reference](DEVELOPER_REFERENCE.md#pacing-details-lines) explains them in depth.
 
 | Details line | Meaning |

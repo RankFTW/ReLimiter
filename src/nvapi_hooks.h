@@ -157,6 +157,11 @@ void NvAPI_ReleaseDriverLimiter() noexcept;
 // pacing on its own (a Sleep over 200 us in at least 16 of the last 64; cleared below 3
 // of 64). Diagnosis only: nothing else reads it.
 inline std::atomic<bool> g_unified_driver_pacing{false};
+// True while the presenting device's sleep status reports low latency on although ReLimiter's
+// applied Sleep mode has it off, for 2 s or more: the driver's own Low Latency Mode (NVIDIA Control
+// Panel or App) is on, and the driver's Sleep paces the game after ReLimiter's release. Read by the
+// OSD and settings-panel warning.
+inline std::atomic<bool> g_driver_low_latency_override{false};
 
 // The Sleep-mode tuple: one applied record {publication, owner, low latency off, interval,
 // epoch} under the forward lock, against the desired tuple (UnifiedPacer_SleepModeDesired:

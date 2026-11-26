@@ -83,8 +83,9 @@ static bool s_game_params_captured = false;
 static std::atomic_flag s_game_params_lock = ATOMIC_FLAG_INIT;
 // s_low_latency_forced_off: true while the driver has the Unified tuple's low latency off
 // (set with the applied tuple, cleared whenever the game's parameters, or the limiter's
-// interval with the game's low latency, reach the driver); only the transition log reads it
-// (PreviousSleepMode). The forward lock serializes a transition (driver call and state
+// interval with the game's low latency, reach the driver); the transition log
+// (PreviousSleepMode) and the driver's own low latency check (NoteDriverLowLatency) read it.
+// The forward lock serializes a transition (driver call and state
 // change) with the forwarding of the game's own SetSleepMode calls, so a game call can
 // neither land between the two nor read a state that does not match the driver; a
 // reconcile that finds it taken skips and retries on its next Sleep.
@@ -1046,6 +1047,33 @@ static void PublishSleepStatusAtSleepReturn(uint32_t publication_token) noexcept
     g_pacing_pending_sleep.Publish(pending, current, static_cast<uint32_t>(newest), ((newest >> 32) & 1) != 0);
 }
 
+// The driver's own low latency: the presenting device's sleep status still reports low latency on
+// while the applied tuple has it off (s_low_latency_forced_off), for 2 s or more. Only the driver's
+// Low Latency Mode (NVIDIA Control Panel or App) keeps it on then, and its Sleep paces the game after
+// ReLimiter's release. The hold rides out a status read across a tuple change. One log line per
+// transition; g_driver_low_latency_override for the OSD.
+static std::atomic<ULONGLONG> s_driver_low_latency_since_ms{0}; // 0: not reported
+constexpr ULONGLONG kDriverLowLatencyHoldMs = 2000;
+
+static void NoteDriverLowLatency(bool low_latency) noexcept {
+    bool override_on = false;
+    if (low_latency && s_low_latency_forced_off.load(std::memory_order_acquire)) {
+        const ULONGLONG now = GetTickCount64();
+        ULONGLONG since = 0;
+        if (s_driver_low_latency_since_ms.compare_exchange_strong(since, now, std::memory_order_relaxed))
+            since = now;
+        override_on = now - since >= kDriverLowLatencyHoldMs;
+    } else {
+        s_driver_low_latency_since_ms.store(0, std::memory_order_relaxed);
+    }
+    if (g_driver_low_latency_override.exchange(override_on, std::memory_order_relaxed) == override_on) return;
+    if (override_on)
+        LOG_WARN("NvAPI: the driver keeps low latency on although ReLimiter sets it off: the NVIDIA Low "
+                 "Latency Mode setting is on and the driver's Sleep paces the game; set it to Off");
+    else
+        LOG_INFO("NvAPI: the driver's low latency follows ReLimiter's setting again");
+}
+
 static void PollSleepStatus(IUnknown* device, uint32_t publication_token) noexcept {
     if (!s_orig_get_sleep_status) return;
     const bool developer = g_config.developer_settings;
@@ -1061,8 +1089,10 @@ static void PollSleepStatus(IUnknown* device, uint32_t publication_token) noexce
     NV_GET_SLEEP_STATUS_PARAMS status{};
     status.version = static_cast<NvU32>(NV_GET_SLEEP_STATUS_PARAMS_VER);
     const NvAPI_Status result = SafeInvokeGetSleepStatus(device, &status);
-    if (result == NVAPI_OK && publication_token == g_sleep_status_token.load(std::memory_order_acquire))
+    if (result == NVAPI_OK && publication_token == g_sleep_status_token.load(std::memory_order_acquire)) {
         DisplayState_OnSleepStatus(status.bFsVrr != 0, status.bFullscreenIFlip != 0, /*own_read=*/true);
+        NoteDriverLowLatency(status.bLowLatencyMode != 0);
+    }
     if (!developer) return;
     RecordSleepStatus(result, status, publication_token);
     if (s_polled_sleep_status.Changed(result, status) &&
@@ -2696,6 +2726,7 @@ static NvAPI_Status __cdecl Hook_GetSleepStatus(IUnknown* device, NV_GET_SLEEP_S
         PublicationToken(published) == g_sleep_status_token.load(std::memory_order_acquire)) {
         s_game_sleep_status_ms.store(GetTickCount64(), std::memory_order_relaxed);
         DisplayState_OnSleepStatus(seen.bFsVrr != 0, seen.bFullscreenIFlip != 0, /*own_read=*/false);
+        NoteDriverLowLatency(seen.bLowLatencyMode != 0);
     }
     if (observe && published.device)
         RecordSleepStatus(result, seen, PublicationToken(published));
