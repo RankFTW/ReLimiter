@@ -1,5 +1,12 @@
 # Changelog
 
+## 4.1.3
+
+### Frame generation
+
+- **Compatibility fix for MFG Unlocker on RTX 40 and older GPUs.** Generated frames are now spaced evenly instead of reaching the screen in bursts. These GPUs have no hardware flip metering, so ReLimiter now has frame generation pace without it.
+- **The frame rate no longer drops over time with frame generation in games that submit a lot of GPU work.**
+
 ## 4.1.2
 
 ### OSD and settings
