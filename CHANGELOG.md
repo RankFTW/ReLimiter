@@ -1,5 +1,12 @@
 # Changelog
 
+## 4.1.5
+
+### Frame generation
+
+- **Compatibility fix for MFG Ada Unlock and MFG Unlocker on RTX 40 and older GPUs: frame rate and latency restored.** Since 4.1.3 ReLimiter turned the driver's spacing of generated frames off on these GPUs. Where the driver does space them, that lowered the frame rate by about 8% and added latency. It is left on again.
+- If generated frames reach the screen in bursts with one of these mods, set `flip_metering_off=true` in `relimiter.ini` (**Flip metering off** in the developer settings).
+
 ## 4.1.4
 
 ### Frame generation
