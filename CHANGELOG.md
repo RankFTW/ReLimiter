@@ -1,5 +1,11 @@
 # Changelog
 
+## 4.1.4
+
+### Frame generation
+
+- **Compatibility fix for frame generation on RTX 40 and older GPUs, including MFG Unlocker.** When the GPU is fully loaded, frame pacing no longer drops out and back in several times a second, which caused frequent small stutters.
+
 ## 4.1.3
 
 ### Frame generation
