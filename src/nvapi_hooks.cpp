@@ -2411,11 +2411,6 @@ static PFN_NvAPI_QueryInterface s_orig_query_interface = nullptr;
 static std::atomic<uint64_t> s_flip_config_signature{UINT64_MAX};
 static std::atomic<uint64_t> s_flip_config_calls{0};
 static std::atomic<uint32_t> s_flip_config_logs{0};
-// Hardware flip metering by GPU architecture (FlipMetering_DecideBlock, below): written once per process during
-// init (the module is retained across addon reloads, and so is the answer); the observer reads it.
-enum class FlipMeteringHardware : uint8_t { Unknown = 0, Present = 1, Absent = 2 };
-static std::atomic<uint8_t> s_flip_metering_hardware{0};
-static std::atomic<bool> s_flip_absent_batch_logged{false};
 
 static NvAPI_Status SafeInvokeSetFlipConfig(IUnknown* queue, UINT source, NV_FLIP_CONFIG* config) noexcept {
     if (!s_orig_set_flip_config) return NVAPI_ERROR;
@@ -2481,22 +2476,13 @@ static NvAPI_Status __cdecl Hook_SetFlipConfig(IUnknown* queue, UINT source, NV_
             ? static_cast<double>(seen.timePerBatchMs) * 1000.0 : 0.0;
         FlipConfig_Record(call_qpc.QuadPart, batch_us >= 4294967295.0 ? UINT32_MAX
             : static_cast<uint32_t>(batch_us + 0.5));
-        // Hardware flip metering is at work only where the batch has frames to space, the driver names no obstacle
-        // and the GPU has the hardware. A game without frame generation configures a batch of ONE in every frame,
-        // status 0 (Rogue Core and Phantom Blade Zero, logs of 2026-11-17: frames_per_batch=1; 3 and 4 with frame
-        // generation at 3x and 4x), and the driver's feedback says where it cannot meter (no independent flip,
-        // mirroring). A GPU before Blackwell accepts a metered batch and spaces nothing (Phantom Blade Zero at 4x on
-        // an RTX 40 with an MFG unlock mod, 2026-11-26: every flip 7 ms after its Present at each position of the
-        // batch); there the call is kept for the capture only.
-        if (result == NVAPI_OK && seen.nFramesPerBatch >= 2 && seen.flipConfigFeedbackMask == 0) {
-            if (static_cast<FlipMeteringHardware>(s_flip_metering_hardware.load(std::memory_order_relaxed)) !=
-                    FlipMeteringHardware::Absent)
-                g_flip_metering_accepted_qpc.store(call_qpc.QuadPart, std::memory_order_relaxed);
-            else if (!s_flip_absent_batch_logged.exchange(true, std::memory_order_relaxed))
-                LOG_WARN("NvAPI: SetFlipConfig accepted a metered batch of %u frames on a GPU without flip-metering "
-                         "hardware: not counted as metering at work (the caller resolved the function before the flip "
-                         "metering block, or was let through)", seen.nFramesPerBatch);
-        }
+        // Flip metering is at work only where the batch has frames to space and the driver names no obstacle. A
+        // game without frame generation configures a batch of ONE in every frame, status 0 (Rogue Core and Phantom
+        // Blade Zero, logs of 2026-11-17: frames_per_batch=1; 3 and 4 with frame generation at 3x and 4x), and the
+        // driver's feedback says where it cannot meter (no independent flip, mirroring). An accepted batch does not
+        // prove that its flips are spaced (the flip metering block's comment, below): nothing in the call tells.
+        if (result == NVAPI_OK && seen.nFramesPerBatch >= 2 && seen.flipConfigFeedbackMask == 0)
+            g_flip_metering_accepted_qpc.store(call_qpc.QuadPart, std::memory_order_relaxed);
     }
     const NvU32 presented = v2 ? seen.nPresentedFramesPerBatch : 0;
     const uint64_t signature = (static_cast<uint64_t>(static_cast<uint32_t>(result)) << 32) |
@@ -2957,211 +2943,63 @@ void InstallNvAPIHooks() {
 #endif // _WIN64
 }
 
-// ── Flip metering block ──
-// NvAPI_D3D12_SetFlipConfig (QueryInterface ID 0xF3148C42) configures hardware
-// flip metering: the display engine spaces the flips of a batch of frames,
-// which DLSS Frame Generation relies on where the GPU has it. The block hides the
-// function: nvapi_QueryInterface returns nullptr for its ID (as Special K,
-// OptiScaler and RenoDX Commander do), so frame generation never configures
-// flip metering, presents from its own thread and is paced as on a GPU without
-// it (present-first ordering, the flip gate). It is installed during init, not
-// with the deferred hooks: frame generation resolves the function itself, and
-// a pointer it resolved before the hook stays usable.
+// ── Flip metering block (developer flip_metering_off) ──
+// NvAPI_D3D12_SetFlipConfig (QueryInterface ID 0xF3148C42) configures flip
+// metering: the driver shows the flips of a batch of frames at the times it
+// was given, which DLSS Frame Generation relies on where it presents a batch
+// back to back. The key hides the function: nvapi_QueryInterface returns
+// nullptr for its ID (as Special K, OptiScaler and RenoDX Commander do), so
+// frame generation never configures flip metering, presents each frame itself
+// and is paced by present-first ordering and the flip gate. Installed during
+// init, not with the deferred hooks: frame generation resolves the function
+// itself, and a pointer it resolved before the hook stays usable.
 //
-// Who it is for (FlipMetering_DecideBlock): every GPU with the developer key
-// flip_metering_off; otherwise a system whose NVIDIA GPUs all predate Blackwell
-// (NV_GPU_ARCHITECTURE_GB200 = 0x1B0), whose display engine has no flip
-// metering. There the driver accepts a metered batch and spaces nothing, while
-// DLSS-G, sent down its Blackwell path by an MFG unlock mod, presents the batch
-// from its worker as if it did (bubs' RTX 40, Phantom Blade Zero at 4x,
-// 2026-11-26: flips 0.2 to 1.6 ms apart at a 4.5 ms output interval; 53% of the
-// flip intervals shorter than 0.35 of it, against 0.1% with hardware metering
-// and none with the block on Blackwell). Smooth Motion (nvpresent64.dll) still
-// gets the function there; with the developer key it does not. The decision is
-// read on every request, so a retained hook of an earlier addon load that this
-// load does not want passes every request through.
+// The GPU's architecture does not decide it. 4.1.3 hid the function wherever
+// no GPU was Blackwell or later, after an RTX 40 system on which an MFG unlock
+// mod sends DLSS-G down its batch path accepted the batch and spaced nothing
+// (2026-11-26: flips 0.2 to 1.6 ms apart at a 4.5 ms output interval). 4.1.5
+// took that back: on an RTX 4090 in the same setup the driver shows each flip
+// of the batch at the asked time as on an RTX 5090 (Phantom Blade Zero at 3x,
+// 2026-11-27: scan-out 29 µs after the asked time at the median, 99% within
+// 100 µs), and hiding the function there cost 8% of the frame rate and 12 ms
+// of PC latency, DLSS-G's own pacing path being the slower one. Whether a
+// batch is spaced shows only in the flips; the key is the remedy for a system
+// that accepts and does not space.
 #ifdef _WIN64
-enum class FlipMeteringBlockReason : uint8_t { None = 0, DeveloperKey = 1, NoHardware = 2 };
-static std::atomic<uint8_t> s_flip_block_reason{0};
-
-static const char* FlipBlockReasonText(FlipMeteringBlockReason reason) noexcept {
-    return reason == FlipMeteringBlockReason::DeveloperKey ? "developer flip_metering_off"
-                                                           : "no GPU with flip-metering hardware";
-}
-
-// One log line per distinct caller module (the first four): a capture's log names every module that asked.
-static std::atomic<uintptr_t> s_flip_block_callers[4];
-
-static void LogFlipBlockCaller(HMODULE caller, bool hidden, FlipMeteringBlockReason reason) noexcept {
-    const uintptr_t key = caller ? reinterpret_cast<uintptr_t>(caller) : 1;
-    bool claimed = false;
-    for (std::atomic<uintptr_t>& slot : s_flip_block_callers) {
-        uintptr_t seen = slot.load(std::memory_order_relaxed);
-        if (seen == 0 && slot.compare_exchange_strong(seen, key, std::memory_order_relaxed)) {
-            claimed = true;
-            break;
-        }
-        if (seen == key) return;
-    }
-    if (!claimed) return;
-    char path[MAX_PATH] = "unknown";
-    if (caller) GetModuleFileNameA(caller, path, MAX_PATH);
-    const char* name = std::strrchr(path, '\\');
-    if (hidden) {
-        LOG_WARN("Flip metering block: NvAPI_D3D12_SetFlipConfig hidden from %s (%s)", name ? name + 1 : path,
-                 FlipBlockReasonText(reason));
-    } else {
-        LOG_INFO("Flip metering block: NvAPI_D3D12_SetFlipConfig passed to %s (Smooth Motion)",
-                 name ? name + 1 : path);
-    }
-}
+static std::atomic<bool> s_flip_config_hidden_logged{false};
 
 static void* __cdecl Hook_QueryInterface(NvU32 id) {
-    if (id == kNvApiIdSetFlipConfig) {
-        const auto reason = static_cast<FlipMeteringBlockReason>(s_flip_block_reason.load(std::memory_order_acquire));
-        if (reason != FlipMeteringBlockReason::None) {
-            HMODULE caller = nullptr;
-            if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                    static_cast<LPCWSTR>(_ReturnAddress()), &caller))
-                caller = nullptr;
-            const bool smooth_motion = caller != nullptr && caller == GetModuleHandleW(L"nvpresent64.dll");
-            const bool hidden = reason == FlipMeteringBlockReason::DeveloperKey || !smooth_motion;
-            LogFlipBlockCaller(caller, hidden, reason);
-            if (hidden) return nullptr;
+    if (id != kNvApiIdSetFlipConfig) return s_orig_query_interface ? s_orig_query_interface(id) : nullptr;
+    if (!s_flip_config_hidden_logged.exchange(true, std::memory_order_relaxed)) {
+        char path[MAX_PATH] = "unknown";
+        HMODULE caller = nullptr;
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                static_cast<LPCSTR>(_ReturnAddress()), &caller) && caller != nullptr) {
+            GetModuleFileNameA(caller, path, MAX_PATH);
         }
+        const char* name = std::strrchr(path, '\\');
+        LOG_WARN("Flip metering off: NvAPI_D3D12_SetFlipConfig hidden from %s", name ? name + 1 : path);
     }
-    return s_orig_query_interface ? s_orig_query_interface(id) : nullptr;
+    return nullptr;
 }
-
-// nvapi64.dll, loaded if need be and pinned: the block's hook lives in it for the rest of the process.
-static HMODULE PinNvApi() noexcept {
-    HMODULE nvapi = nullptr;
-    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, L"nvapi64.dll", &nvapi)) return nvapi;
-    if (LoadLibraryW(L"nvapi64.dll") == nullptr) return nullptr;
-    return GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, L"nvapi64.dll", &nvapi) ? nvapi : nullptr;
-}
-
-static constexpr NvU32 kNvApiIdInitialize = 0x0150E828;       // deps/nvapi/nvapi_interface.h
-static constexpr NvU32 kNvApiIdEnumPhysicalGpus = 0xE5AC921F;
-static constexpr NvU32 kNvApiIdGpuGetArchInfo = 0xD8265D24;
-static constexpr NvU32 kGpuArchitectureGB200 = 0x1B0;         // NV_GPU_ARCHITECTURE_GB200: Blackwell
-
-// Present: a GPU of Blackwell's architecture or a later one answered. Absent: every GPU answered, each with an
-// earlier architecture. Unknown otherwise: no GPU, a GPU that did not answer, or a Tegra ID (0xE00000xx).
-static FlipMeteringHardware ClassifyFlipMeteringHardware(const NvU32* architectures, NvU32 answered,
-                                                         NvU32 count) noexcept {
-    bool every_earlier = count != 0 && answered == count;
-    for (NvU32 index = 0; index < answered; ++index) {
-        const NvU32 architecture = architectures[index];
-        const bool tegra = (architecture & 0xF0000000u) != 0;
-        if (!tegra && architecture >= kGpuArchitectureGB200) return FlipMeteringHardware::Present;
-        if (tegra) every_earlier = false;
-    }
-    return every_earlier ? FlipMeteringHardware::Absent : FlipMeteringHardware::Unknown;
-}
-
-// The architecture of every physical GPU through `query` (nvapi_QueryInterface), classified. `detail` gets the
-// architectures, or the step that failed, for the log.
-static FlipMeteringHardware ProbeFlipMeteringHardware(PFN_NvAPI_QueryInterface query, char* detail,
-                                                      size_t size) noexcept {
-    detail[0] = '\0';
-    const auto initialize = query ? reinterpret_cast<PFN_NvAPI_Initialize>(query(kNvApiIdInitialize)) : nullptr;
-    const auto enumerate = query ? reinterpret_cast<PFN_NvAPI_EnumPhysicalGPUs>(query(kNvApiIdEnumPhysicalGpus))
-                                 : nullptr;
-    const auto arch_info = query ? reinterpret_cast<PFN_NvAPI_GPU_GetArchInfo>(query(kNvApiIdGpuGetArchInfo))
-                                 : nullptr;
-    if (!initialize || !enumerate || !arch_info) {
-        std::snprintf(detail, size, "NvAPI functions not resolved");
-        return FlipMeteringHardware::Unknown;
-    }
-    NvAPI_Status status = initialize();
-    if (status != NVAPI_OK) {
-        std::snprintf(detail, size, "NvAPI_Initialize failed (%d)", status);
-        return FlipMeteringHardware::Unknown;
-    }
-    NvPhysicalGpuHandle gpus[kNvApiMaxPhysicalGpus] = {};
-    NvU32 count = 0;
-    status = enumerate(gpus, &count);
-    if (status != NVAPI_OK || count == 0 || count > kNvApiMaxPhysicalGpus) {
-        std::snprintf(detail, size, "NvAPI_EnumPhysicalGPUs: status %d, %u GPUs", status, count);
-        return FlipMeteringHardware::Unknown;
-    }
-    NvU32 architectures[kNvApiMaxPhysicalGpus] = {};
-    NvU32 answered = 0;
-    int used = std::snprintf(detail, size, "GPU architectures");
-    for (NvU32 index = 0; index < count; ++index) {
-        NV_GPU_ARCH_INFO info{};
-        info.version = NV_GPU_ARCH_INFO_VER;
-        status = arch_info(gpus[index], &info);
-        if (status == NVAPI_OK) architectures[answered++] = info.architecture;
-        if (used < 0 || static_cast<size_t>(used) >= size) continue;
-        const int written = status == NVAPI_OK
-            ? std::snprintf(detail + used, size - used, "%s 0x%X", index ? "," : "", info.architecture)
-            : std::snprintf(detail + used, size - used, "%s failed (%d)", index ? "," : "", status);
-        used = written < 0 ? -1 : used + written;
-    }
-    return ClassifyFlipMeteringHardware(architectures, answered, count);
-}
-
-// Init thread only. The answer is read once per process, and logged at every load of the addon: a game that loads it
-// several times (Phantom Blade Zero four times in 6 s) keeps only the last loads' logs.
-static bool s_flip_metering_probed = false;
-static char s_flip_metering_detail[384] = "";
-static double s_flip_metering_probe_ms = 0.0;
 #endif
-
-bool FlipMetering_DecideBlock(bool developer_key) {
-#ifdef _WIN64
-    const bool first = !s_flip_metering_probed;
-    if (first) {
-        s_flip_metering_probed = true;
-        LARGE_INTEGER frequency{}, start{}, end{};
-        QueryPerformanceFrequency(&frequency);
-        QueryPerformanceCounter(&start);
-        std::snprintf(s_flip_metering_detail, sizeof(s_flip_metering_detail), "nvapi64.dll unavailable");
-        FlipMeteringHardware hardware = FlipMeteringHardware::Unknown;
-        if (HMODULE nvapi = PinNvApi()) {
-            hardware = ProbeFlipMeteringHardware(
-                reinterpret_cast<PFN_NvAPI_QueryInterface>(GetProcAddress(nvapi, "nvapi_QueryInterface")),
-                s_flip_metering_detail, sizeof(s_flip_metering_detail));
-        }
-        QueryPerformanceCounter(&end);
-        s_flip_metering_hardware.store(static_cast<uint8_t>(hardware), std::memory_order_relaxed);
-        s_flip_metering_probe_ms = frequency.QuadPart > 0
-            ? static_cast<double>(end.QuadPart - start.QuadPart) * 1000.0 / frequency.QuadPart : 0.0;
-    }
-    const auto hardware = static_cast<FlipMeteringHardware>(s_flip_metering_hardware.load(std::memory_order_relaxed));
-    LOG_INFO("Flip metering hardware: %s (%s; %.1f ms%s)",
-             hardware == FlipMeteringHardware::Present ? "present"
-                 : hardware == FlipMeteringHardware::Absent ? "absent" : "unknown",
-             s_flip_metering_detail, s_flip_metering_probe_ms, first ? "" : ", read at an earlier load of the addon");
-    const FlipMeteringBlockReason reason = developer_key ? FlipMeteringBlockReason::DeveloperKey
-        : hardware == FlipMeteringHardware::Absent ? FlipMeteringBlockReason::NoHardware
-        : FlipMeteringBlockReason::None;
-    s_flip_block_reason.store(static_cast<uint8_t>(reason), std::memory_order_release);
-    if (reason != FlipMeteringBlockReason::None)
-        LOG_INFO("Flip metering block: NvAPI_D3D12_SetFlipConfig is hidden from frame generation (%s)",
-                 FlipBlockReasonText(reason));
-    return reason != FlipMeteringBlockReason::None;
-#else
-    (void)developer_key;
-    return false;
-#endif
-}
 
 // The block's target while its install awaits the report (written by the installing thread).
 static void* s_flip_block_target = nullptr;
 
 void InstallFlipMeteringBlock() {
 #ifdef _WIN64
-    const HMODULE nvapi = PinNvApi();
-    if (nvapi == nullptr) {
-        LOG_WARN("Flip metering block: nvapi64.dll unavailable, nothing hidden");
+    // Pinned: the hook lives in nvapi64.dll for the rest of the process.
+    HMODULE nvapi = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, L"nvapi64.dll", &nvapi) &&
+        (LoadLibraryW(L"nvapi64.dll") == nullptr ||
+         !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, L"nvapi64.dll", &nvapi))) {
+        LOG_WARN("Flip metering off: nvapi64.dll unavailable, nothing hidden");
         return;
     }
     void* query = reinterpret_cast<void*>(GetProcAddress(nvapi, "nvapi_QueryInterface"));
     if (query == nullptr) {
-        LOG_WARN("Flip metering block: nvapi_QueryInterface not found, nothing hidden");
+        LOG_WARN("Flip metering off: nvapi_QueryInterface not found, nothing hidden");
         return;
     }
     // Inside a batch the hook is only queued: the caller reports after the batch applied.
@@ -3169,7 +3007,7 @@ void InstallFlipMeteringBlock() {
     const MH_STATUS status = InstallHook(query, reinterpret_cast<void*>(&Hook_QueryInterface),
         reinterpret_cast<void**>(&s_orig_query_interface));
     if (status != MH_OK) {
-        LOG_WARN("Flip metering block: nvapi_QueryInterface hook not installed (%d), flip metering unchanged", status);
+        LOG_WARN("Flip metering off: nvapi_QueryInterface hook not installed (%d), flip metering unchanged", status);
         s_flip_block_target = nullptr;
         return;
     }
@@ -3183,9 +3021,9 @@ void ReportFlipMeteringBlock() {
     if (!query) return;
     s_flip_block_target = nullptr;
     if (Hooks_TargetEnabled(query)) {
-        LOG_INFO("Flip metering block: nvapi_QueryInterface hook installed, NvAPI_D3D12_SetFlipConfig hidden from later requests");
+        LOG_INFO("Flip metering off: nvapi_QueryInterface hook installed, NvAPI_D3D12_SetFlipConfig hidden from later requests");
     } else {
-        LOG_WARN("Flip metering block: nvapi_QueryInterface hook not installed, flip metering unchanged");
+        LOG_WARN("Flip metering off: nvapi_QueryInterface hook not installed, flip metering unchanged");
     }
 #endif
 }

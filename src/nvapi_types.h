@@ -73,19 +73,6 @@ struct NV_FLIP_CONFIG {
 };
 static_assert(sizeof(NV_FLIP_CONFIG) == 24, "layout of nvapi.h's V1 and V2 structures");
 
-// NvAPI_GPU_GetArchInfo result (nvapi.h NV_GPU_ARCH_INFO_V2, 16 bytes; the version word is sizeof | (2 << 16)).
-// architecture is an NV_GPU_ARCHITECTURE_ID: 0x190 Ada (AD100), 0x1B0 Blackwell (GB200); Tegra IDs are 0xE00000xx.
-typedef void* NvPhysicalGpuHandle;
-struct NV_GPU_ARCH_INFO {
-    NvU32 version;
-    NvU32 architecture;
-    NvU32 implementation;
-    NvU32 revision;
-};
-static_assert(sizeof(NV_GPU_ARCH_INFO) == 16, "layout of nvapi.h's V2 structure");
-#define NV_GPU_ARCH_INFO_VER (sizeof(NV_GPU_ARCH_INFO) | (2 << 16))
-constexpr NvU32 kNvApiMaxPhysicalGpus = 64; // nvapi.h NVAPI_MAX_PHYSICAL_GPUS: NvAPI_EnumPhysicalGPUs fills up to this many
-
 // NvAPI_D3D_SetReflexSync parameters (nvapi.h NV_SET_REFLEX_SYNC_PARAMS_V1).
 struct NV_SET_REFLEX_SYNC_PARAMS {
     NvU32 version;
@@ -127,6 +114,3 @@ using PFN_NvAPI_D3D_GetSleepStatus = NvAPI_Status(__cdecl*)(IUnknown*, NV_GET_SL
 using PFN_NvAPI_D3D12_NotifyOutOfBandCommandQueue = NvAPI_Status(__cdecl*)(IUnknown*, int);
 using PFN_NvAPI_D3D12_SetCreateCommandQueueLowLatencyHint = NvAPI_Status(__cdecl*)(IUnknown*);
 using PFN_NvAPI_QueryInterface         = void*(__cdecl*)(NvU32);
-using PFN_NvAPI_Initialize = NvAPI_Status(__cdecl*)();
-using PFN_NvAPI_EnumPhysicalGPUs = NvAPI_Status(__cdecl*)(NvPhysicalGpuHandle*, NvU32*);
-using PFN_NvAPI_GPU_GetArchInfo = NvAPI_Status(__cdecl*)(NvPhysicalGpuHandle, NV_GPU_ARCH_INFO*);

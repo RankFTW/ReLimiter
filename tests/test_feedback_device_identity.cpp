@@ -1619,15 +1619,10 @@ void RepublishDuringQuery() {
 }
 
 #ifdef _WIN64
-// Flip metering block: the nvapi_QueryInterface detour hides NvAPI_D3D12_SetFlipConfig
-// (nullptr, the driver is not asked) while this load wants the block: for the developer
-// key from every caller, for missing hardware from every caller but Smooth Motion
-// (nvpresent64.dll, not loaded here). It forwards every other ID with the driver's
-// result, and SetFlipConfig too when no reason is set (a retained hook of an earlier
-// load). One log line per distinct caller module.
+// Developer flip_metering_off: the nvapi_QueryInterface detour hides
+// NvAPI_D3D12_SetFlipConfig on every request (nullptr, the driver is not asked)
+// and forwards every other ID with the driver's result.
 static int s_flip_config_log_writes = 0; // Log_Write lines of the SetFlipConfig observer
-static int s_flip_absent_log_writes = 0; // "NvAPI: SetFlipConfig accepted a metered batch ..." lines
-static int s_flip_block_log_writes = 0;  // "Flip metering block: NvAPI_D3D12_SetFlipConfig hidden ..." lines
 static int s_reflex_observe_log_writes = 0; // Log_Write lines that start with "Reflex observe: "
 static int s_query_calls = 0;
 static NvU32 s_query_last = 0;
@@ -1641,112 +1636,13 @@ static void* __cdecl FakeQueryInterface(NvU32 id) {
 void TestFlipMeteringBlock() {
     const auto old_query = s_orig_query_interface;
     s_orig_query_interface = FakeQueryInterface;
-    for (std::atomic<uintptr_t>& slot : s_flip_block_callers) slot.store(0);
     s_query_calls = 0;
-    const int block_logs = s_flip_block_log_writes;
-    s_flip_block_reason.store(static_cast<uint8_t>(FlipMeteringBlockReason::DeveloperKey));
     CHECK(Hook_QueryInterface(0xF3148C42) == nullptr);
     CHECK(Hook_QueryInterface(0xF3148C42) == nullptr);
     CHECK(s_query_calls == 0);
-    CHECK(s_flip_block_log_writes == block_logs + 1);
     CHECK(Hook_QueryInterface(0x852CD1D2) == &s_query_target); // NvAPI_D3D_Sleep
     CHECK(s_query_calls == 1 && s_query_last == 0x852CD1D2);
-    s_flip_block_reason.store(static_cast<uint8_t>(FlipMeteringBlockReason::NoHardware));
-    CHECK(Hook_QueryInterface(0xF3148C42) == nullptr);
-    CHECK(s_query_calls == 1 && s_flip_block_log_writes == block_logs + 1);
-    s_flip_block_reason.store(static_cast<uint8_t>(FlipMeteringBlockReason::None));
-    CHECK(Hook_QueryInterface(0xF3148C42) == &s_query_target);
-    CHECK(s_query_calls == 2 && s_query_last == 0xF3148C42);
     s_orig_query_interface = old_query;
-}
-
-// The architecture probe through a fake nvapi_QueryInterface: Present where a GPU of
-// Blackwell's architecture (0x1B0) or a later one answers, Absent where every GPU
-// answers with an earlier one, Unknown for any other answer.
-struct FakeGpu { NvAPI_Status status; NvU32 architecture; };
-static std::vector<FakeGpu> s_fake_gpus;
-static NvAPI_Status s_fake_initialize_status = NVAPI_OK;
-static NvAPI_Status s_fake_enumerate_status = NVAPI_OK;
-static bool s_fake_arch_resolved = true;
-static NvAPI_Status __cdecl FakeNvInitialize() { return s_fake_initialize_status; }
-static NvAPI_Status __cdecl FakeEnumPhysicalGpus(NvPhysicalGpuHandle* gpus, NvU32* count) {
-    if (s_fake_enumerate_status != NVAPI_OK) return s_fake_enumerate_status;
-    const size_t filled = std::min<size_t>(s_fake_gpus.size(), kNvApiMaxPhysicalGpus);
-    for (size_t index = 0; index < filled; ++index) gpus[index] = reinterpret_cast<NvPhysicalGpuHandle>(index + 1);
-    *count = static_cast<NvU32>(s_fake_gpus.size()); // more than fit: a count the probe must not trust
-    return NVAPI_OK;
-}
-static NvAPI_Status __cdecl FakeGetArchInfo(NvPhysicalGpuHandle gpu, NV_GPU_ARCH_INFO* info) {
-    if (info->version != (sizeof(NV_GPU_ARCH_INFO) | (2u << 16))) return -9; // NVAPI_INCOMPATIBLE_STRUCT_VERSION
-    const size_t index = reinterpret_cast<size_t>(gpu) - 1;
-    if (index >= s_fake_gpus.size()) return -5;
-    if (s_fake_gpus[index].status != NVAPI_OK) return s_fake_gpus[index].status;
-    info->architecture = s_fake_gpus[index].architecture;
-    return NVAPI_OK;
-}
-static void* __cdecl FakeNvQuery(NvU32 id) {
-    if (id == 0x0150E828) return reinterpret_cast<void*>(&FakeNvInitialize);
-    if (id == 0xE5AC921F) return reinterpret_cast<void*>(&FakeEnumPhysicalGpus);
-    if (id == 0xD8265D24) return s_fake_arch_resolved ? reinterpret_cast<void*>(&FakeGetArchInfo) : nullptr;
-    return nullptr;
-}
-static FlipMeteringHardware ProbeFake(std::vector<FakeGpu> gpus, char* detail, size_t size) {
-    s_fake_gpus = std::move(gpus);
-    return ProbeFlipMeteringHardware(FakeNvQuery, detail, size);
-}
-
-void TestFlipMeteringHardware() {
-    constexpr NvU32 kAda = 0x190, kBlackwell = 0x1B0, kTegra = 0xE0000040;
-    char detail[256];
-    CHECK(ProbeFake({{NVAPI_OK, kAda}}, detail, sizeof(detail)) == FlipMeteringHardware::Absent);
-    CHECK(std::strcmp(detail, "GPU architectures 0x190") == 0);
-    CHECK(ProbeFake({{NVAPI_OK, kAda}, {NVAPI_OK, kBlackwell}}, detail, sizeof(detail)) == FlipMeteringHardware::Present);
-    CHECK(ProbeFake({{NVAPI_OK, kBlackwell}, {NVAPI_OK, kAda}}, detail, sizeof(detail)) == FlipMeteringHardware::Present);
-    CHECK(ProbeFake({{NVAPI_OK, 0x1C0}}, detail, sizeof(detail)) == FlipMeteringHardware::Present);
-    // A GPU that does not answer may be the one with the hardware: never Absent then.
-    CHECK(ProbeFake({{NVAPI_OK, kBlackwell}, {-5, 0}}, detail, sizeof(detail)) == FlipMeteringHardware::Present);
-    CHECK(ProbeFake({{-5, 0}, {NVAPI_OK, kAda}}, detail, sizeof(detail)) == FlipMeteringHardware::Unknown);
-    CHECK(ProbeFake({{NVAPI_OK, kAda}, {-104, 0}}, detail, sizeof(detail)) == FlipMeteringHardware::Unknown);
-    CHECK(std::strcmp(detail, "GPU architectures 0x190, failed (-104)") == 0);
-    // Tegra IDs (0xE00000xx) are not a discrete architecture below Blackwell.
-    CHECK(ProbeFake({{NVAPI_OK, kTegra}}, detail, sizeof(detail)) == FlipMeteringHardware::Unknown);
-    CHECK(ProbeFake({{NVAPI_OK, kTegra}, {NVAPI_OK, kBlackwell}}, detail, sizeof(detail)) == FlipMeteringHardware::Present);
-    // No GPU, more GPUs than the handle array holds, a failed step or a missing function: Unknown.
-    CHECK(ProbeFake({}, detail, sizeof(detail)) == FlipMeteringHardware::Unknown);
-    CHECK(ProbeFake(std::vector<FakeGpu>(65, FakeGpu{NVAPI_OK, kAda}), detail, sizeof(detail)) ==
-          FlipMeteringHardware::Unknown);
-    s_fake_enumerate_status = -6;
-    CHECK(ProbeFake({{NVAPI_OK, kAda}}, detail, sizeof(detail)) == FlipMeteringHardware::Unknown);
-    s_fake_enumerate_status = NVAPI_OK;
-    s_fake_initialize_status = -2;
-    CHECK(ProbeFake({{NVAPI_OK, kAda}}, detail, sizeof(detail)) == FlipMeteringHardware::Unknown);
-    CHECK(std::strcmp(detail, "NvAPI_Initialize failed (-2)") == 0);
-    s_fake_initialize_status = NVAPI_OK;
-    s_fake_arch_resolved = false;
-    CHECK(ProbeFake({{NVAPI_OK, kAda}}, detail, sizeof(detail)) == FlipMeteringHardware::Unknown);
-    s_fake_arch_resolved = true;
-    CHECK(ProbeFlipMeteringHardware(nullptr, detail, sizeof(detail)) == FlipMeteringHardware::Unknown);
-    // Every handle the array holds; the detail is cut at its buffer.
-    char short_detail[24];
-    CHECK(ProbeFake(std::vector<FakeGpu>(64, FakeGpu{NVAPI_OK, kAda}), short_detail, sizeof(short_detail)) ==
-          FlipMeteringHardware::Absent);
-    CHECK(std::strlen(short_detail) < sizeof(short_detail));
-
-    // The decision from the answer (probed once per process; here the answer is set, never read from nvapi64).
-    s_flip_metering_probed = true;
-    const auto decide = [](FlipMeteringHardware hardware, bool key, FlipMeteringBlockReason expected) {
-        s_flip_metering_hardware.store(static_cast<uint8_t>(hardware));
-        const bool block = FlipMetering_DecideBlock(key);
-        CHECK(block == (expected != FlipMeteringBlockReason::None));
-        CHECK(s_flip_block_reason.load() == static_cast<uint8_t>(expected));
-    };
-    decide(FlipMeteringHardware::Absent, false, FlipMeteringBlockReason::NoHardware);
-    decide(FlipMeteringHardware::Present, false, FlipMeteringBlockReason::None);
-    decide(FlipMeteringHardware::Unknown, false, FlipMeteringBlockReason::None);
-    decide(FlipMeteringHardware::Unknown, true, FlipMeteringBlockReason::DeveloperKey);
-    decide(FlipMeteringHardware::Absent, true, FlipMeteringBlockReason::DeveloperKey);
-    s_flip_metering_hardware.store(static_cast<uint8_t>(FlipMeteringHardware::Unknown));
-    s_flip_block_reason.store(static_cast<uint8_t>(FlipMeteringBlockReason::None));
 }
 
 // The SetFlipConfig observer passes the call through unchanged and logs one line
@@ -1819,42 +1715,6 @@ void TestFlipConfigObserver() {
     config.timePerBatchMs = 8.5f;
     Hook_SetFlipConfig(queue, 3, &config);
     CHECK(FlipConfig_Read(&flip_qpc, &flip_us) && flip_us == 8500);
-    s_orig_set_flip_config = old;
-}
-
-// Where no GPU has flip-metering hardware an accepted metered batch is recorded for the
-// capture, reaches the caller unchanged and is not counted as metering at work; said once.
-void TestFlipConfigObserverWithoutHardware() {
-    const auto old = s_orig_set_flip_config;
-    s_orig_set_flip_config = FakeSetFlipConfig;
-    s_flip_driver_status = NVAPI_OK; s_flip_driver_feedback = 0;
-    NV_FLIP_CONFIG config{};
-    config.version = sizeof(NV_FLIP_CONFIG) | (2u << 16);
-    config.nFramesPerBatch = 4; config.nPresentedFramesPerBatch = 4; config.timePerBatchMs = 9.0f;
-    auto* queue = reinterpret_cast<IUnknown*>(&s_query_target);
-    s_flip_metering_hardware.store(static_cast<uint8_t>(FlipMeteringHardware::Absent));
-    s_flip_absent_batch_logged.store(false);
-    g_flip_metering_accepted_qpc.store(0);
-    const int absent_logs = s_flip_absent_log_writes;
-    const int calls = s_flip_driver_calls;
-    CHECK(Hook_SetFlipConfig(queue, 3, &config) == NVAPI_OK);
-    CHECK(Hook_SetFlipConfig(queue, 3, &config) == NVAPI_OK);
-    CHECK(s_flip_driver_calls == calls + 2 && config.nFramesPerBatch == 4 && config.flipConfigFeedbackMask == 0);
-    CHECK(g_flip_metering_accepted_qpc.load() == 0);
-    CHECK(s_flip_absent_log_writes == absent_logs + 1);
-    int64_t flip_qpc = 0;
-    uint32_t flip_us = 0;
-    CHECK(FlipConfig_Read(&flip_qpc, &flip_us) && flip_qpc > 0 && flip_us == 9000);
-    // Without an answer about the hardware, and with the hardware, it counts as before.
-    s_flip_metering_hardware.store(static_cast<uint8_t>(FlipMeteringHardware::Unknown));
-    Hook_SetFlipConfig(queue, 3, &config);
-    CHECK(g_flip_metering_accepted_qpc.load() > 0);
-    g_flip_metering_accepted_qpc.store(0);
-    s_flip_metering_hardware.store(static_cast<uint8_t>(FlipMeteringHardware::Present));
-    Hook_SetFlipConfig(queue, 3, &config);
-    CHECK(g_flip_metering_accepted_qpc.load() > 0);
-    s_flip_metering_hardware.store(static_cast<uint8_t>(FlipMeteringHardware::Unknown));
-    g_flip_metering_accepted_qpc.store(0);
     s_orig_set_flip_config = old;
 }
 
@@ -3473,9 +3333,6 @@ void Breadcrumb_Trail(TrailKind, uint8_t, uint32_t, uint16_t) noexcept {}
 void Log_Write(LogLevel, const char* fmt, ...) {
 #ifdef _WIN64
     if (fmt && std::strncmp(fmt, "NvAPI: SetFlipConfig", 20) == 0) ++s_flip_config_log_writes;
-    if (fmt && std::strncmp(fmt, "NvAPI: SetFlipConfig accepted a metered batch", 45) == 0) ++s_flip_absent_log_writes;
-    if (fmt && std::strncmp(fmt, "Flip metering block: NvAPI_D3D12_SetFlipConfig hidden", 53) == 0)
-        ++s_flip_block_log_writes;
     if (fmt && std::strncmp(fmt, "Reflex observe: ", 16) == 0) ++s_reflex_observe_log_writes;
 #else
     (void)fmt;
@@ -3652,9 +3509,7 @@ int main(int argc, char** argv) {
 #endif
 #ifdef _WIN64
     TestFlipMeteringBlock();
-    TestFlipMeteringHardware();
     TestFlipConfigObserver();
-    TestFlipConfigObserverWithoutHardware();
     TestReflexObservation();
 #endif
     // No-FG token: native mode transitions clear it; the scheduler-side

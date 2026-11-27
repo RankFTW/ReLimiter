@@ -112,14 +112,10 @@ extern std::atomic<uint32_t> g_game_requested_interval;
 // Install NvAPI hooks. Call after MH_Initialize().
 void InstallNvAPIHooks();
 
-// Flip metering block: hides NvAPI_D3D12_SetFlipConfig from later nvapi_QueryInterface requests (64-bit), so frame
-// generation runs without hardware flip metering. FlipMetering_DecideBlock: call once per addon load during init,
-// after MH_Initialize() and outside a HookBatch (it may load and initialize NvAPI), before the game's frame
-// generation resolves NvAPI functions. It reads the architecture of every NVIDIA GPU once per process and logs it,
-// and returns whether to install the block: with the developer key flip_metering_off, or when no GPU has
-// flip-metering hardware (Blackwell, NV_GPU_ARCHITECTURE_GB200, and later); then Smooth Motion still gets the
-// function. Win32: false. InstallFlipMeteringBlock installs the hook; interception lasts until the addon shuts down.
-bool FlipMetering_DecideBlock(bool developer_key);
+// Developer flip_metering_off: hides NvAPI_D3D12_SetFlipConfig from every later
+// nvapi_QueryInterface request in the process (64-bit). Call once during init,
+// after MH_Initialize() and before the game's frame generation resolves NvAPI
+// functions; interception lasts until the addon shuts down.
 void InstallFlipMeteringBlock();
 
 // Inside a HookBatch the two installers above only queue their hooks. Call these after the batch applied: each

@@ -604,7 +604,7 @@ void DrainFgReadback(Queue& queue,int64_t* next,bool before_signal) noexcept {
     }
 }
 // The FG input wait's keys of the spacing floor (instrumentation_state.h). They act where hardware flip metering
-// spaces the flips: the driver accepted a batch of two or more frames in the last 500 ms on a GPU with the hardware
+// spaces the flips: the driver accepted a batch of two or more frames in the last 500 ms
 // (g_flip_metering_accepted_qpc, the test the telemetry uses). Where DLSS-G presents from its own thread the flip
 // gate keeps the spacing at the flips themselves, and the floor in front of it keeps the earlier eighth and the
 // display-side interval: measured there the hundredth bought nothing and cost latency (Phantom Blade Zero at a cap

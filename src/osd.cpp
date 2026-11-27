@@ -454,11 +454,11 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
             g_config.flip_metering_off ? "on" : "off");
         *config_dirty = true;
     }
-    HelpTip("Diagnostic, DLSS Frame Generation on GPUs with hardware flip metering (RTX 50). On hides "
-        "NvAPI_D3D12_SetFlipConfig from the game, so frame generation runs as on a GPU without hardware flip "
-        "metering: the display engine no longer spaces the generated frames. Takes effect at the next "
-        "game launch. Leave off with Smooth Motion, which needs flip metering. Where no GPU has the hardware "
-        "(RTX 40 and older) ReLimiter hides it from frame generation by itself.");
+    HelpTip("DLSS Frame Generation where the driver spaces a batch of generated frames (RTX 50; RTX 40 and "
+        "older with an MFG unlock mod). On hides NvAPI_D3D12_SetFlipConfig from the game, so frame generation "
+        "presents each frame itself and ReLimiter spaces them. Turn it on if generated frames reach the screen "
+        "in bursts with an MFG unlock mod; where the driver spaces them it costs frame rate and latency. Takes "
+        "effect at the next game launch. Leave off with Smooth Motion, which needs flip metering.");
 #endif
     ImGui::Spacing();
 }

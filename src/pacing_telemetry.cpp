@@ -500,8 +500,8 @@ namespace
 
     // Hardware flip metering spaces the displayed frames: within the last half second the driver accepted a batch
     // of two or more frames with no obstacle in its feedback (NvAPI_D3D12_SetFlipConfig, once per real frame;
-    // instrumentation_state.h), on a GPU with flip-metering hardware. A refused call does not count, and neither
-    // does a batch of one, which a game without frame generation sends in every frame.
+    // instrumentation_state.h). A refused call does not count, and neither does a batch of one, which a game
+    // without frame generation sends in every frame.
     bool FlipMeteringFlowing(int64_t now_qpc) noexcept
     {
         const int64_t accepted_qpc = g_flip_metering_accepted_qpc.load(std::memory_order_relaxed);
