@@ -404,6 +404,9 @@ if(MSVC)
     set_property(TARGET test_gpu_queue_dependency PROPERTY
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     target_compile_options(test_gpu_queue_dependency PRIVATE /W4 /utf-8 /permissive-)
+    # The harnesses hold the tables, the evaluator's mirror and the resolver's scratch (about 1 MiB each, two at once in
+    # the equivalence tests): more than the default 1 MiB stack.
+    target_link_options(test_gpu_queue_dependency PRIVATE /STACK:8388608)
 endif()
 
 # The probe's borrowing rules (src/gpu_queue_borrow.cpp: pending word, frame pattern, gate, late classification,

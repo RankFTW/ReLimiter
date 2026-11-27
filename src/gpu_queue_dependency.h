@@ -42,8 +42,8 @@
 // does not, the next successful lock holder (a writer or the pull) notices that the epoch it holds the tables
 // for is behind and resets them before its own work (a pending clear). A decision is published with the epoch
 // it was computed for and is only valid while that epoch is current, so a clear invalidates it at once. Nothing
-// evaluates under the lock: Reader::Pull copies only the entries recorded since its previous pull and the
-// command list rows under it (a few kilobytes at most), then the resolver and the evaluator run on its own copy;
+// evaluates under the lock: Reader::Pull copies only the entries recorded since its previous pull, at most kPullChunk
+// entries of each table per hold of the lock, and the command list rows under it, then the resolver and the evaluator run on its own copy;
 // a window whose epoch changed restarts and adopts nothing. The resolver and the evaluator belong to ONE
 // consumer at a time (FrameFeed::Evaluate, serialised by its guard): the probe's worker while a session runs,
 // the Present thread before an adoption and whenever no session is running; the Present thread's own part is
@@ -55,7 +55,15 @@
 
 namespace gpu_queue_dependency {
 
-constexpr size_t kLogCapacity = 512; // entries of each table
+// Entries of each table and of the evaluator's mirror of it. The mirror must keep every entry an unresolved frame can
+// still read (Reader::SetNeeded, NeededFor): the Waits of the pending frames' windows (up to FrameFeed::kBacklog + 1)
+// and the Signals of those windows plus kMaxSignalSkewFrames + 1 frames before them. Sized from a game that submits
+// heavily (about 140 Waits and 130 Signals per real frame, 1.3 times that at its peak): about 1k Signals needed
+// normally and 2.2k with a full backlog.
+constexpr size_t kLogCapacity = 4096;
+// Entries of each table one hold of the lock copies (Reader::Pull): a detour that waits longer than the lock's spin
+// bound drops its record, so a pull that has more to copy takes the lock again for the rest.
+constexpr size_t kPullChunk = 512;
 constexpr size_t kQueueSlots = 8;    // queues with command list counters
 constexpr size_t kMaxNodes = 8;      // candidates of one frame (the presenting queue included)
 constexpr uint32_t kMaxHops = 3;
@@ -255,28 +263,55 @@ template <class Seam> bool Tables::NoteExecuteSeam(uint64_t queue, uint32_t list
     return NoteExecuteLocked(queue, lists);
 }
 
-// The Present thread's copy of the tables: Pull() takes the lock (bounded), copies what is new, releases it;
-// everything after that (the resolver, the evaluator) runs on the copy.
+// What the evaluator's mirror must keep for the frames not resolved yet (NeededFor). Each table has its own need: a
+// frame reads the Waits of its window (and, with the presenting queue as the root, the Waits carrying its scope,
+// whatever their time), and the Signals that can match them (SkewOk: within kMaxSignalSkewFrames by the frame counter)
+// or that it counts for its first-hop edge (from the previous frame's matched Signal on, by time). A needed entry that
+// a pull overwrites in the mirror counts as loss.
+struct Needed {
+    int64_t wait_qpc = INT64_MAX;    // a Wait at or after it may lie in an unresolved frame's window
+    uint64_t wait_scope = 0;         // a Wait carrying this scope id or a later one may be an unresolved frame's (0 = none)
+    bool signal_epoch_valid = false;
+    uint32_t signal_epoch = 0;       // a Signal of this frame counter or a later one may match an unresolved frame's Wait
+    int64_t signal_qpc = INT64_MAX;  // a Signal at or after it is counted for the next frame's first-hop edge
+    bool NeedsWait(const Entry& e) const noexcept { return e.qpc >= wait_qpc || (wait_scope != 0 && e.scope >= wait_scope); }
+    bool NeedsSignal(const Entry& e) const noexcept {
+        return (signal_epoch_valid && static_cast<int32_t>(e.epoch - signal_epoch) >= 0) || e.qpc >= signal_qpc;
+    }
+};
+
+// The evaluating thread's copy of the tables: Pull() takes the lock (bounded, at most kPullChunk entries of each table
+// per hold), copies what is new, releases it; everything after that (the resolver, the evaluator) runs on the copy.
 class Reader {
 public:
     // Entries recorded since the previous successful Pull are appended to the local mirrors (when more than
     // kLogCapacity were recorded the oldest were overwritten before the copy: counted in loss()), the command list
     // rows are copied, and the epoch the tables belong to is read (a pending clear is applied first). An epoch other
-    // than the previous pull's empties the mirrors first. False = the lock did not come free within
-    // Tables::kSpinBound: the pull is skipped and counted, nothing else changes (the cursors stay, so the next pull
-    // copies the entries of both frames, none lost, none twice).
+    // than the mirror's empties the mirrors first. The copy runs in holds of the lock of at most kPullChunk entries of
+    // each table, up to the heads its first hold read. False = a hold did not get the lock within Tables::kSpinBound:
+    // the pull is skipped and counted; what earlier holds of it copied stays copied (the cursors moved with it), so
+    // the next pull copies the rest, none lost, none twice, and reports an epoch change this one saw.
     bool Pull(Tables& tables) noexcept;
-    // Entries of the mirror recorded at or after `qpc` may still be needed by a frame that is not resolved yet (the
-    // oldest unresolved frame's window begin, or the previous edge's Signal when that is older): when the mirror is full
-    // and a pull overwrites such an entry it is counted in loss() (the frame would be resolved without it). INT64_MAX
-    // (the default) = nothing is needed. Set before every Pull.
-    void SetNeededSince(int64_t qpc) noexcept { needed_since_ = qpc; }
+    // What the frames not resolved yet need (NeededFor): a full mirror overwriting such an entry counts it in loss()
+    // (the frame would be resolved without it). Set before every Pull; the default needs nothing.
+    void SetNeeded(const Needed& needed) noexcept { needed_ = needed; }
     uint64_t epoch() const noexcept { return epoch_; }
     bool epoch_changed() const noexcept { return changed_; } // as of the latest Pull (false for a skipped one)
     // Records dropped, lost or overwritten so far (cumulative; the tables' loss at the latest pull plus the overruns).
     uint64_t loss() const noexcept { return loss_; }
-    // The mirror's own part of loss(): entries a frame still needed that a pull overwrote (cumulative).
-    uint64_t overrun() const noexcept { return overrun_; }
+    // The mirror's own part of loss(), cumulative: entries overwritten in the tables before a pull copied them, and
+    // entries a frame still needed that a pull overwrote in the mirror; per table and in sum.
+    uint64_t overrun() const noexcept { return signal_overrun_ + wait_overrun_; }
+    uint64_t signal_overrun() const noexcept { return signal_overrun_; }
+    uint64_t wait_overrun() const noexcept { return wait_overrun_; }
+    // Signals and Waits recorded between the previous successful pull and the latest one (copied or overwritten), and
+    // since the reader was created (cumulative over every hold, a clear's discarded copy included).
+    uint64_t pulled_signals() const noexcept { return pulled_signals_; }
+    uint64_t pulled_waits() const noexcept { return pulled_waits_; }
+    uint64_t recorded_signals() const noexcept { return recorded_signals_; }
+    uint64_t recorded_waits() const noexcept { return recorded_waits_; }
+    // The entries of each mirror the current need keeps (a scan of both: diagnostics).
+    void NeededOccupancy(size_t* signals, size_t* waits) const noexcept;
     uint64_t pulls_skipped() const noexcept { return skipped_.load(std::memory_order_relaxed); }
     const Entry* signals() const noexcept { return signals_; }
     size_t signal_count() const noexcept { return signal_count_; }
@@ -286,14 +321,21 @@ public:
     size_t row_count() const noexcept { return row_count_; }
 
 private:
-    Entry signals_[kLogCapacity], waits_[kLogCapacity]; // unordered once full
+    // One hold of the lock: true when it held the lock, `*done` when the copy reached the target heads (then `*lost` is
+    // the tables' loss counter and the rows are copied); false = no lock.
+    bool PullHold(Tables& tables, bool first, bool* done, uint64_t* lost) noexcept;
+
+    Entry signals_[kLogCapacity], waits_[kLogCapacity]; // in slot order, unordered in time once full
     size_t signal_count_ = 0, wait_count_ = 0, signal_next_ = 0, wait_next_ = 0;
     uint64_t signal_cursor_ = 0, wait_cursor_ = 0;
+    uint64_t signal_target_ = 0, wait_target_ = 0;      // the heads the pull in progress copies up to
     Row rows_[kQueueSlots];
     size_t row_count_ = 0;
-    uint64_t epoch_ = 0, loss_ = 0, overrun_ = 0;
-    int64_t needed_since_ = INT64_MAX;
+    uint64_t epoch_ = 0, loss_ = 0, signal_overrun_ = 0, wait_overrun_ = 0, pulled_signals_ = 0, pulled_waits_ = 0;
+    uint64_t recorded_signals_ = 0, recorded_waits_ = 0;
+    Needed needed_;
     bool changed_ = false;
+    bool change_pending_ = false; // an epoch change a pull saw and has not reported yet (a later hold failed)
     std::atomic<uint64_t> skipped_{0};
 };
 
@@ -338,12 +380,36 @@ struct FrameInput {
     PreviousEdge previous[kMaxNodes]; // the first-hop edges of the previous evaluated frame (Evaluator::FillPrevious)
     uint32_t previous_count = 0;
 };
-// Derives the candidates of one frame. `waits` and `signals` are table copies (any order). A Wait of the
+// The resolver's working memory, owned by the caller (FrameFeed keeps one under its evaluator guard, a test its own):
+// the frame's candidate Waits in slot order, each one's match among the Signals, and a hash of the candidates by
+// (fence, value) that the one pass over the Signals looks them up in. About 136 KiB: never on a game thread's stack.
+struct ResolveScratch {
+    static constexpr size_t kBuckets = kLogCapacity;  // a power of two
+    static constexpr uint16_t kNone = 0xFFFF;
+    struct Match {
+        uint64_t signaller;  // the first queue found that signalled the Wait's (fence, value)
+        int64_t qpc;         // that queue's latest such Signal
+        bool found, ambiguous;
+    };
+    uint32_t generation = 0;                    // the frame the buckets belong to (a bucket of another is empty)
+    uint32_t bucket_generation[kBuckets] = {};
+    uint16_t bucket_head[kBuckets] = {};
+    uint16_t next[kLogCapacity] = {};           // the next candidate of the same bucket
+    uint16_t picked[kLogCapacity] = {};         // the candidates: indices into the Wait array, in slot order
+    Match match[kLogCapacity] = {};             // per candidate
+};
+static_assert((kLogCapacity & (kLogCapacity - 1)) == 0 && kLogCapacity < ResolveScratch::kNone,
+    "the resolver's scratch indexes the mirror with 16-bit indices and masks its hash");
+
+// Derives the candidates of one frame. `waits` and `signals` are table copies in slot order (any time order), at most
+// kLogCapacity Waits. A Wait of the
 // presenting queue counts when it was enqueued inside the frame's Present scope, or outside any scope within the
 // window; a Wait of another candidate queue when it falls inside the window. An entry older than kMaxAgeFrames
-// does not count.
+// does not count. One pass over the Waits picks the frame's candidates, one over the Signals finds each one's match,
+// the hop walk runs over the candidates in slot order, and one more pass over the Signals counts the first-hop
+// Signals since the previous frame's edge.
 void ResolveFrame(const FrameInput& input, const Entry* waits, size_t wait_count, const Entry* signals,
-    size_t signal_count, FrameResult* out) noexcept;
+    size_t signal_count, ResolveScratch* scratch, FrameResult* out) noexcept;
 
 // The FG input closes the Wait scope of this thread and frame counter. Both words are already recorded for
 // every Wait. A Wait on a different thread can make a queue a candidate, never give its Signal a frame identity.
@@ -589,12 +655,22 @@ struct BoundaryInput {
 struct PendingFrame {
     uint64_t scope = 0, presenting_queue = 0, generation = 0, epoch = 0, lost = 0;
     int64_t window_begin = 0, window_end = 0;
+    uint32_t window_counter = 0; // the frame counter of the boundary that began the window (its entries carry it)
     uint32_t current_epoch = 0;
     uint8_t mode = 1;
     bool keyed = false, rows_exact = false;
     uint8_t row_count = 0;
     Row rows[kQueueSlots];
 };
+// What the mirror must keep for the frames not resolved yet (Reader::SetNeeded): `held` the pending frames, `open` the
+// frame the next boundary will push (its window begin and frame counter; none: open_valid false), and
+// `previous_signal_qpc` where the next frame's first-hop Signal count starts (Evaluator::OldestPreviousSignalQpc;
+// 0 = none, as after a restart). Waits: from the oldest window begin on, and, for a frame of the presenting root (mode
+// 1), every Wait carrying its scope id or a later one (a scope selects Waits whatever their time). Signals: from the
+// oldest window counter minus kMaxSignalSkewFrames on (SkewOk), one frame of slack below it (an entry's clock and
+// frame counter are two plain loads), and from the previous edge's Signal on.
+Needed NeededFor(const PendingFrame* held, size_t held_count, bool open_valid, int64_t open_begin, uint32_t open_counter,
+    int64_t previous_signal_qpc) noexcept;
 // The consumer's callbacks, all on the evaluating thread under the evaluator guard.
 class FeedSink {
 public:
@@ -643,16 +719,29 @@ public:
     // Tests: the consumer's mirrors.
     const Reader& reader() const noexcept { return reader_; }
     const Evaluator& evaluator() const noexcept { return evaluator_; }
+    // The mirror against its capacity, since the feed was created: entries recorded per table, the most recorded
+    // between two pulls, the most the frames' need kept at a pull (kLogCapacity minus it = the smallest spare room),
+    // and the entries lost to the mirror (overwritten before a pull copied them, or while a frame needed them).
+    uint64_t signals_recorded() const noexcept { return signals_recorded_.load(std::memory_order_relaxed); }
+    uint64_t waits_recorded() const noexcept { return waits_recorded_.load(std::memory_order_relaxed); }
+    uint64_t pull_peak_signals() const noexcept { return pull_peak_signals_.load(std::memory_order_relaxed); }
+    uint64_t pull_peak_waits() const noexcept { return pull_peak_waits_.load(std::memory_order_relaxed); }
+    uint64_t needed_peak_signals() const noexcept { return needed_peak_signals_.load(std::memory_order_relaxed); }
+    uint64_t needed_peak_waits() const noexcept { return needed_peak_waits_.load(std::memory_order_relaxed); }
+    uint64_t signal_overrun() const noexcept { return signal_overrun_.load(std::memory_order_relaxed); }
+    uint64_t wait_overrun() const noexcept { return wait_overrun_.load(std::memory_order_relaxed); }
 
 private:
     struct ScopeRecord {
         uint64_t scope = 0;
         int64_t qpc = 0;
-        uint64_t epoch = 0; // the tables' epoch at this boundary
+        uint64_t epoch = 0;   // the tables' epoch at this boundary
+        uint32_t counter = 0; // the frame counter from this boundary on (BoundaryInput::frame_counter)
         bool keyed = false;
     };
     void Step(Tables& tables, FeedSink& sink) noexcept;
     void ResetEvaluator(FeedSink& sink, Tables& tables, bool fg_input, uint64_t baseline) noexcept;
+    void NoteMirror() noexcept; // the diagnostics above, after a successful pull
 
     // Producer (one at a time):
     ScopeRecord ring_[3];
@@ -668,13 +757,19 @@ private:
     std::atomic<uint64_t> restart_loss_{0};        // the loss counter at the latest restart
     std::atomic<uint8_t> restart_mode_{0};
     std::atomic<bool> queue_full_{false};          // a frame was dropped: the consumer restarts the window
-    std::atomic<int64_t> open_begin_{INT64_MAX};   // the window begin of the next frame to be pushed (the pull's needed-since)
+    // The next frame to be pushed (at the next boundary): its window begin and frame counter, the open part of the pull's
+    // horizon. Stored with release after head_ (the counter last); Step loads the counter, then the begin, then head_
+    // (acquire): a frame pushed at or before the boundary whose begin it read is in the queue it reads, and the counter
+    // is never of a later boundary than the begin (older is conservative).
+    std::atomic<int64_t> open_begin_{INT64_MAX};
+    std::atomic<uint32_t> open_counter_{0};
     std::atomic<uint64_t> snapshots_skipped_{0};
     std::atomic<uint64_t> boundaries_{0};          // boundaries so far: every one is followed by a pull (the cursors keep pace), frame or not
     std::atomic<uint64_t> last_lost_{0};           // the loss counter at the latest boundary (release, after its frame was queued)
     // Consumer (under `evaluating_`):
     std::atomic<bool> evaluating_{false};
     Reader reader_;
+    ResolveScratch scratch_;
     Evaluator evaluator_;
     PendingFrame held_[kBacklog];
     size_t held_count_ = 0;
@@ -685,6 +780,8 @@ private:
     Decision decision_;
     std::atomic<uint64_t> windows_{0}, frames_{0}, ambiguous_{0}, multi_edge_{0}, missing_{0}, unsignalled_{0},
         ambiguous_signals_{0}, stale_decisions_{0}, backlog_overflows_{0};
+    std::atomic<uint64_t> signals_recorded_{0}, waits_recorded_{0}, pull_peak_signals_{0}, pull_peak_waits_{0},
+        needed_peak_signals_{0}, needed_peak_waits_{0}, signal_overrun_{0}, wait_overrun_{0};
 };
 
 } // namespace gpu_queue_dependency

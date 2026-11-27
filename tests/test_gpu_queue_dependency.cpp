@@ -11,6 +11,7 @@
 #include <thread>
 #include <vector>
 #include <map>
+#include <memory>
 
 #define CHECK(value) do { if (!(value)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #value); std::abort(); } } while (false)
 
@@ -46,6 +47,17 @@ const Node* Find(const FrameResult& f, uint64_t queue) {
         if (f.nodes[i].queue == queue) return &f.nodes[i];
     return nullptr;
 }
+// The frame counter (Entry::epoch) the entries of frame f carry in the harnesses below: the counter of the boundary that
+// began the frame (Present f - 1 at qpc 1000 (f - 1) + 999; the first boundary is at -1).
+constexpr uint32_t kCounterBase = 10;
+uint32_t FrameCounter(uint32_t frame) { return kCounterBase + frame; }
+uint32_t CounterAt(int64_t boundary_qpc) { return kCounterBase + static_cast<uint32_t>((boundary_qpc + 1) / 1000); }
+// The resolver with the tests' own scratch (static: about 136 KiB; the direct resolver tests run on one thread).
+void ResolveFrame(const FrameInput& input, const Entry* waits, size_t wait_count, const Entry* signals, size_t signal_count,
+    FrameResult* out) {
+    static ResolveScratch scratch;
+    gpu_queue_dependency::ResolveFrame(input, waits, wait_count, signals, signal_count, &scratch, out);
+}
 
 void TestTablesAndReader() {
     Tables tables;
@@ -77,6 +89,12 @@ void TestTablesAndReader() {
     uint64_t lowest = UINT64_MAX;
     for (size_t i = 0; i < reader.signal_count(); ++i) if (reader.signals()[i].value < lowest) lowest = reader.signals()[i].value;
     CHECK(lowest == 4 + kLogCapacity + 100 - kLogCapacity + 1);
+    std::vector<bool> seen(kLogCapacity, false); // copied in several holds of the lock (kPullChunk each): none twice
+    for (size_t i = 0; i < reader.signal_count(); ++i) {
+        const size_t slot = static_cast<size_t>(reader.signals()[i].value - lowest);
+        CHECK(slot < kLogCapacity && !seen[slot]);
+        seen[slot] = true;
+    }
     CHECK(reader.loss() == 100 && tables.Lost() == 0);
     // Command lists per queue.
     CHECK(tables.NoteExecute(kP, 3));
@@ -698,14 +716,14 @@ void TestPublicationIsDiscardedWhenTheLockIsHeld() {
 // it is pure: the Present of frame f resolves frame f-1 (production's one-frame lag: frame f is still being recorded), the
 // frame of a Present waits in a bounded backlog (kBacklog, overflow restarts the window keeping the loss baseline) with
 // the command list counters of its own boundary (the previous Present's successful pull, else inexact), a pull
-// (skippable) copies what is new after the needed-since mark is set, the evaluator resolves the backlog in order after
-// BeginPull, a changed epoch resets the window (the first frame after it is the next Present's). The session itself
-// (RequestStop, the adopted queue and role, the law's feed) is glue state and is not covered here.
+// (skippable) copies what is new after the need is set (NeededFor, as FrameFeed::Step sets it), the evaluator resolves
+// the backlog in order after BeginPull, a changed epoch resets the window (the first frame after it is the next
+// Present's). The session itself (RequestStop, the adopted queue and role, the law's feed) is glue state and is not
+// covered here.
 struct PullHarness {
-    static constexpr size_t kBacklog = 8; // gpu_queue_probe_d3d12.cpp Dependency::kBacklog
+    static constexpr size_t kBacklog = 8; // gpu_queue_dependency.h FrameFeed::kBacklog
     struct Pending {
-        uint64_t scope;
-        int64_t begin, end;
+        PendingFrame frame; // the window, the frame counter its entries carry, the scope, the counter at its push
         std::vector<Row> rows;
         bool exact;
     };
@@ -721,18 +739,31 @@ struct PullHarness {
         reader.Pull(tables);
         evaluator.Reset(false, reader.loss());
     }
+    // Frame f as the Present of frame f + 1 pushes it: the window [1000 f, 1000 f + 999], the scope f + 1.
+    static PendingFrame Pushed(uint32_t f) {
+        PendingFrame p;
+        p.scope = f + 1;
+        p.presenting_queue = kP;
+        p.window_begin = 1000 * static_cast<int64_t>(f);
+        p.window_end = p.window_begin + 999;
+        p.window_counter = FrameCounter(f);
+        p.current_epoch = FrameCounter(f + 2);
+        p.mode = 1;
+        return p;
+    }
     // The events of one real frame: the presenting queue's Wait in its Present scope, the signalling queue's Signal of the
     // same (fence, value), and their command lists. `crowd` > 0 adds Signals of a crowded game: an early extra Signal of
     // the dependency fence (an older value) and crowd - 2 of other fences, so the frame holds `crowd` Signals.
     void RecordFrame(uint32_t frame, uint32_t lists_p = 3, uint32_t lists_m = 48, uint32_t crowd = 0) {
         const uint64_t value = 100 + frame;
         const int64_t t = 1000 * static_cast<int64_t>(frame);
-        CHECK(tables.RecordWait(E(kP, kF, value, t + 500, frame + 1)));
+        const uint32_t counter = FrameCounter(frame);
+        CHECK(tables.RecordWait(E(kP, kF, value, t + 500, frame + 1, counter)));
         if (crowd != 0) {
-            CHECK(tables.RecordSignal(E(kM, kF, value - 1, t + 50)));
-            for (uint32_t i = 0; i + 2 < crowd; ++i) CHECK(tables.RecordSignal(E(kM, kG, i, t + 60)));
+            CHECK(tables.RecordSignal(E(kM, kF, value - 1, t + 50, 0, counter)));
+            for (uint32_t i = 0; i + 2 < crowd; ++i) CHECK(tables.RecordSignal(E(kM, kG, i, t + 60, 0, counter)));
         }
-        CHECK(tables.RecordSignal(E(kM, kF, value, t + 100)));
+        CHECK(tables.RecordSignal(E(kM, kF, value, t + 100, 0, counter)));
         CHECK(tables.NoteExecute(kP, lists_p));
         CHECK(tables.NoteExecute(kM, lists_m));
     }
@@ -743,12 +774,12 @@ struct PullHarness {
         tables.ReleaseLockForTest();
     }
     void Present(uint32_t frame, bool skip_pull = false) {
-        int64_t needed = INT64_MAX;
-        if (!backlog.empty()) needed = backlog.front().begin;
-        else if (frame >= 1) needed = 1000 * static_cast<int64_t>(frame - 1); // the frame pushed below
-        const int64_t previous_signal = evaluator.OldestPreviousSignalQpc();
-        if (previous_signal != 0 && previous_signal < needed) needed = previous_signal;
-        reader.SetNeededSince(needed);
+        // The horizon: the backlog, the frame this Present pushes, and the open frame (the next one).
+        std::vector<PendingFrame> held;
+        for (const Pending& pending : backlog) held.push_back(pending.frame);
+        if (frame >= 1) held.push_back(Pushed(frame - 1));
+        reader.SetNeeded(NeededFor(held.data(), held.size(), true, 1000 * static_cast<int64_t>(frame), FrameCounter(frame),
+            evaluator.OldestPreviousSignalQpc()));
         bool pulled;
         if (skip_pull) {
             CHECK(tables.HoldLockForTest()); // the lock is held: the pull times out and is skipped
@@ -772,17 +803,16 @@ struct PullHarness {
                 evaluator.Reset(false, evaluator.pull_loss());
                 backlog.clear();
             }
-            Pending pending{frame, 1000 * static_cast<int64_t>(frame - 1), 1000 * static_cast<int64_t>(frame - 1) + 999,
-                prev_valid ? prev_rows : std::vector<Row>{}, prev_valid};
-            backlog.push_back(pending);
+            backlog.push_back(Pending{Pushed(frame - 1), prev_valid ? prev_rows : std::vector<Row>{}, prev_valid});
         }
         if (pulled) {
             evaluator.BeginPull(reader.loss(), static_cast<uint32_t>(backlog.size()));
             for (const Pending& pending : backlog) {
                 FrameInput input = Input();
-                input.scope = pending.scope;
-                input.window_begin = pending.begin;
-                input.window_end = pending.end;
+                input.scope = pending.frame.scope;
+                input.window_begin = pending.frame.window_begin;
+                input.window_end = pending.frame.window_end;
+                input.current_epoch = pending.frame.current_epoch;
                 evaluator.FillPrevious(&input, reader.epoch());
                 FrameResult result;
                 ResolveFrame(input, reader.waits(), reader.wait_count(), reader.signals(), reader.signal_count(), &result);
@@ -851,37 +881,108 @@ void TestBacklogOverflowKeepsTheLossBaseline() {
     CHECK(h.decisions.back().adoptable && h.decisions.back().queue == kM);
 }
 
-// The mirror evicting entries a pending frame needs counts as loss. Reader level: only entries at or after the needed-since
-// mark count. Production level (a crowded game): 300 Signals per frame, an early extra Signal of the dependency
-// fence among them; each pull copies fewer than the table holds, but the 512-entry mirror loses the early part of the frame
-// being resolved. Without the mark nothing would be counted and the window would qualify with the extra Signal gone; with
-// it every window fails as lost. An uncrowded run is untouched.
+// The mirror evicting entries a pending frame needs counts as loss. Reader level: only the Signals the need keeps (here from
+// the previous edge's time on) count. Production level, a crowd above the capacity: 800 Signals per frame, more than the
+// mirror holds for the frames whose Signals a pending frame's Waits may match (SkewOk), so each pull overwrites needed
+// Signals and every window fails as lost (without the need nothing would be counted and the windows would be decided on
+// incomplete logs). An uncrowded run is untouched.
 void TestMirrorEvictionOfNeededEntriesIsLoss() {
     Tables tables;
     Reader reader;
-    reader.SetNeededSince(500);
+    Needed needed;
+    needed.signal_qpc = 500;
+    reader.SetNeeded(needed);
     for (uint64_t i = 0; i < kLogCapacity; ++i) CHECK(tables.RecordSignal(E(kM, kF, i, static_cast<int64_t>(i))));
     CHECK(reader.Pull(tables) && reader.loss() == 0 && reader.signal_count() == kLogCapacity);
     // 100 more: the 100 oldest (qpc 0..99, before the mark) are overwritten: not needed, not counted.
-    for (uint64_t i = 0; i < 100; ++i) CHECK(tables.RecordSignal(E(kM, kF, 1000 + i, 1000 + static_cast<int64_t>(i))));
+    for (uint64_t i = 0; i < 100; ++i) CHECK(tables.RecordSignal(E(kM, kF, 10000 + i, 10000 + static_cast<int64_t>(i))));
     CHECK(reader.Pull(tables) && reader.loss() == 0);
     // Mark lowered to 100: the next 100 overwritten entries (qpc 100..199) are needed.
-    reader.SetNeededSince(100);
-    for (uint64_t i = 0; i < 100; ++i) CHECK(tables.RecordSignal(E(kM, kF, 2000 + i, 2000 + static_cast<int64_t>(i))));
-    CHECK(reader.Pull(tables) && reader.loss() == 100);
+    needed.signal_qpc = 100;
+    reader.SetNeeded(needed);
+    for (uint64_t i = 0; i < 100; ++i) CHECK(tables.RecordSignal(E(kM, kF, 20000 + i, 20000 + static_cast<int64_t>(i))));
+    CHECK(reader.Pull(tables) && reader.loss() == 100 && reader.signal_overrun() == 100 && reader.wait_overrun() == 0);
 
     for (int crowded = 0; crowded < 2; ++crowded) {
-        PullHarness h;
+        auto h = std::make_unique<PullHarness>();
         for (uint32_t f = 0; f <= 3 * kWindowFrames + 1; ++f) {
-            h.RecordFrame(f, 3, 48, crowded ? 300 : 0);
-            h.Present(f);
+            h->RecordFrame(f, 3, 48, crowded ? 800 : 0);
+            h->Present(f);
         }
-        CHECK(h.decisions.size() == 3);
-        for (const Decision& d : h.decisions) {
+        CHECK(h->decisions.size() == 3);
+        for (const Decision& d : h->decisions) {
             if (crowded) CHECK(!d.adoptable && d.reason == Reason::NotQualifiedLoss);
             else CHECK(d.adoptable && d.queue == kM);
         }
     }
+}
+
+// Each table by its own need (Needed). Waits: a frame reads its window's (or, with the presenting root, its scope's
+// whatever their time), so a Wait before the oldest window begin is not needed even when it is newer than the previous
+// edge's Signal (one time mark for both tables counted it, the loss of a heavily submitting game). Signals: by the frame
+// counter (a Wait matches Signals up to kMaxSignalSkewFrames apart), across its wrap, or from the previous edge's time on.
+void TestNeededHorizonPerTable() {
+    // Fills one table's mirror with `old` entries, then overwrites every one of them with `fresh` ones: the overrun.
+    const auto evict = [](const Needed& needed, bool signal, const Entry& old, const Entry& fresh) {
+        auto tables = std::make_unique<Tables>();
+        auto reader = std::make_unique<Reader>();
+        reader->SetNeeded(needed);
+        for (size_t i = 0; i < kLogCapacity; ++i) CHECK(signal ? tables->RecordSignal(old) : tables->RecordWait(old));
+        CHECK(reader->Pull(*tables) && reader->loss() == 0);
+        for (size_t i = 0; i < kLogCapacity; ++i) CHECK(signal ? tables->RecordSignal(fresh) : tables->RecordWait(fresh));
+        CHECK(reader->Pull(*tables));
+        CHECK((signal ? reader->wait_overrun() : reader->signal_overrun()) == 0);
+        return signal ? reader->signal_overrun() : reader->wait_overrun();
+    };
+    Needed window; // a pending frame's window begins at 1000; the previous edge's Signal was at 100
+    window.wait_qpc = 1000;
+    window.signal_qpc = 100;
+    CHECK(evict(window, false, E(kP, kF, 1, 500), E(kP, kF, 2, 2000)) == 0);              // Waits before the window
+    CHECK(evict(window, false, E(kP, kF, 1, 1000), E(kP, kF, 2, 2000)) == kLogCapacity);  // from its begin on
+    CHECK(evict(window, true, E(kM, kF, 1, 500), E(kM, kF, 2, 2000)) == kLogCapacity);    // Signals after the edge
+    CHECK(evict(window, true, E(kM, kF, 1, 50), E(kM, kF, 2, 2000)) == 0);
+    Needed scoped = window; // a presenting-root frame of scope 50: its Waits whatever their time
+    scoped.wait_scope = 50;
+    CHECK(evict(scoped, false, E(kP, kF, 1, 10, 50), E(kP, kF, 2, 2000)) == kLogCapacity);
+    CHECK(evict(scoped, false, E(kP, kF, 1, 10, 49), E(kP, kF, 2, 2000)) == 0);
+    Needed skew; // Signals of frame counter 20 on, no previous edge
+    skew.signal_epoch_valid = true;
+    skew.signal_epoch = 20;
+    CHECK(evict(skew, true, E(kM, kF, 1, 10, 0, 20), E(kM, kF, 2, 2000, 0, 30)) == kLogCapacity);
+    CHECK(evict(skew, true, E(kM, kF, 1, 10, 0, 19), E(kM, kF, 2, 2000, 0, 30)) == 0);
+    skew.signal_epoch = 0xFFFFFFFEu; // across the wrap: counter 1 is newer than it, 0xFFFFFFF0 older
+    CHECK(evict(skew, true, E(kM, kF, 1, 10, 0, 1), E(kM, kF, 2, 2000, 0, 30)) == kLogCapacity);
+    CHECK(evict(skew, true, E(kM, kF, 1, 10, 0, 0xFFFFFFF0u), E(kM, kF, 2, 2000, 0, 30)) == 0);
+}
+
+// The need of the frames not resolved yet (NeededFor): the oldest window begin and frame counter of the held frames and
+// the open one, the lowest scope of a presenting-root frame (scopes interleave), the previous edge's Signal; nothing
+// without frames or after a restart (no previous edge: disabled, not time 0).
+void TestNeededForCoversHeldAndOpenFrames() {
+    Needed n = NeededFor(nullptr, 0, false, 0, 0, 0);
+    CHECK(n.wait_qpc == INT64_MAX && n.wait_scope == 0 && !n.signal_epoch_valid && n.signal_qpc == INT64_MAX);
+    n = NeededFor(nullptr, 0, true, 7000, 40, 0);
+    CHECK(n.wait_qpc == 7000 && n.wait_scope == 0 && n.signal_epoch_valid && n.signal_qpc == INT64_MAX);
+    CHECK(n.signal_epoch == static_cast<uint32_t>(40 - kMaxSignalSkewFrames - 1));
+    PendingFrame held[2];
+    held[0].window_begin = 5000;
+    held[0].window_counter = 38;
+    held[0].scope = 21;
+    held[1].window_begin = 6000;
+    held[1].window_counter = 39;
+    held[1].scope = 20;
+    n = NeededFor(held, 2, true, 7000, 40, 4500);
+    CHECK(n.wait_qpc == 5000 && n.wait_scope == 20 && n.signal_qpc == 4500);
+    CHECK(n.signal_epoch_valid && n.signal_epoch == static_cast<uint32_t>(38 - kMaxSignalSkewFrames - 1));
+    // An FG input frame's scope is a (thread, counter) word, never a bound on scope ids.
+    held[0].mode = held[1].mode = 2;
+    n = NeededFor(held, 2, false, 0, 0, 0);
+    CHECK(n.wait_qpc == 5000 && n.wait_scope == 0 && n.signal_qpc == INT64_MAX);
+    // Frame counters across the wrap: 0xFFFFFFFF is older than 1 and 2.
+    held[0].window_counter = 0xFFFFFFFFu;
+    held[1].window_counter = 1;
+    n = NeededFor(held, 2, true, 7000, 2, 0);
+    CHECK(n.signal_epoch == static_cast<uint32_t>(0xFFFFFFFFu - kMaxSignalSkewFrames - 1));
 }
 
 // Command list counts aligned with the evaluated frames: the render queue does 1000 lists in the FIRST frame of the
@@ -1729,10 +1830,19 @@ bool SameDecisions(const std::vector<Decision>& a, const std::vector<Decision>& 
 void RecordScriptFrame(Tables& tables, uint32_t frame) {
     const uint64_t value = 100 + frame;
     const int64_t t = 1000 * static_cast<int64_t>(frame);
-    CHECK(tables.RecordWait(E(kP, kF, value, t + 500, frame + 1)));
-    CHECK(tables.RecordSignal(E(kM, kF, value, t + 100)));
+    CHECK(tables.RecordWait(E(kP, kF, value, t + 500, frame + 1, FrameCounter(frame))));
+    CHECK(tables.RecordSignal(E(kM, kF, value, t + 100, 0, FrameCounter(frame))));
     CHECK(tables.NoteExecute(kP, 3));
     CHECK(tables.NoteExecute(kM, 48));
+}
+// The rest of a heavily submitting game's frame: `signals` Signals of another fence by another queue and `waits` Waits of
+// another queue on a CPU-signalled fence (no queue signals it), none part of the dependency.
+void RecordTraffic(Tables& tables, uint32_t frame, uint32_t signals, uint32_t waits) {
+    const int64_t t = 1000 * static_cast<int64_t>(frame);
+    for (uint32_t i = 0; i < signals; ++i)
+        CHECK(tables.RecordSignal(E(kA, kG, 1000ull * frame + i, t + 200 + i % 300, 0, FrameCounter(frame))));
+    for (uint32_t i = 0; i < waits; ++i)
+        CHECK(tables.RecordWait(E(kB, kCpu, 1000ull * frame + i, t + 200 + i % 300, 0, FrameCounter(frame))));
 }
 void DropScriptSignal(Tables& tables, uint32_t frame) {
     CHECK(tables.HoldLockForTest());
@@ -1767,7 +1877,7 @@ struct FeedHarness {
         in.scope = scope;
         in.qpc = qpc;
         in.keyed = true;
-        in.frame_counter = 10;
+        in.frame_counter = CounterAt(qpc);
         in.mode = 1;
         in.restart = restart_next;
         restart_next = false;
@@ -1945,7 +2055,7 @@ void TestFeedRestartEvictingOnlyOldGenerationEvidenceStillQualifies() {
     CHECK(h.feed.evaluator().OldestPreviousSignalQpc() != 0 && h.feed.evaluator().OldestPreviousSignalQpc() < 5500);
     // Fill the mirror (each pull copies fewer than the table holds) with Signals of another fence, no frame involved.
     for (int chunk = 0; chunk < 2; ++chunk) {
-        for (uint64_t i = 0; i < (chunk == 0 ? 400u : 200u); ++i) CHECK(h.tables.RecordSignal(E(kM, kG, i, 5500)));
+        for (uint64_t i = 0; i < (chunk == 0 ? kLogCapacity - 200 : 400u); ++i) CHECK(h.tables.RecordSignal(E(kM, kG, i, 5500)));
         h.Boundary(0, 5200 + 100 * chunk);
         h.feed.Evaluate(h.tables, h.sink);
     }
@@ -2039,7 +2149,7 @@ void TestFeedEvaluatedOnAnotherThreadDecidesLikeInline() {
             in.scope = scope;
             in.qpc = qpc;
             in.keyed = true;
-            in.frame_counter = 10;
+            in.frame_counter = CounterAt(qpc);
             in.mode = 1;
             feed.OnBoundary(tables, in);
         };
@@ -2063,10 +2173,190 @@ void TestFeedEvaluatedOnAnotherThreadDecidesLikeInline() {
         CHECK(SameDecisions(sink.decisions, reference.sink.decisions));
     }
 }
+
+// Production volume (a game that submits heavily: about 140 Waits and 130 Signals per real frame, 180 of each here) on the
+// production feed, evaluated at every Present and at every seventh (seven frames per pull, close to a full backlog): the
+// mirror overwrites old entries every few frames, never one a pending frame needs, so every window qualifies with nothing
+// lost, and the diagnostics show the volume and the room left. A 512-entry mirror with one time mark for both tables lost
+// needed entries at a fraction of this volume.
+void TestFeedProductionVolumeLosesNothing() {
+    constexpr uint32_t kTraffic = 180, kPerFrame = kTraffic + 1, kFrames = 3 * kWindowFrames + 10;
+    for (const uint32_t lag : {0u, 7u}) {
+        auto h = std::make_unique<FeedHarness>();
+        if (lag == 0) h->feed.Evaluate(h->tables, h->sink);
+        for (uint32_t f = 0; f < kFrames; ++f) {
+            RecordTraffic(h->tables, f, kTraffic, kTraffic);
+            RecordScriptFrame(h->tables, f);
+            h->Boundary(f + 1, 1000 * static_cast<int64_t>(f) + 999);
+            if (lag == 0 || (f + 1) % lag == 0) h->feed.Evaluate(h->tables, h->sink);
+        }
+        for (int i = 0; i < 3; ++i) h->feed.Evaluate(h->tables, h->sink);
+        CHECK(h->sink.decisions.size() >= 3 && h->feed.backlog_overflows() == 0);
+        for (const Decision& d : h->sink.decisions) CHECK(d.adoptable && d.queue == kM && d.lost_records == 0);
+        CHECK(h->feed.signal_overrun() == 0 && h->feed.wait_overrun() == 0);
+        CHECK(h->feed.signals_recorded() == uint64_t{kPerFrame} * kFrames && h->feed.waits_recorded() == uint64_t{kPerFrame} * kFrames);
+        CHECK(h->feed.pull_peak_signals() >= uint64_t{kPerFrame} * (lag ? lag : 1));
+        // Every frame a pending frame's Waits may match by the frame counter is kept, with room to spare.
+        CHECK(h->feed.needed_peak_signals() >= uint64_t{kPerFrame} * (kMaxSignalSkewFrames + 1));
+        CHECK(h->feed.needed_peak_signals() < kLogCapacity && h->feed.needed_peak_waits() < kLogCapacity);
+    }
+}
+
+// The resolver as it was before the per-frame join, a scan of every Signal for every Wait: the reference the join must
+// reproduce exactly (src/gpu_queue_dependency.cpp before the change; same predicates, same order of Signals per Wait).
+bool RefFresh(const Entry& e, uint32_t current_epoch) { return static_cast<uint32_t>(current_epoch - e.epoch) <= kMaxAgeFrames; }
+bool RefSkewOk(const Entry& wait, const Entry& signal) {
+    const int32_t skew = static_cast<int32_t>(wait.epoch - signal.epoch);
+    return skew <= static_cast<int32_t>(kMaxSignalSkewFrames) && skew >= -static_cast<int32_t>(kMaxSignalSkewFrames);
+}
+Node* RefFindNode(FrameResult* frame, uint64_t queue) {
+    for (uint32_t i = 0; i < frame->count; ++i)
+        if (frame->nodes[i].queue == queue) return &frame->nodes[i];
+    return nullptr;
+}
+void ResolvePairwise(const FrameInput& input, const Entry* waits, size_t wait_count, const Entry* signals, size_t signal_count,
+    FrameResult* out) {
+    *out = FrameResult{};
+    if (!input.presenting_queue) return;
+    out->nodes[0].queue = input.presenting_queue;
+    out->count = 1;
+    for (uint32_t head = 0; head < out->count; ++head) {
+        const Node current = out->nodes[head];
+        if (current.hops >= kMaxHops) continue;
+        for (size_t i = 0; i < wait_count; ++i) {
+            const Entry& w = waits[i];
+            if (w.queue != current.queue || !RefFresh(w, input.current_epoch)) continue;
+            bool in_frame;
+            bool joined_scope = false;
+            if (current.hops == 0 && !input.fg_input) {
+                joined_scope = input.scope != 0 && w.scope == input.scope;
+                in_frame = joined_scope || (w.scope == 0 && w.qpc > input.window_begin && w.qpc <= input.window_end);
+            } else {
+                in_frame = w.qpc > input.window_begin && w.qpc <= input.window_end;
+                joined_scope = current.hops == 0 && input.scope == FgInputScope(w.thread, w.epoch);
+            }
+            if (!in_frame) continue;
+            uint64_t signaller = 0;
+            bool found = false, ambiguous = false;
+            int64_t matched_qpc = 0;
+            for (size_t j = 0; j < signal_count; ++j) {
+                const Entry& s = signals[j];
+                if (s.fence != w.fence || s.value != w.value || s.queue == w.queue || !RefFresh(s, input.current_epoch) ||
+                    !RefSkewOk(w, s))
+                    continue;
+                if (!found) { signaller = s.queue; found = true; matched_qpc = s.qpc; }
+                else if (s.queue != signaller) ambiguous = true;
+                else if (s.qpc > matched_qpc) matched_qpc = s.qpc;
+            }
+            if (!found) { ++out->unsignalled_waits; continue; }
+            if (ambiguous) {
+                ++out->ambiguous_signals;
+                if (current.hops == 0) ++out->ambiguous_signals_presenting;
+                continue;
+            }
+            if (Node* known = RefFindNode(out, signaller)) {
+                if (known->parent == current.queue && known->hops == current.hops + 1 &&
+                    (known->fence != w.fence || known->value != w.value))
+                    ++known->edges;
+                continue;
+            }
+            if (out->count >= kMaxNodes) continue;
+            Node& node = out->nodes[out->count++];
+            node.queue = signaller;
+            node.parent = current.queue;
+            node.fence = w.fence;
+            node.value = w.value;
+            node.hops = current.hops + 1;
+            node.edges = 1;
+            node.keyed = current.hops == 0 && joined_scope && input.keyed;
+            node.signal_qpc = matched_qpc;
+            if (current.hops == 0) {
+                for (uint32_t p = 0; p < input.previous_count; ++p) {
+                    const PreviousEdge& previous = input.previous[p];
+                    if (previous.queue != signaller || previous.fence != w.fence) continue;
+                    uint32_t since = 0;
+                    for (size_t j = 0; j < signal_count; ++j) {
+                        const Entry& s = signals[j];
+                        if (s.queue == signaller && s.fence == w.fence && RefFresh(s, input.current_epoch) &&
+                            s.qpc > previous.signal_qpc && s.qpc <= matched_qpc)
+                            ++since;
+                    }
+                    node.signals_since = since;
+                    node.signals_valid = true;
+                    node.value_monotonic = w.value > previous.value;
+                    break;
+                }
+            }
+        }
+    }
+}
+bool SameResult(const FrameResult& a, const FrameResult& b) {
+    if (a.count != b.count || a.ambiguous_signals != b.ambiguous_signals ||
+        a.ambiguous_signals_presenting != b.ambiguous_signals_presenting || a.unsignalled_waits != b.unsignalled_waits)
+        return false;
+    for (uint32_t i = 0; i < a.count; ++i) {
+        const Node& x = a.nodes[i];
+        const Node& y = b.nodes[i];
+        if (x.queue != y.queue || x.parent != y.parent || x.fence != y.fence || x.value != y.value || x.hops != y.hops ||
+            x.edges != y.edges || x.keyed != y.keyed || x.signal_qpc != y.signal_qpc || x.signals_since != y.signals_since ||
+            x.signals_valid != y.signals_valid || x.value_monotonic != y.value_monotonic)
+            return false;
+    }
+    return true;
+}
+
+// The per-frame join (candidate Waits hashed by (fence, value), one pass over the Signals) gives exactly the result of the
+// pairwise scan on seeded random frames dense in repeats: few queues, fences and values (shared buckets, duplicate and
+// ambiguous Signals, cycles, second paths, the hop limit), scope and window selections on both roots, aged and skewed
+// entries, previous edges, and the bucket stamps coming round inside the run. Sometimes thousands of entries per table.
+void TestResolveJoinEqualsPairwiseScan() {
+    auto scratch = std::make_unique<ResolveScratch>();
+    scratch->generation = UINT32_MAX - 3;
+    Lcg rng(0x5EED);
+    const uint64_t queues[] = {kP, kM, kA, kB, kC};
+    const uint64_t fences[] = {kF, kG, kH, kCpu};
+    std::vector<Entry> waits, signals;
+    constexpr uint32_t kCurrent = 1000;
+    const auto entry = [&]() {
+        const uint32_t epoch = rng.Below(10) == 0 ? kCurrent - 120 - rng.Below(20) : kCurrent - rng.Below(10);
+        Entry e = E(queues[rng.Below(5)], fences[rng.Below(4)], 1 + rng.Below(6), static_cast<int64_t>(rng.Below(1600)) - 300,
+            rng.Below(3) == 0 ? 7 + rng.Below(2) : 0, epoch);
+        e.thread = 1 + rng.Below(2);
+        return e;
+    };
+    for (int round = 0; round < 3000; ++round) {
+        FrameInput in;
+        in.presenting_queue = kP;
+        in.fg_input = rng.Below(3) == 0;
+        in.window_begin = 0;
+        in.window_end = 1000;
+        in.current_epoch = kCurrent;
+        in.keyed = rng.Below(2) == 0;
+        in.scope = in.fg_input ? FgInputScope(1 + rng.Below(2), kCurrent - rng.Below(6)) : 7 + rng.Below(2);
+        in.previous_count = rng.Below(4);
+        for (uint32_t p = 0; p < in.previous_count; ++p)
+            in.previous[p] = PreviousEdge{queues[1 + rng.Below(4)], fences[rng.Below(4)], 1 + rng.Below(6),
+                static_cast<int64_t>(rng.Below(1500)) - 300};
+        const uint32_t size = round % 100 == 0 ? 2000 : 200;
+        waits.resize(rng.Below(size));
+        signals.resize(rng.Below(size));
+        for (Entry& e : waits) e = entry();
+        for (Entry& e : signals) e = entry();
+        FrameResult join, reference;
+        gpu_queue_dependency::ResolveFrame(in, waits.data(), waits.size(), signals.data(), signals.size(), scratch.get(), &join);
+        ResolvePairwise(in, waits.data(), waits.size(), signals.data(), signals.size(), &reference);
+        if (!SameResult(join, reference)) std::fprintf(stderr, "round %d differs\n", round);
+        CHECK(SameResult(join, reference));
+    }
+    CHECK(scratch->generation < 3000u); // the stamps came round
+}
 } // namespace
 
 int main() {
     TestTablesAndReader();
+    TestNeededHorizonPerTable();
+    TestNeededForCoversHeldAndOpenFrames();
+    TestResolveJoinEqualsPairwiseScan();
     TestFgInputRootWindows();
     TestFgInputWaitTag();
     TestFgInputAdmittedOncePerInput();
@@ -2097,6 +2387,7 @@ int main() {
     TestFeedRestartEvictingOnlyOldGenerationEvidenceStillQualifies();
     TestFeedStaleHeldFramesDoNotOverflowTheNewGeneration();
     TestFeedEvaluatedOnAnotherThreadDecidesLikeInline();
+    TestFeedProductionVolumeLosesNothing();
     TestPartialCandidateWithEqualCountsAdoptsNothing();
     TestEpochChangeRestartsTheWindow();
     TestDecisionOfAnOldEpochIsNotPublished();

@@ -193,49 +193,86 @@ uint64_t Tables::PublishedQueue() const noexcept {
 }
 
 // ── Reader ──
-bool Reader::Pull(Tables& tables) noexcept {
-    if (!tables.TryLock(Tables::kSpinBound)) {
-        skipped_.fetch_add(1, std::memory_order_relaxed);
-        changed_ = false;
-        return false;
+namespace {
+// Copies the entries [cursor, target) of one table into its mirror, at most kPullChunk of them; `head` is the table's
+// head now. An entry the writers overwrote before it was copied, and a mirror entry `needs` keeps that a full mirror
+// overwrites, count in `overrun`.
+template <class Needs>
+void CopyChunk(const Entry* table, uint64_t head, uint64_t target, uint64_t& cursor, Entry* mirror, size_t& count,
+    size_t& next, uint64_t& overrun, const Needs& needs) noexcept {
+    if (head > cursor + kLogCapacity) { // recorded faster than copied: the oldest were overwritten
+        overrun += head - cursor - kLogCapacity;
+        cursor = head - kLogCapacity;
     }
+    const uint64_t end = target <= cursor ? cursor : target - cursor > kPullChunk ? cursor + kPullChunk : target;
+    for (; cursor < end; ++cursor) {
+        if (count == kLogCapacity && needs(mirror[next]))
+            ++overrun; // an entry a frame that is not resolved yet may need is overwritten: counted as loss
+        mirror[next] = table[cursor % kLogCapacity];
+        next = (next + 1) % kLogCapacity;
+        if (count < kLogCapacity) ++count;
+    }
+}
+} // namespace
+
+bool Reader::PullHold(Tables& tables, bool first, bool* done, uint64_t* lost) noexcept {
+    if (!tables.TryLock(Tables::kSpinBound)) return false;
     tables.SyncLocked(); // a clear that was not applied yet is applied first: the copy below is of the current epoch
     const uint64_t epoch = tables.tables_epoch_;
-    changed_ = epoch != epoch_;
-    if (changed_) { // the tables were cleared: nothing of the old lifetime stays
+    if (epoch != epoch_) { // the tables were cleared: nothing of the old lifetime stays, the copy starts over
         epoch_ = epoch;
         signal_count_ = wait_count_ = signal_next_ = wait_next_ = 0;
         signal_cursor_ = wait_cursor_ = 0;
+        change_pending_ = true;
+        first = true;
     }
-    // Only what is new since the previous pull: the lock is held for this copy, not for the evaluation.
-    uint64_t head = tables.signal_head_;
-    if (head > signal_cursor_ + kLogCapacity) { // recorded faster than copied: the oldest were overwritten
-        overrun_ += head - signal_cursor_ - kLogCapacity;
-        signal_cursor_ = head - kLogCapacity;
+    if (first) { // the pull copies up to the heads of now; what is recorded later is the next pull's
+        signal_target_ = tables.signal_head_;
+        wait_target_ = tables.wait_head_;
+        pulled_signals_ = signal_target_ - signal_cursor_;
+        pulled_waits_ = wait_target_ - wait_cursor_;
     }
-    for (; signal_cursor_ < head; ++signal_cursor_) {
-        if (signal_count_ == kLogCapacity && signals_[signal_next_].qpc >= needed_since_)
-            ++overrun_; // an entry a frame that is not resolved yet may need is overwritten: counted as loss
-        signals_[signal_next_] = tables.signals_[signal_cursor_ % kLogCapacity];
-        signal_next_ = (signal_next_ + 1) % kLogCapacity;
-        if (signal_count_ < kLogCapacity) ++signal_count_;
+    // Only what is new since the previous pull, a bounded part of it per hold: the lock is held for this copy, not for
+    // the evaluation.
+    const Needed& needed = needed_;
+    const uint64_t signal_from = signal_cursor_, wait_from = wait_cursor_;
+    CopyChunk(tables.signals_, tables.signal_head_, signal_target_, signal_cursor_, signals_, signal_count_,
+        signal_next_, signal_overrun_, [&needed](const Entry& e) noexcept { return needed.NeedsSignal(e); });
+    CopyChunk(tables.waits_, tables.wait_head_, wait_target_, wait_cursor_, waits_, wait_count_, wait_next_,
+        wait_overrun_, [&needed](const Entry& e) noexcept { return needed.NeedsWait(e); });
+    recorded_signals_ += signal_cursor_ - signal_from;
+    recorded_waits_ += wait_cursor_ - wait_from;
+    *done = signal_cursor_ >= signal_target_ && wait_cursor_ >= wait_target_;
+    if (*done) {
+        row_count_ = tables.CopyRowsLocked(rows_);
+        *lost = tables.Lost();
     }
-    head = tables.wait_head_;
-    if (head > wait_cursor_ + kLogCapacity) {
-        overrun_ += head - wait_cursor_ - kLogCapacity;
-        wait_cursor_ = head - kLogCapacity;
-    }
-    for (; wait_cursor_ < head; ++wait_cursor_) {
-        if (wait_count_ == kLogCapacity && waits_[wait_next_].qpc >= needed_since_) ++overrun_;
-        waits_[wait_next_] = tables.waits_[wait_cursor_ % kLogCapacity];
-        wait_next_ = (wait_next_ + 1) % kLogCapacity;
-        if (wait_count_ < kLogCapacity) ++wait_count_;
-    }
-    row_count_ = tables.CopyRowsLocked(rows_);
-    const uint64_t lost = tables.Lost();
     tables.Unlock();
-    loss_ = lost + overrun_;
     return true;
+}
+
+bool Reader::Pull(Tables& tables) noexcept {
+    uint64_t lost = 0;
+    bool done = false;
+    for (bool first = true; !done; first = false) {
+        if (!PullHold(tables, first, &done, &lost)) {
+            skipped_.fetch_add(1, std::memory_order_relaxed);
+            changed_ = false;
+            return false;
+        }
+    }
+    changed_ = change_pending_;
+    change_pending_ = false;
+    loss_ = lost + overrun();
+    return true;
+}
+
+void Reader::NeededOccupancy(size_t* signals, size_t* waits) const noexcept {
+    size_t s = 0, w = 0;
+    for (size_t i = 0; i < signal_count_; ++i) s += needed_.NeedsSignal(signals_[i]) ? 1 : 0;
+    for (size_t i = 0; i < wait_count_; ++i) w += needed_.NeedsWait(waits_[i]) ? 1 : 0;
+    *signals = s;
+    *waits = w;
 }
 
 // ── Resolver ──
@@ -255,20 +292,73 @@ Node* FindNode(FrameResult* frame, uint64_t queue) noexcept {
         if (frame->nodes[i].queue == queue) return &frame->nodes[i];
     return nullptr;
 }
+size_t Bucket(uint64_t fence, uint64_t value) noexcept {
+    uint64_t h = fence ^ (value * 0x9E3779B97F4A7C15ull);
+    h ^= h >> 33;
+    h *= 0xFF51AFD7ED558CCDull;
+    h ^= h >> 33;
+    return static_cast<size_t>(h) & (ResolveScratch::kBuckets - 1);
+}
 } // namespace
 
 void ResolveFrame(const FrameInput& input, const Entry* waits, size_t wait_count, const Entry* signals,
-    size_t signal_count, FrameResult* out) noexcept {
+    size_t signal_count, ResolveScratch* scratch, FrameResult* out) noexcept {
     *out = FrameResult{};
     if (!input.presenting_queue) return;
     out->nodes[0].queue = input.presenting_queue;
     out->count = 1;
+    ResolveScratch& s = *scratch;
+    if (++s.generation == 0) { // the stamps came round: no bucket of an earlier frame may look current
+        for (uint32_t& g : s.bucket_generation) g = 0;
+        s.generation = 1;
+    }
+    // The frame's candidate Waits, in slot order: inside the window, or carrying the frame's Present scope (the
+    // presenting root only). The hop walk below applies the exact rule of each hop to them.
+    size_t picked = 0;
+    const size_t wait_end = wait_count < kLogCapacity ? wait_count : kLogCapacity;
+    for (size_t i = 0; i < wait_end; ++i) {
+        const Entry& w = waits[i];
+        if (!Fresh(w, input.current_epoch)) continue;
+        const bool in_window = w.qpc > input.window_begin && w.qpc <= input.window_end;
+        const bool scoped = !input.fg_input && input.scope != 0 && w.scope == input.scope;
+        if (!in_window && !scoped) continue;
+        const size_t b = Bucket(w.fence, w.value);
+        s.next[picked] = s.bucket_generation[b] == s.generation ? s.bucket_head[b] : ResolveScratch::kNone;
+        s.bucket_generation[b] = s.generation;
+        s.bucket_head[b] = static_cast<uint16_t>(picked);
+        s.picked[picked] = static_cast<uint16_t>(i);
+        s.match[picked] = ResolveScratch::Match{0, 0, false, false};
+        ++picked;
+    }
+    // Each candidate's match, in one pass over the Signals (in slot order, so each candidate sees them in the order a
+    // scan of its own would): the queues that signalled its (fence, value), the same value, not the newest Signal of
+    // the fence.
+    if (picked != 0) {
+        for (size_t j = 0; j < signal_count; ++j) {
+            const Entry& sig = signals[j];
+            if (!Fresh(sig, input.current_epoch)) continue;
+            const size_t b = Bucket(sig.fence, sig.value);
+            if (s.bucket_generation[b] != s.generation) continue;
+            for (uint16_t k = s.bucket_head[b]; k != ResolveScratch::kNone; k = s.next[k]) {
+                const Entry& w = waits[s.picked[k]];
+                if (w.fence != sig.fence || w.value != sig.value || sig.queue == w.queue || !SkewOk(w, sig)) continue;
+                ResolveScratch::Match& m = s.match[k];
+                if (!m.found) { m.signaller = sig.queue; m.found = true; m.qpc = sig.qpc; }
+                else if (sig.queue != m.signaller) m.ambiguous = true;
+                else if (sig.qpc > m.qpc) m.qpc = sig.qpc;
+            }
+        }
+    }
+    // The first-hop nodes whose Signals since the previous frame's edge are counted after the walk.
+    struct Since { uint32_t node; uint64_t queue, fence; int64_t after, until; };
+    Since since[kMaxNodes];
+    uint32_t since_count = 0;
     for (uint32_t head = 0; head < out->count; ++head) {
         const Node current = out->nodes[head]; // by value: the array can grow below
         if (current.hops >= kMaxHops) continue;
-        for (size_t i = 0; i < wait_count; ++i) {
-            const Entry& w = waits[i];
-            if (w.queue != current.queue || !Fresh(w, input.current_epoch)) continue;
+        for (size_t k = 0; k < picked; ++k) {
+            const Entry& w = waits[s.picked[k]];
+            if (w.queue != current.queue) continue;
             bool in_frame;
             bool joined_scope = false;
             if (current.hops == 0 && !input.fg_input) {
@@ -279,26 +369,14 @@ void ResolveFrame(const FrameInput& input, const Entry* waits, size_t wait_count
                 joined_scope = current.hops == 0 && input.scope == FgInputScope(w.thread, w.epoch);
             }
             if (!in_frame) continue;
-            // The queues that signalled this (fence, value): the same value, not the newest Signal of the fence.
-            uint64_t signaller = 0;
-            bool found = false, ambiguous = false;
-            int64_t matched_qpc = 0;
-            for (size_t j = 0; j < signal_count; ++j) {
-                const Entry& s = signals[j];
-                if (s.fence != w.fence || s.value != w.value || s.queue == w.queue || !Fresh(s, input.current_epoch) ||
-                    !SkewOk(w, s))
-                    continue;
-                if (!found) { signaller = s.queue; found = true; matched_qpc = s.qpc; }
-                else if (s.queue != signaller) ambiguous = true;
-                else if (s.qpc > matched_qpc) matched_qpc = s.qpc;
-            }
-            if (!found) { ++out->unsignalled_waits; continue; }
-            if (ambiguous) {
+            const ResolveScratch::Match& m = s.match[k];
+            if (!m.found) { ++out->unsignalled_waits; continue; }
+            if (m.ambiguous) {
                 ++out->ambiguous_signals;
                 if (current.hops == 0) ++out->ambiguous_signals_presenting;
                 continue;
             }
-            if (Node* known = FindNode(out, signaller)) {
+            if (Node* known = FindNode(out, m.signaller)) {
                 // A cycle (the dependent queue waits on the presenting queue) or a second path: it adds no
                 // candidate. A second distinct (fence, value) from the same parent makes the edge ambiguous.
                 if (known->parent == current.queue && known->hops == current.hops + 1 &&
@@ -307,34 +385,38 @@ void ResolveFrame(const FrameInput& input, const Entry* waits, size_t wait_count
                 continue;
             }
             if (out->count >= kMaxNodes) continue;
-            Node& node = out->nodes[out->count++];
-            node.queue = signaller;
+            const uint32_t index = out->count++;
+            Node& node = out->nodes[index];
+            node.queue = m.signaller;
             node.parent = current.queue;
             node.fence = w.fence;
             node.value = w.value;
             node.hops = current.hops + 1;
             node.edges = 1;
             node.keyed = current.hops == 0 && joined_scope && input.keyed;
-            // Hop 1: EVERY Signal of this fence by this queue between the previous frame's matched Signal and this
-            // one's, whatever its value (exactly one is a Signal per real frame); whether the value rose is a
-            // separate check (value_monotonic).
-            node.signal_qpc = matched_qpc;
+            node.signal_qpc = m.qpc;
             if (current.hops == 0) {
                 for (uint32_t p = 0; p < input.previous_count; ++p) {
                     const PreviousEdge& previous = input.previous[p];
-                    if (previous.queue != signaller || previous.fence != w.fence) continue;
-                    uint32_t since = 0;
-                    for (size_t j = 0; j < signal_count; ++j) {
-                        const Entry& s = signals[j];
-                        if (s.queue == signaller && s.fence == w.fence && Fresh(s, input.current_epoch) &&
-                            s.qpc > previous.signal_qpc && s.qpc <= matched_qpc)
-                            ++since;
-                    }
-                    node.signals_since = since;
+                    if (previous.queue != m.signaller || previous.fence != w.fence) continue;
+                    since[since_count++] = Since{index, m.signaller, w.fence, previous.signal_qpc, m.qpc};
                     node.signals_valid = true;
                     node.value_monotonic = w.value > previous.value;
                     break;
                 }
+            }
+        }
+    }
+    // Hop 1: EVERY Signal of the fence by the queue between the previous frame's matched Signal and this one's, whatever
+    // its value (exactly one is a Signal per real frame); whether the value rose is a separate check (value_monotonic).
+    if (since_count != 0) {
+        for (size_t j = 0; j < signal_count; ++j) {
+            const Entry& sig = signals[j];
+            if (!Fresh(sig, input.current_epoch)) continue;
+            for (uint32_t i = 0; i < since_count; ++i) {
+                const Since& c = since[i];
+                if (sig.queue == c.queue && sig.fence == c.fence && sig.qpc > c.after && sig.qpc <= c.until)
+                    ++out->nodes[c.node].signals_since;
             }
         }
     }
@@ -711,6 +793,30 @@ bool MakeAdoptionSnapshot(const Decision& decision, uint64_t published_queue, Ad
     return true;
 }
 
+Needed NeededFor(const PendingFrame* held, size_t held_count, bool open_valid, int64_t open_begin, uint32_t open_counter,
+    int64_t previous_signal_qpc) noexcept {
+    Needed needed;
+    bool any = false;
+    uint32_t oldest_counter = 0;
+    const auto take = [&](int64_t begin, uint32_t counter) noexcept {
+        if (begin < needed.wait_qpc) needed.wait_qpc = begin;
+        if (!any || static_cast<int32_t>(counter - oldest_counter) < 0) oldest_counter = counter; // wraps
+        any = true;
+    };
+    for (size_t i = 0; i < held_count; ++i) {
+        const PendingFrame& f = held[i];
+        take(f.window_begin, f.window_counter);
+        if (f.mode == 1 && f.scope != 0 && (needed.wait_scope == 0 || f.scope < needed.wait_scope)) needed.wait_scope = f.scope;
+    }
+    if (open_valid) take(open_begin, open_counter);
+    if (any) {
+        needed.signal_epoch_valid = true;
+        needed.signal_epoch = oldest_counter - static_cast<uint32_t>(kMaxSignalSkewFrames) - 1u;
+    }
+    if (previous_signal_qpc != 0) needed.signal_qpc = previous_signal_qpc;
+    return needed;
+}
+
 // ── The frame feed ──
 void FrameFeed::OnBoundary(Tables& tables, const BoundaryInput& in) noexcept {
     const uint64_t lost = tables.Lost();
@@ -734,6 +840,7 @@ void FrameFeed::OnBoundary(Tables& tables, const BoundaryInput& in) noexcept {
     ring_[ring_count_].scope = in.scope;
     ring_[ring_count_].qpc = in.qpc;
     ring_[ring_count_].epoch = epoch;
+    ring_[ring_count_].counter = in.frame_counter;
     ring_[ring_count_].keyed = in.keyed;
     ++ring_count_;
     if (ring_count_ == 3 && ring_[1].scope != 0) {
@@ -749,6 +856,7 @@ void FrameFeed::OnBoundary(Tables& tables, const BoundaryInput& in) noexcept {
             f.lost = lost;            // the loss counter of this moment: what a pull at this Present would have read
             f.window_begin = ring_[0].qpc;
             f.window_end = ring_[1].qpc;
+            f.window_counter = ring_[0].counter;
             f.current_epoch = in.frame_counter;
             f.mode = in.mode;
             f.keyed = ring_[1].keyed;
@@ -761,9 +869,11 @@ void FrameFeed::OnBoundary(Tables& tables, const BoundaryInput& in) noexcept {
     // The counters of THIS boundary: the next frame's own boundary snapshot (unknown when the lock did not come free).
     prev_valid_ = tables.SnapshotRows(prev_rows_, &prev_row_count_, &prev_epoch_);
     if (!prev_valid_) snapshots_skipped_.fetch_add(1, std::memory_order_relaxed);
-    // What the next frame to be pushed (at the next boundary) will need from the mirror.
-    open_begin_.store(ring_count_ == 3 ? ring_[1].qpc : ring_count_ == 2 ? ring_[0].qpc : INT64_MAX,
-        std::memory_order_relaxed);
+    // The next frame to be pushed (at the next boundary, or the one after it while the ring fills) and the frame counter
+    // its entries carry: the begin first, the counter last, both after the push above (see open_begin_).
+    const ScopeRecord& open = ring_[ring_count_ >= 2 ? ring_count_ - 2 : 0];
+    open_begin_.store(open.qpc, std::memory_order_release);
+    open_counter_.store(open.counter, std::memory_order_release);
     // Published last: whoever reads this loss sees every frame queued up to this boundary; then the boundary counts.
     last_lost_.store(lost, std::memory_order_release);
     boundaries_.fetch_add(1, std::memory_order_release);
@@ -797,6 +907,9 @@ void FrameFeed::Step(Tables& tables, FeedSink& sink) noexcept {
     // window keeping the loss baseline of the previous pull (the loss the next pull finds still poisons the retained frames).
     uint64_t tail = tail_.load(std::memory_order_relaxed);
     const bool full = queue_full_.exchange(false, std::memory_order_acq_rel);
+    // The open frame before the head (see open_begin_): with it, the frames below cover every window not resolved yet.
+    const uint32_t open_counter = open_counter_.load(std::memory_order_acquire);
+    const int64_t open_begin = open_begin_.load(std::memory_order_acquire);
     const uint64_t head = head_.load(std::memory_order_acquire);
     const uint64_t generation = generation_.load(std::memory_order_acquire);
     if (full) { // the producer dropped a frame: everything queued is before the gap
@@ -834,13 +947,12 @@ void FrameFeed::Step(Tables& tables, FeedSink& sink) noexcept {
     // Every boundary is followed by a pull, whether it queued a frame or not, as the inline path pulled at every Present: the
     // cursors keep pace with the tables and a drop is seen at the boundary it happened in. Nothing new at all: no pull.
     if (held_count_ == 0 && !restart && boundaries == seen_boundaries_) return;
-    int64_t needed = held_count_ != 0 ? held_[0].window_begin : open_begin_.load(std::memory_order_relaxed);
     const int64_t previous_signal = restart ? 0 : evaluator_.OldestPreviousSignalQpc();
-    if (previous_signal != 0 && previous_signal < needed) needed = previous_signal;
-    reader_.SetNeededSince(needed);
+    reader_.SetNeeded(NeededFor(held_, held_count_, open_begin != INT64_MAX, open_begin, open_counter, previous_signal));
     // The mirror's overrun BEFORE this pull: a restart's baseline must not absorb what this very pull found.
     const uint64_t overrun_before = reader_.overrun();
     if (!reader_.Pull(tables)) return; // skipped and counted: the frames stay, the restart stays pending
+    NoteMirror();
     seen_boundaries_ = boundaries;
 
     const bool epoch_changed = reader_.epoch_changed();
@@ -883,7 +995,8 @@ void FrameFeed::Step(Tables& tables, FeedSink& sink) noexcept {
         input.fg_input = f.mode == 2;
         evaluator_.FillPrevious(&input, reader_.epoch()); // the previous frame's first-hop edges: Signals of the fence since them
         FrameResult frame;
-        ResolveFrame(input, reader_.waits(), reader_.wait_count(), reader_.signals(), reader_.signal_count(), &frame);
+        ResolveFrame(input, reader_.waits(), reader_.wait_count(), reader_.signals(), reader_.signal_count(), &scratch_,
+            &frame);
         const uint64_t ambiguous = evaluator_.ambiguous_frames_total(), missing = evaluator_.missing_join_frames_total(),
             unsignalled = evaluator_.unsignalled_waits_total(), ambiguous_signals = evaluator_.ambiguous_signals_total(),
             multi_edge = evaluator_.multi_edge_frames_total();
@@ -912,6 +1025,22 @@ void FrameFeed::Step(Tables& tables, FeedSink& sink) noexcept {
         }
     }
     held_count_ = 0;
+}
+
+void FrameFeed::NoteMirror() noexcept {
+    const auto raise = [](std::atomic<uint64_t>& peak, uint64_t value) noexcept {
+        if (value > peak.load(std::memory_order_relaxed)) peak.store(value, std::memory_order_relaxed);
+    };
+    signals_recorded_.store(reader_.recorded_signals(), std::memory_order_relaxed);
+    waits_recorded_.store(reader_.recorded_waits(), std::memory_order_relaxed);
+    raise(pull_peak_signals_, reader_.pulled_signals());
+    raise(pull_peak_waits_, reader_.pulled_waits());
+    size_t signals = 0, waits = 0;
+    reader_.NeededOccupancy(&signals, &waits);
+    raise(needed_peak_signals_, signals);
+    raise(needed_peak_waits_, waits);
+    signal_overrun_.store(reader_.signal_overrun(), std::memory_order_relaxed);
+    wait_overrun_.store(reader_.wait_overrun(), std::memory_order_relaxed);
 }
 
 } // namespace gpu_queue_dependency

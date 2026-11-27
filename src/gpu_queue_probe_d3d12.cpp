@@ -1052,6 +1052,17 @@ void LogDecision(const dq::Decision& d, bool kept) noexcept {
              d.multi_edge_frames, d.missing_join_frames, d.multi_signal_frames,
              static_cast<unsigned long long>(d.lost_records), static_cast<unsigned long long>(dep.loss_windows.load()),
              static_cast<unsigned long long>(dep.unjoinable_windows.load()));
+    // Which source the loss came from (a session's summary may never be logged when the game is closed in it).
+    if (d.reason == dq::Reason::NotQualifiedLoss) {
+        const auto u = [](uint64_t value) { return static_cast<unsigned long long>(value); };
+        LOG_INFO("GPU queue probe: dependency rule, records lost so far by source: dropped on a lock time-out Signals "
+                 "%llu, Waits %llu, command lists %llu; queues beyond the command list rows %llu; lost to the "
+                 "evaluator's mirror (overwritten before copied, or while a frame needed them) Signals %llu, Waits %llu; "
+                 "at most %llu Signals and %llu Waits needed at once of %llu per table",
+                 u(dep.tables.DroppedSignals()), u(dep.tables.DroppedWaits()), u(dep.tables.DroppedLists()),
+                 u(dep.tables.RowOverflow()), u(dep.feed.signal_overrun()), u(dep.feed.wait_overrun()),
+                 u(dep.feed.needed_peak_signals()), u(dep.feed.needed_peak_waits()), u(dq::kLogCapacity));
+    }
 }
 
 // A frame boundary's late identity: the root queue's Wait of the dependency fence value. Admitted
@@ -1237,7 +1248,8 @@ void DependencyDrainOnWorker() noexcept {
     dep.feed.Evaluate(dep.tables, sink);
 }
 
-// The rule's counters, logged with the cost summary when a session ends.
+// The rule's counters, logged with the cost summary when a session ends. Three lines: a log message holds at most 1023
+// characters (Log_Write), and one line cut everything after the retain counters.
 void LogDependency(const char* reason) noexcept {
     if (g_gpu_queue_probe_source.load(std::memory_order_relaxed) == 0 && dep.feed.frames() == 0) return;
     const auto counters = g_core.Statistics();
@@ -1249,13 +1261,7 @@ void LogDependency(const char* reason) noexcept {
              "command lists %llu; queues beyond the command list rows %llu; decisions discarded (changed epoch or lock "
              "time-out) %llu, of them lock time-outs %llu; Present thread pulls skipped on a lock time-out %llu (their "
              "frames were evaluated by the next pull), backlog overflows %llu; clears applied later by the next lock "
-             "holder %llu; loss windows %llu, unjoinable windows %llu; root boundaries missed while another thread fed one "
-             "%llu (each invalidated its window); unqualified windows with adoption kept %llu; queue "
-             "destructions that stopped waiting for a queue reference in flight %llu (%llu native queue references "
-             "taken and never released, on purpose); boundaries from the dependency Signal "
-             "%llu, tags %llu (%llu pushed at a keyed root boundary); "
-             "core join_ambiguous %llu, join_missing %llu, untagged_boundaries %llu, tags_unmatched %llu, "
-             "irregular_boundary_events %llu, frames_invalidated_by_irregular_boundary %llu",
+             "holder %llu; loss windows %llu, unjoinable windows %llu",
              reason, dq::RoleText(g.identity.load(std::memory_order_acquire) ? g.role.load(std::memory_order_relaxed) :
                  dq::Role::None), u(dep.feed.windows()),
              u(dep.feed.frames()), u(dep.feed.ambiguous()), u(dep.feed.multi_edge()), u(dep.feed.missing()),
@@ -1263,11 +1269,25 @@ void LogDependency(const char* reason) noexcept {
              u(dep.tables.DroppedWaits()), u(dep.tables.DroppedLists()), u(dep.tables.RowOverflow()),
              u(dep.feed.stale_decisions()), u(dep.tables.PublishTimeouts()), u(dep.feed.pulls_skipped()),
              u(dep.feed.backlog_overflows()), u(dep.tables.ClearsDeferred()), u(dep.loss_windows.load()),
-             u(dep.unjoinable_windows.load()), u(dep.missed_boundaries.load()), u(dep.windows_kept.load()),
-             u(dep.retain_timeouts.load()), u(dep.retain_leaks.load()), u(g.dep_boundaries.load()),
-             u(g.dep_tags.load()), u(g.dep_tags_late.load()), u(counters.join_ambiguous), u(counters.join_missing),
-             u(counters.untagged_boundaries), u(counters.tags_unmatched), u(counters.irregular_boundary_events),
+             u(dep.unjoinable_windows.load()));
+    LOG_INFO("GPU queue probe dependency rule (%s), boundaries and joins: root boundaries missed while another thread "
+             "fed one %llu (each invalidated its window); unqualified windows with adoption kept %llu; queue "
+             "destructions that stopped waiting for a queue reference in flight %llu (%llu native queue references "
+             "taken and never released, on purpose); boundaries from the dependency Signal %llu, tags %llu (%llu pushed "
+             "at a keyed root boundary); core join_ambiguous %llu, join_missing %llu, untagged_boundaries %llu, "
+             "tags_unmatched %llu, irregular_boundary_events %llu, frames_invalidated_by_irregular_boundary %llu",
+             reason, u(dep.missed_boundaries.load()), u(dep.windows_kept.load()), u(dep.retain_timeouts.load()),
+             u(dep.retain_leaks.load()), u(g.dep_boundaries.load()), u(g.dep_tags.load()), u(g.dep_tags_late.load()),
+             u(counters.join_ambiguous), u(counters.join_missing), u(counters.untagged_boundaries),
+             u(counters.tags_unmatched), u(counters.irregular_boundary_events),
              u(counters.frames_invalidated_by_irregular_boundary));
+    LOG_INFO("GPU queue probe dependency rule (%s), evaluator mirror of %llu entries per table: Signals recorded %llu "
+             "(at most %llu between two pulls, at most %llu needed at once), Waits recorded %llu (at most %llu between "
+             "two pulls, at most %llu needed at once); entries lost to the mirror (overwritten before copied, or while a "
+             "frame needed them): Signals %llu, Waits %llu",
+             reason, u(dq::kLogCapacity), u(dep.feed.signals_recorded()), u(dep.feed.pull_peak_signals()),
+             u(dep.feed.needed_peak_signals()), u(dep.feed.waits_recorded()), u(dep.feed.pull_peak_waits()),
+             u(dep.feed.needed_peak_waits()), u(dep.feed.signal_overrun()), u(dep.feed.wait_overrun()));
 }
 
 bool SessionEnding() noexcept {
