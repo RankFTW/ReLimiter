@@ -800,7 +800,8 @@ void ReportMarkerChange(Rule::Change change, bool was_ordering) noexcept {
                      "waits for the generated frame's Present", Rule::kRun, Rule::kEnter);
     }
     else if (change == Rule::Change::Rest) {
-        // Where no Present ever follows (hardware flip metering) this happens every few seconds: said once.
+        // Where no Present ever follows (DLSS-G's worker presents the whole batch: its flip metering path) this
+        // happens every few seconds: said once.
         static std::atomic<bool> said{false};
         if (was_ordering || !said.exchange(true, relaxed))
             LOG_INFO("FG present order: of %u markers more than %u were not followed by a Present in time; nothing "

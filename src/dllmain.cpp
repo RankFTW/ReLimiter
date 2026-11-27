@@ -697,13 +697,15 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
         // known here unless a previous load of the addon in this process resolved a display.
         PollGSyncState();
 
-        // Developer flip_metering_off: before the game's frame generation
+        // The flip-metering block (developer flip_metering_off, or no GPU with flip-metering hardware): decided
+        // outside the batch (it may load and initialize NvAPI), installed before the game's frame generation
         // resolves NvAPI_D3D12_SetFlipConfig, so not with the deferred hooks.
+        const bool flip_metering_block = FlipMetering_DecideBlock(g_config.flip_metering_off);
         {
             // One batch for the install block of init: the flip-metering block and the NGX hooks are enabled
             // by one freeze. The block's report is read after the apply.
             HookBatch batch(HookBatchSite::Init);
-            if (g_config.flip_metering_off) InstallFlipMeteringBlock();
+            if (flip_metering_block) InstallFlipMeteringBlock();
             if (g_config.dlss_info_hooks) NGXHooks_Init();
             else LOG_INFO("DLSS info hooks disabled by user config");
             batch.Apply();

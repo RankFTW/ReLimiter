@@ -457,7 +457,8 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
     HelpTip("Diagnostic, DLSS Frame Generation on GPUs with hardware flip metering (RTX 50). On hides "
         "NvAPI_D3D12_SetFlipConfig from the game, so frame generation runs as on a GPU without hardware flip "
         "metering: the display engine no longer spaces the generated frames. Takes effect at the next "
-        "game launch. Leave off with Smooth Motion, which needs flip metering.");
+        "game launch. Leave off with Smooth Motion, which needs flip metering. Where no GPU has the hardware "
+        "(RTX 40 and older) ReLimiter hides it from frame generation by itself.");
 #endif
     ImGui::Spacing();
 }
