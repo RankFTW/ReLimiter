@@ -341,6 +341,7 @@ static void TestLateWorkerCycle() {
     std::vector<uint64_t> behind;
     for (unsigned i = 0; i <= h::LateCycles; ++i) behind.push_back(Source());
     CHECK(h::epoch == binding && h::route.late_count == h::LateCycles && begins == prior_begins + 2 + h::LateCycles);
+    CHECK(h::late_most == h::LateCycles && h::late_found[h::LateCycles] > 0);
     std::thread([&] { for (const auto value : behind) Worker(value); }).join();
     CHECK(h::route.late_count == 0 && h::route.cycle.complete && h::route.previous_frame == behind.back() &&
         StreamlineHandoff_IsCurrent(binding));

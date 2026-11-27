@@ -12,7 +12,6 @@
 #include "gpu_hold_order.h"
 #include "logger.h"
 #include "pacing_resolver.h"
-#include "lead_controller.h"
 #include "bounded_mpsc_queue.h"
 #include <d3d12.h>
 #include <dxgi.h>
@@ -22,15 +21,15 @@
 
 namespace streamline_handoff {
 constexpr unsigned RequiredCycles = 4;
-// The cycles the binding carries for a worker behind the source (Route::late): any depth the pacer's own hold can
-// create. The lead spans at most LEAD_BUDGET_INTERVALS intervals from a frame's release to its frame generation
-// input (lead_controller.h), so the game can release frame n + 3 while the worker is still on frame n; a worker
-// further behind is beyond any hold and the binding ends (worker_cycles_behind). The binding holds while frame
-// generation of frame n finishes within LateCycles + 1 intervals of n's release: in Cronos at the GPU limit (RTX 4090,
-// 4x, 2026-11-27) it finished at most 2.72 I after it (p99.9 2.72 I held, 2.55 I not held), and the one late cycle
-// tolerated before revoked the binding every 0.4 s there.
+// The cycles the binding carries for a worker behind the source (Route::late). The depth is the worker's fence calls
+// on the CPU at each source Signal (late_found, ReportLateCycles; late_most in each revoked binding's record), not
+// how late frame generation's GPU work or its display is. In Cronos at the GPU limit with a separate presenter (RTX
+// 4090, 4x, 2026-11-27) it was at most 1 at every source Signal over 100 s, also right after the hold returned and
+// across frame generation turned off and on, while frame generation's GPU work finished up to 5.3 I after release
+// (that depth is the queues', not the worker's). LateCycles leaves two cycles above it; a worker further behind ends
+// the binding (worker_cycles_behind). The earlier rule, one abandoned late cycle at a time that never completed,
+// revoked the binding there every 0.4 s.
 constexpr unsigned LateCycles = 3;
-static_assert(static_cast<double>(LateCycles) >= LEAD_BUDGET_INTERVALS, "the binding carries the depth the lead spans");
 std::atomic<uint64_t> epoch{1}, authorized{0}, sequence{0};
 // The source queue whose fence-chain proof the authorized binding's hold stands on (a separate presenter's binding,
 // see Authorize), or null when it stands on none (a worker-local Present). Stored before `authorized`, read only
@@ -53,11 +52,28 @@ struct Invalidation {
     int64_t qpc = 0;
     DWORD thread = 0;
     uint64_t object = 0;
+    // A callback that lost the try-lock: the holder's thread as the call found it (0: released before it was read),
+    // the holder's site and the QPC it took the lock at.
+    DWORD holder = 0;
+    const char* holder_site = nullptr;
+    int64_t holder_since = 0;
+    // The most cycles the binding carried for a late worker (Route::late).
+    unsigned late_most = 0;
 };
 // One first-revocation record per retained binding, not a per-frame trace.
 relimiter::BoundedMpscQueue<Invalidation, 32> invalidations;
 std::atomic<ID3D12Fence*> forward_filter{nullptr}, back_filter{nullptr};
 SRWLOCK mutex = SRWLOCK_INIT;
+// The holder of `mutex`, for the record of a callback that loses the try-lock (Lock). The thread is stored last with
+// release and cleared before the release of the lock, so a reader that finds a thread finds its site and time or a
+// later holder's.
+std::atomic<DWORD> lock_holder{0};
+std::atomic<const char*> lock_site{nullptr};
+std::atomic<int64_t> lock_since{0};
+// How many cycles the binding carried for a late worker at each accepted source Signal (index: Route::late_count
+// after the Signal), since the last report; and the most the current binding carried. Written under the lock.
+std::array<std::atomic<uint64_t>, LateCycles + 1> late_found{};
+std::atomic<unsigned> late_most{0};
 struct Cycle {
     GpuPresentFgInput input{};
     int64_t begin = 0;
@@ -209,6 +225,10 @@ AdmissionStage marker_admission, present_admission, fence_admission;
 std::atomic<UINT> last_sync{0}, last_flags{0};
 int64_t last_admission_report = 0; // installer worker only
 int64_t Now() noexcept { LARGE_INTEGER value{}; QueryPerformanceCounter(&value); return value.QuadPart; }
+int64_t Frequency() noexcept {
+    static const int64_t frequency = [] { LARGE_INTEGER value{}; QueryPerformanceFrequency(&value); return value.QuadPart; }();
+    return frequency;
+}
 const char* PolicyRejection() noexcept {
     if (faulted.load(std::memory_order_acquire)) return "retained_com_fault";
     if (RuntimeLifecycle_IsStopping()) return "stopping";
@@ -221,10 +241,20 @@ const char* PolicyRejection() noexcept {
 bool Enabled() noexcept {
     return !PolicyRejection();
 }
-const char* InputRejection(const GpuPresentFgInput& input) noexcept {
-    const auto current = NativeGate_GetContext(Now());
-    if (const auto* reason = PolicyRejection()) return reason;
+// What an input is judged against. The fence callbacks and the installer pass read it before they take the lock, so
+// the locked section only compares scalars with it (the epoch is read there, at the comparison).
+struct InputContext {
+    const char* policy = nullptr;
+    NativeGateContext gate;
+    uint64_t observer = 0, prediction = 0;
+};
+InputContext ReadInputContext() noexcept {
+    return {PolicyRejection(), NativeGate_GetContext(Now()), GpuReadiness_Settings(), NativeGate_PredictionEpoch()};
+}
+const char* InputRejection(const GpuPresentFgInput& input, const InputContext& context) noexcept {
+    if (context.policy) return context.policy;
     if (input.binding != epoch.load(std::memory_order_acquire)) return "binding_epoch_changed";
+    const auto& current = context.gate;
     if (!current.observe_frame_generation) return "fg_context_not_observable";
     // FgInputRoute is published by the GPU gate from inputs this route
     // delivers, so it is never an admission requirement here.
@@ -232,10 +262,11 @@ const char* InputRejection(const GpuPresentFgInput& input) noexcept {
     if (current.swapchain_generation != input.swapchain) return "swapchain_generation_changed";
     if (current.producer_epoch != input.producer) return "marker_producer_changed";
     if (current.controller_generation != input.controller) return "controller_changed";
-    if (input.observer != GpuReadiness_Settings()) return "observer_settings_changed";
-    if (input.prediction != NativeGate_PredictionEpoch()) return "prediction_epoch_changed";
+    if (input.observer != context.observer) return "observer_settings_changed";
+    if (input.prediction != context.prediction) return "prediction_epoch_changed";
     return nullptr;
 }
+const char* InputRejection(const GpuPresentFgInput& input) noexcept { return InputRejection(input, ReadInputContext()); }
 bool Current(const GpuPresentFgInput& input) noexcept { return !InputRejection(input); }
 void ReportAdmission(bool final) noexcept {
     const auto context = NativeGate_GetContext(Now());
@@ -540,19 +571,62 @@ void ReportChain(bool final) noexcept {
     ReportChainSide("worker", a.worker);
     ReportChainSide("presenter", a.presenter);
 }
+// Installer worker, at most every five seconds: how many cycles the binding carried for a late worker at each source
+// Signal since the last report, only when the worker was behind at all, and the most the current binding carried.
+void ReportLateCycles(bool final) noexcept {
+    static int64_t last_report = 0;
+    const auto now = Now();
+    if (!final && now - last_report < Frequency() * 5) return;
+    last_report = now;
+    char counts[96] = {};
+    size_t used = 0;
+    bool behind = false;
+    for (unsigned depth = 0; depth <= LateCycles; ++depth) {
+        const auto found = late_found[depth].exchange(0, std::memory_order_relaxed);
+        behind = behind || (depth && found);
+        const int written = std::snprintf(counts + used, sizeof(counts) - used, " %u=%llu", depth,
+            static_cast<unsigned long long>(found));
+        if (written > 0) used += static_cast<size_t>(written);
+        if (used >= sizeof(counts)) used = sizeof(counts) - 1;
+    }
+    if (!behind) return;
+    LOG_INFO("Streamline GPU: frame generation's worker behind the source, source Signals by cycles late:%s; binding %llu at most %u of %u",
+        counts, static_cast<unsigned long long>(source_key.load(std::memory_order_acquire) >> 3),
+        late_most.load(std::memory_order_relaxed), LateCycles);
+}
+// Any thread: revokes the binding. The first revocation of the retained binding is recorded for the installer's log.
+void RecordInvalidation(const char* reason, uint64_t object, DWORD holder = 0, const char* holder_site = nullptr,
+    int64_t holder_since = 0) noexcept {
+    rejection.store(reason, std::memory_order_release);
+    authorized.store(0, std::memory_order_release);
+    const auto previous = epoch.fetch_add(1, std::memory_order_acq_rel);
+    if (previous == (source_key.load(std::memory_order_acquire) >> 3))
+        invalidations.Push({previous, reason, Now(), GetCurrentThreadId(), object, holder, holder_site, holder_since,
+            late_most.load(std::memory_order_relaxed)});
+}
 struct Lock {
     bool held = false;
-    explicit Lock(const char* critical_failure) noexcept {
+    // `site`: this caller, as a contended callback records its holder. `critical_failure`: a callback's revocation
+    // reason when the lock is busy; null for the installer pass, which defers.
+    Lock(const char* site, const char* critical_failure) noexcept {
         held = TryAcquireSRWLockExclusive(&mutex) != FALSE;
-        if (held) return;
+        if (held) {
+            lock_site.store(site, std::memory_order_relaxed);
+            lock_since.store(Now(), std::memory_order_relaxed);
+            lock_holder.store(GetCurrentThreadId(), std::memory_order_release);
+            return;
+        }
         if (critical_failure) {
             callback_contentions.fetch_add(1, std::memory_order_relaxed);
-            StreamlineHandoff_Invalidate(critical_failure);
+            const DWORD holder = lock_holder.load(std::memory_order_acquire);
+            RecordInvalidation(critical_failure, 0, holder, holder ? lock_site.load(std::memory_order_relaxed) : "none",
+                holder ? lock_since.load(std::memory_order_relaxed) : 0);
         } else maintenance_deferrals.fetch_add(1, std::memory_order_relaxed);
     }
     ~Lock() { Unlock(); }
     void Unlock() noexcept {
         if (held) {
+            lock_holder.store(0, std::memory_order_relaxed);
             ReleaseSRWLockExclusive(&mutex); held = false;
         }
     }
@@ -735,22 +809,17 @@ void Authorize() noexcept {
 }
 // Caller holds the lock. Completes cycles in order, oldest first: a late cycle (its source returned before the next
 // source Signal pushed it) when its worker's back Signal finished, the newest once its source has returned as well.
-// `validated`: the Service's InputRejection of the newest input, computed outside the lock. Every cycle of a binding
-// has its identity (SamePolicy at each source Signal), so that answer is each cycle's; otherwise it is computed here
-// once, when a cycle first meets every other condition.
-void CompleteCycles(const char* validated_reason = nullptr, bool validated = false) noexcept {
+// `context`: read by the caller before it took the lock; each cycle's input is judged against it.
+void CompleteCycles(const InputContext& context) noexcept {
     auto& newest = route.cycle;
     if (!newest.outer_done && newest.input.transaction &&
         completed_source_transaction.load(std::memory_order_acquire) == newest.input.transaction)
         newest.outer_done = true;
-    const char* reason = validated_reason;
-    bool judged = validated;
     for (;;) {
         auto& cycle = route.late_count ? route.late[0] : newest;
         if (cycle.complete || !cycle.outer_done || cycle.finished != 15 || cycle.begun != 15 ||
             !cycle.executions || (!cycle.callbacks && !cycle.separate) || route.epoch != epoch.load(std::memory_order_acquire)) return;
-        if (!judged) { reason = InputRejection(cycle.input); judged = true; }
-        if (reason) { Reject(nullptr, reason); return; }
+        if (const auto* reason = InputRejection(cycle.input, context)) { Reject(nullptr, reason); return; }
         if (!route.successes) { route.sites = cycle.sites; route.separate = cycle.separate; }
         else if (route.sites != cycle.sites) { Reject(nullptr, "cycle_sites_changed"); return; }
         else if (route.separate != cycle.separate) { Reject(nullptr, "cycle_presenter_changed"); return; }
@@ -797,12 +866,7 @@ bool CheckDevices(bool separate_route) noexcept {
 }
 
 void StreamlineHandoff_Invalidate(const char* reason, uint64_t object) noexcept {
-    using namespace streamline_handoff;
-    rejection.store(reason, std::memory_order_release);
-    authorized.store(0, std::memory_order_release);
-    const auto previous = epoch.fetch_add(1, std::memory_order_acq_rel);
-    if (previous == (source_key.load(std::memory_order_acquire) >> 3))
-        invalidations.Push({previous, reason, Now(), GetCurrentThreadId(), object});
+    streamline_handoff::RecordInvalidation(reason, object);
 }
 StreamlineHandoffStatus StreamlineHandoff_ReadStatus() noexcept {
     using namespace streamline_handoff;
@@ -1031,12 +1095,14 @@ StreamlineFenceCall StreamlineHandoff_BeforeFence(ID3D12CommandQueue* queue, ID3
     const bool source = scope && scope->input.transaction && !scope->invalid;
     if (!source && !StreamlineHandoff_Interested(fence)) return {};
     fence_admission.Record(site ? nullptr : "selected_plugin_site_missing");
-    Lock lock("fence_before_lock_busy");
+    // Read before the lock; the locked section compares with it.
+    const InputContext context = source ? ReadInputContext() : InputContext{};
+    Lock lock("fence_before", "fence_before_lock_busy");
     if (!lock.held) return {};
     // The worker may have finished before the outer source scope published its
     // return. Resolve that pending completion before considering a new input.
-    if (source && signal) CompleteCycles();
-    if (source && (!Current(scope->input) || scope->config != GpuPresent_GetConfig().word ||
+    if (source && signal) CompleteCycles(context);
+    if (source && (InputRejection(scope->input, context) || scope->config != GpuPresent_GetConfig().word ||
         scope->multiplier != g_fg_multiplier.load(std::memory_order_acquire))) { Reject(scope, "source_policy_changed"); return {}; }
     unsigned role = 0;
     if (source) {
@@ -1048,6 +1114,7 @@ StreamlineFenceCall StreamlineHandoff_BeforeFence(ID3D12CommandQueue* queue, ID3
                 route.sync_interval = scope->sync_interval;
                 route.cycle.input = scope->input;
                 route.first_forward = value; route.draining = true;
+                late_most.store(0, std::memory_order_relaxed);
                 if (!Retain(reinterpret_cast<IDXGISwapChain*>(scope->proxy), &route.proxy) ||
                     !Retain(queue, &route.source) || !Retain(fence, &route.forward)) { Reject(scope, "source_retain_failed"); return {}; }
                 chain.source_queue.store(queue, std::memory_order_release);
@@ -1057,6 +1124,9 @@ StreamlineFenceCall StreamlineHandoff_BeforeFence(ID3D12CommandQueue* queue, ID3
             else if (!route.cycle.complete) route.late[route.late_count++] = route.cycle; // its worker is late
             completed_source_transaction.store(0, std::memory_order_relaxed);
             route.cycle = {}; route.cycle.input = scope->input; route.cycle.forward = value; route.cycle.begin = Now();
+            late_found[route.late_count].fetch_add(1, std::memory_order_relaxed);
+            if (route.late_count > late_most.load(std::memory_order_relaxed))
+                late_most.store(route.late_count, std::memory_order_relaxed);
             separate.generation.store(scope->input.swapchain, std::memory_order_relaxed);
             separate.native.store(scope->input.native, std::memory_order_relaxed);
             // Opens this cycle's evidence.
@@ -1138,7 +1208,11 @@ void StreamlineHandoff_ProbeSourceSignal(ID3D12CommandQueue* queue) noexcept {
 void StreamlineHandoff_AfterFence(const StreamlineFenceCall& call, HRESULT result) noexcept {
     using namespace streamline_handoff;
     if (!call.role) return;
-    Lock lock("fence_after_lock_busy");
+    // Only the worker's back Signal can complete a cycle here: a late cycle once it finished, and the cycles after it.
+    // A source's own calls finish inside its scope, which has not returned yet, and a worker Wait leaves its back
+    // Signal to come. Read before the lock; the locked section compares with it.
+    const InputContext context = call.role == 4 ? ReadInputContext() : InputContext{};
+    Lock lock("fence_after", "fence_after_lock_busy");
     if (!lock.held || call.epoch != epoch.load(std::memory_order_acquire) || route.epoch != call.epoch) return;
     Cycle* const cycle = FindCycle(call.transaction);
     if (!cycle) return;
@@ -1151,8 +1225,10 @@ void StreamlineHandoff_AfterFence(const StreamlineFenceCall& call, HRESULT resul
         scope->successful_source_fences |= 1u << (call.role - 1);
     }
     cycle->finished |= 1u << (call.role - 1);
-    if (call.role == 4) worker_scope = {};
-    CompleteCycles(); // a late cycle's completion can complete the cycles after it as well
+    if (call.role == 4) {
+        worker_scope = {};
+        CompleteCycles(context);
+    }
 }
 void StreamlineHandoff_Execute(ID3D12CommandQueue* queue) noexcept {
     using namespace streamline_handoff;
@@ -1165,7 +1241,7 @@ void StreamlineHandoff_Boundary(const StreamlineBoundaryEvidence& evidence) noex
     if (evidence.stage != StreamlineBoundaryStage::Present) {
         if (evidence.stage == StreamlineBoundaryStage::DestroyQueue) VoidChain();
         if (evidence.stage == StreamlineBoundaryStage::DestroyQueue) {
-            Lock lock("queue_lifecycle_lock_busy");
+            Lock lock("queue_lifecycle", "queue_lifecycle_lock_busy");
             if (!lock.held) return;
             // Both roles must already be retained. Missing identity, incomplete
             // discovery or contention cannot prove this queue is unrelated.
@@ -1183,7 +1259,7 @@ void StreamlineHandoff_Boundary(const StreamlineBoundaryEvidence& evidence) noex
     if (!tracking.load(std::memory_order_acquire) || !worker_scope.transaction ||
         worker_scope.epoch != epoch.load(std::memory_order_acquire)) return;
     if (const auto* reason = WorkerPresentRejection(evidence)) {
-        Lock lock("worker_present_lock_busy");
+        Lock lock("worker_present", "worker_present_lock_busy");
         const Cycle* cycle = lock.held && route.epoch == epoch.load(std::memory_order_acquire) ? WorkerScopeCycle() : nullptr;
         if (cycle) RejectRoute(reason, *cycle);
         return;
@@ -1200,9 +1276,16 @@ void StreamlineHandoff_Service(bool final) noexcept {
         // the same way; the state is logged once instead (PublishSeparatePresenter).
         if (separate.published && (invalidation.reason == OtherQueuePresentReason ||
                                    invalidation.reason == PresentQueueNotWorkerReason)) continue;
-        LOG_INFO("Streamline GPU: binding invalidated epoch=%llu reason=%s qpc=%lld thread=%lu object=%llu maintenance_deferrals=%llu callback_contentions=%llu record_drops=%llu",
+        // A lost try-lock: the holder as the call found it (lock_holder=0 site=none: released before it was read).
+        char holder[112] = {};
+        if (invalidation.holder_site)
+            std::snprintf(holder, sizeof(holder), " lock_holder=%lu site=%s held_us=%.1f",
+                static_cast<unsigned long>(invalidation.holder), invalidation.holder_site,
+                invalidation.holder_since ? static_cast<double>(invalidation.qpc - invalidation.holder_since) * 1e6 /
+                    static_cast<double>(Frequency()) : 0.0);
+        LOG_INFO("Streamline GPU: binding invalidated epoch=%llu reason=%s qpc=%lld thread=%lu object=%llu late_most=%u%s maintenance_deferrals=%llu callback_contentions=%llu record_drops=%llu",
             invalidation.epoch, invalidation.reason, invalidation.qpc, invalidation.thread, invalidation.object,
-            maintenance_deferrals.load(), callback_contentions.load(), invalidations.DroppedValues());
+            invalidation.late_most, holder, maintenance_deferrals.load(), callback_contentions.load(), invalidations.DroppedValues());
     }
     // fg_present_order: its binding stands only while frame generation presents at one multiplier.
     FgPresentOrder_Service(g_fg_presenting.load(std::memory_order_acquire), g_fg_multiplier.load(std::memory_order_acquire));
@@ -1212,13 +1295,13 @@ void StreamlineHandoff_Service(bool final) noexcept {
     PublishSeparatePresenter();
     ReportChain(final);
     ReportAdmission(final); // no formatting or I/O from marker/Present/queue callbacks
+    ReportLateCycles(final);
     // Snapshot only scalars while locked. Registry/context and policy lookups
     // can overlap a critical fence callback and must not hold its SRW lock.
-    Lock snapshot_lock(nullptr);
+    Lock snapshot_lock("service_snapshot", nullptr);
     if (!snapshot_lock.held || !route.epoch) return;
     const auto binding = route.epoch;
     const auto transaction = route.cycle.input.transaction;
-    const auto input = route.cycle.input;
     // The oldest cycle not complete, for the timeout: a worker that stopped is found by its oldest cycle, whatever the
     // frame rate, not only once the newest has waited.
     const Cycle* oldest = WorkerCycle();
@@ -1226,19 +1309,20 @@ void StreamlineHandoff_Service(bool final) noexcept {
     const auto begin = oldest ? oldest->begin : 0;
     snapshot_lock.Unlock();
     const bool current = binding == epoch.load(std::memory_order_acquire);
-    const char* failure = current ? InputRejection(input) : nullptr;
-    const auto context = current && oldest_transaction && begin > 0 ? NativeGate_GetContext(Now()) : NativeGateContext{};
+    const InputContext context = current ? ReadInputContext() : InputContext{};
     // If a source replaced this cycle while validation was in flight, the
     // next service pass will inspect it. Never apply old policy to a new input.
-    Lock lock(nullptr);
+    Lock lock("service", nullptr);
     if (!lock.held || route.epoch != binding || route.cycle.input.transaction != transaction) return;
     if (current && route.epoch == epoch.load(std::memory_order_acquire)) {
-        CompleteCycles(failure, true); // consumes worker-before-source completion
+        CompleteCycles(context); // consumes worker-before-source completion
+        const char* failure = InputRejection(route.cycle.input, context);
         if (failure && route.epoch == epoch.load(std::memory_order_acquire)) Reject(nullptr, failure);
         const Cycle* stalled = WorkerCycle();
+        const auto& clock = context.gate;
         if (route.epoch == epoch.load(std::memory_order_acquire) && stalled &&
             stalled->input.transaction == oldest_transaction && stalled->begin == begin && begin > 0 &&
-            context.qpc_frequency > 0 && context.now_qpc - begin > context.qpc_frequency / 4)
+            clock.qpc_frequency > 0 && clock.now_qpc - begin > clock.qpc_frequency / 4)
             Reject(nullptr, "incomplete_cycle_timeout");
     }
     if (route.epoch != epoch.load(std::memory_order_acquire)) {
@@ -1267,7 +1351,7 @@ void StreamlineHandoff_Service(bool final) noexcept {
         pins.fetch_add(1, std::memory_order_acq_rel);
         lock.Unlock();
         const bool valid = CheckDevices(separate_route); // retained interfaces, installer worker only
-        Lock publish(nullptr); // retained pins survive a deferred device-check publication
+        Lock publish("device_publish", nullptr); // retained pins survive a deferred device-check publication
         if (publish.held && route.epoch == checked_epoch && checked_epoch == epoch.load(std::memory_order_acquire)) {
             if (!valid) Reject(nullptr, "device_validation_failed");
             else {
