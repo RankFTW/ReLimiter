@@ -306,7 +306,8 @@ static void TestSourceAdmissionUnderContention() {
 static void TestLateWorkerCycle() {
     const auto binding = h::epoch.load();
     const auto prior_begins = begins;
-    // First both worker fences are late (no retained worker yet); then just the back Signal is late.
+    // First both worker fences are late (no retained worker yet); then just the back Signal is late. The late cycle
+    // completes and counts, then the newest.
     for (const bool waited : {false,true}) {
         const auto late = Source();
         std::promise<void> ready;
@@ -322,23 +323,102 @@ static void TestLateWorkerCycle() {
             const auto current = replacement.get();
             if (waited) CHECK(Fence(&b,&back_fence,late+10000,0x140,true) == S_OK);
             else Worker(late);
-            CHECK(h::epoch == binding && h::route.cycle.begun == 3 && h::route.cycle.finished == 3);
+            CHECK(h::epoch == binding && h::route.late_count == 0 && h::route.previous_frame == late &&
+                h::route.cycle.begun == 3 && h::route.cycle.finished == 3);
             Worker(current);
         });
         worker_ready.get();
         const auto current = Source();
-        CHECK(h::epoch == binding && !h::route.cycle.complete);
+        CHECK(h::epoch == binding && !h::route.cycle.complete && h::route.late_count == 1);
         next.set_value(current); worker.join();
-        CHECK(h::route.cycle.complete && h::route.previous_frame == current && h::route.successes == (waited ? 2u : 1u));
+        CHECK(h::route.cycle.complete && h::route.previous_frame == current && h::route.successes == (waited ? 4u : 2u));
         StreamlineHandoff_Service();
     }
-    for (unsigned i = 2; i < h::RequiredCycles; ++i) Cycle();
     CHECK(begins == prior_begins && StreamlineHandoff_IsCurrent(binding));
     Cycle(); CHECK(begins == prior_begins + 1);
-    Source(); Source(); CHECK(h::epoch == binding);
+    // The worker may be LateCycles cycles behind the source: each source keeps the binding and its gate, and the
+    // worker that catches up completes every cycle, in order, without a Service pass.
+    std::vector<uint64_t> behind;
+    for (unsigned i = 0; i <= h::LateCycles; ++i) behind.push_back(Source());
+    CHECK(h::epoch == binding && h::route.late_count == h::LateCycles && begins == prior_begins + 2 + h::LateCycles);
+    std::thread([&] { for (const auto value : behind) Worker(value); }).join();
+    CHECK(h::route.late_count == 0 && h::route.cycle.complete && h::route.previous_frame == behind.back() &&
+        StreamlineHandoff_IsCurrent(binding));
+    StreamlineHandoff_Service();
+    // One more is beyond the depth the binding carries.
+    for (unsigned i = 0; i <= h::LateCycles; ++i) Source();
+    CHECK(h::epoch == binding);
     Source();
-    CHECK(!h::authorized && h::epoch != binding && std::strcmp(h::rejection.load(),"previous_cycle_incomplete") == 0);
+    CHECK(!h::authorized && h::epoch != binding && std::strcmp(h::rejection.load(),"worker_cycles_behind") == 0);
     Reset();
+
+    // The worker is on the oldest outstanding cycle: a Wait for a newer one, before or after the older one's Wait, is
+    // out of order.
+    for (const bool older_waited : {false,true}) {
+        Warm();
+        const auto ordered = h::epoch.load();
+        const auto older = Source(), newer = Source();
+        std::thread([=] {
+            if (older_waited) CHECK(Fence(&b,&forward_fence,older,0x130,false) == S_OK);
+            CHECK(Fence(&b,&forward_fence,newer,0x130,false) == S_OK);
+        }).join();
+        CHECK(h::epoch != ordered && std::strcmp(h::rejection.load(),"worker_cycle_out_of_order") == 0);
+        Reset();
+    }
+
+    // A worker-local Present on another queue inside a late cycle rejects as it does in the newest.
+    Warm();
+    {
+        const auto present_binding = h::epoch.load();
+        const auto older = Source(); Source();
+        std::thread([=] {
+            CHECK(Fence(&b,&forward_fence,older,0x130,false) == S_OK);
+            q::ObserveExecute(As<ID3D12CommandQueue>(&b),7,reinterpret_cast<ID3D12CommandList* const*>(1));
+            StreamlineHandoff_Boundary({StreamlineBoundaryStage::Present,0x1000,reinterpret_cast<uint64_t>(&c),0,1});
+        }).join();
+        CHECK(h::epoch != present_binding && std::strcmp(h::rejection.load(),"present_queue_not_worker") == 0);
+        Reset();
+    }
+
+    // A worker that stopped is found by its oldest outstanding cycle.
+    Warm();
+    Source(); Source();
+    CHECK(h::route.late_count == 1);
+    h::route.late[0].begin -= Frequency();
+    StreamlineHandoff_Service();
+    CHECK(!h::route.epoch && std::strcmp(h::rejection.load(),"incomplete_cycle_timeout") == 0);
+    Reset();
+
+    // After a revocation the next binding ignores the worker's calls for the frames before it on the worker's queue,
+    // until its own first worker Wait, and qualifies as usual. Such a value on another queue, or after that Wait,
+    // rejects.
+    for (const bool other_queue : {false,true}) {
+        Warm();
+        const auto older = Source();
+        StreamlineHandoff_Invalidate("test_revoke_with_late_worker");
+        StreamlineHandoff_Service();
+        CHECK(!h::route.epoch);
+        const auto drained = h::epoch.load();
+        const auto first = Source();
+        std::thread([=] {
+            CHECK(Fence(other_queue ? &c : &b,&forward_fence,older,0x130,false) == S_OK);
+            if (other_queue) return;
+            WorkerEvidence();
+            CHECK(Fence(&b,&back_fence,older+10000,0x140,true) == S_OK);
+            CHECK(h::epoch == drained);
+            Worker(first);
+        }).join();
+        if (other_queue) {
+            CHECK(h::epoch != drained && std::strcmp(h::rejection.load(),"forward_wait_value_mismatch") == 0);
+            Reset();
+            continue;
+        }
+        CHECK(h::epoch == drained && h::route.cycle.complete && h::route.successes == 1);
+        Source();
+        std::thread([=] { CHECK(Fence(&b,&back_fence,older+10000,0x140,true) == S_OK); }).join();
+        CHECK(h::epoch != drained && std::strcmp(h::rejection.load(),"back_signal_value_mismatch") == 0);
+        Reset();
+    }
 
     // A reused identity could make a late worker fence indistinguishable from the replacement's fence.
     enum class Reused { Frame, Forward, Back };

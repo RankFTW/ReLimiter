@@ -12,6 +12,7 @@
 #include "gpu_hold_order.h"
 #include "logger.h"
 #include "pacing_resolver.h"
+#include "lead_controller.h"
 #include "bounded_mpsc_queue.h"
 #include <d3d12.h>
 #include <dxgi.h>
@@ -21,6 +22,15 @@
 
 namespace streamline_handoff {
 constexpr unsigned RequiredCycles = 4;
+// The cycles the binding carries for a worker behind the source (Route::late): any depth the pacer's own hold can
+// create. The lead spans at most LEAD_BUDGET_INTERVALS intervals from a frame's release to its frame generation
+// input (lead_controller.h), so the game can release frame n + 3 while the worker is still on frame n; a worker
+// further behind is beyond any hold and the binding ends (worker_cycles_behind). The binding holds while frame
+// generation of frame n finishes within LateCycles + 1 intervals of n's release: in Cronos at the GPU limit (RTX 4090,
+// 4x, 2026-11-27) it finished at most 2.72 I after it (p99.9 2.72 I held, 2.55 I not held), and the one late cycle
+// tolerated before revoked the binding every 0.4 s there.
+constexpr unsigned LateCycles = 3;
+static_assert(static_cast<double>(LateCycles) >= LEAD_BUDGET_INTERVALS, "the binding carries the depth the lead spans");
 std::atomic<uint64_t> epoch{1}, authorized{0}, sequence{0};
 // The source queue whose fence-chain proof the authorized binding's hold stands on (a separate presenter's binding,
 // see Authorize), or null when it stands on none (a worker-local Present). Stored before `authorized`, read only
@@ -52,6 +62,7 @@ struct Cycle {
     GpuPresentFgInput input{};
     int64_t begin = 0;
     uint64_t forward = 0, back = 0;
+    uint64_t token = 0; // separate.cycle as this cycle's source Signal advanced it
     std::array<uint64_t, 4> sites{};
     unsigned begun = 0, finished = 0, executions = 0, callbacks = 0;
     bool outer_done = false, complete = false;
@@ -61,11 +72,17 @@ struct Cycle {
     uint32_t worker_thread = 0;
 };
 // The binding is held by identity (the proxy, the source queue, the forward and back fences, the four call sites, newer
-// frames and fence values) and by cycle order: after its source returns, one late worker cycle may be abandoned,
-// never two without a completion. The OS thread that calls the proxy Present is not part of the binding.
+// frames and fence values) and by cycle order: every cycle completes, in order, with the worker's Wait and back Signal
+// of its own values. A source Signal needs the previous source returned (its completion slot is consumed first); the
+// worker may be up to LateCycles cycles behind it (`late`, oldest first; `cycle` is the newest, the source's). The OS
+// thread that calls the proxy Present is not part of the binding.
 struct Route {
     uint64_t epoch = 0, config = 0, previous_frame = 0, previous_forward = 0, previous_back = 0;
-    struct { uint64_t frame = 0, forward = 0, back = 0; } abandoned;
+    // The values of the binding's first cycle (its source Signal and source Wait). Until the binding's first worker
+    // Wait (`draining`) the worker may still finish frames of the source cycles between the previous binding and this
+    // one: their values are below these.
+    uint64_t first_forward = 0, first_back = 0;
+    bool draining = false;
     int multiplier = 0;
     UINT sync_interval = 0;
     IDXGISwapChain* proxy = nullptr;
@@ -77,8 +94,24 @@ struct Route {
     unsigned successes = 0;
     bool device_checked = false;
     bool separate = false; // the kind of the binding's completed cycles (Cycle::separate); one kind per binding
+    std::array<Cycle, LateCycles> late{};
+    unsigned late_count = 0;
     Cycle cycle{};
 } route;
+// The cycle the worker is on: the oldest one not complete (cycles complete in order), or none. Caller holds the lock;
+// a pointer into `late` lasts until the next completion.
+Cycle* WorkerCycle() noexcept {
+    if (route.late_count) return &route.late[0];
+    return route.cycle.input.transaction && !route.cycle.complete ? &route.cycle : nullptr;
+}
+// The outstanding or newest cycle of `transaction`, or none. Caller holds the lock.
+Cycle* FindCycle(uint64_t transaction) noexcept {
+    if (!transaction) return nullptr;
+    if (route.cycle.input.transaction == transaction) return &route.cycle;
+    for (unsigned i = 0; i < route.late_count; ++i)
+        if (route.late[i].input.transaction == transaction) return &route.late[i];
+    return nullptr;
+}
 struct Marker { GpuPresentFgInput input{}; int64_t release = 0; };
 thread_local Marker marker;
 thread_local GpuPresentFgInput last_marker;
@@ -538,18 +571,17 @@ void Reject(StreamlineInputScope* scope, const char* reason) noexcept {
     if (scope) scope->invalid = true;
     StreamlineHandoff_Invalidate(reason);
 }
-// The route's identity as a separate presenter's. Caller holds the lock.
-void TagSeparate() noexcept {
+// The route's identity as a separate presenter's, from a cycle of it. Caller holds the lock.
+void TagSeparate(const GpuPresentFgInput& input) noexcept {
     constexpr auto relaxed = std::memory_order_relaxed;
-    const auto& input = route.cycle.input;
     separate.tag_native.store(input.native, relaxed); separate.tag_generation.store(input.swapchain, relaxed);
     separate.tag_producer.store(input.producer, relaxed); separate.tag_controller.store(input.controller, relaxed);
     separate.tag_multiplier.store(route.multiplier, relaxed);
     separate.evident.store(true, std::memory_order_release);
 }
-// A structural reason marks this route identity as a separate presenter's. Caller holds the lock.
-void RejectRoute(const char* reason) noexcept {
-    if (reason == OtherQueuePresentReason || reason == PresentQueueNotWorkerReason) TagSeparate();
+// A structural reason marks this route identity (of `cycle`) as a separate presenter's. Caller holds the lock.
+void RejectRoute(const char* reason, const Cycle& cycle) noexcept {
+    if (reason == OtherQueuePresentReason || reason == PresentQueueNotWorkerReason) TagSeparate(cycle.input);
     Reject(nullptr, reason);
 }
 // Installer worker: the separate-presenter capability for the current controller,
@@ -595,9 +627,11 @@ bool SamePolicy(const StreamlineInputScope& scope) noexcept {
         a.native == b.native && a.swapchain == b.swapchain && a.producer == b.producer && a.controller == b.controller &&
         a.observer == b.observer && a.prediction == b.prediction;
 }
-bool WorkerMatches() noexcept {
-    return worker_scope.epoch == route.epoch && worker_scope.transaction == route.cycle.input.transaction &&
-        worker_scope.queue == route.worker && route.cycle.worker_thread == GetCurrentThreadId();
+// The cycle this thread's worker scope is on, when the scope belongs to the binding and its worker. Caller holds the lock.
+const Cycle* WorkerScopeCycle() noexcept {
+    const Cycle* cycle = FindCycle(worker_scope.transaction);
+    return cycle && worker_scope.epoch == route.epoch && worker_scope.queue == route.worker &&
+        cycle->worker_thread == GetCurrentThreadId() ? cycle : nullptr;
 }
 // Each rejection names the check that failed; the first one of a binding is
 // logged (`binding invalidated ... reason=`). Fence checks run under the lock.
@@ -607,15 +641,16 @@ const char* SourceSignalRejection(const StreamlineInputScope& scope, ID3D12Comma
     uint64_t value, uint64_t site) noexcept {
     if (!SamePolicy(scope)) return "route_policy_mismatch";
     if (!route.cycle.complete) {
-        // Only the worker may be late. An overlapping source could still publish into the new source's completion slot.
-        if (!route.cycle.outer_done || route.abandoned.forward) return "previous_cycle_incomplete";
-        route.abandoned = {route.cycle.input.source, route.cycle.forward, route.cycle.back};
+        // The previous source must have returned: an overlapping source could still publish into the new source's
+        // completion slot. Its worker may be late, by up to LateCycles cycles.
+        if (!route.cycle.outer_done) return "previous_cycle_incomplete";
+        if (route.late_count == LateCycles) return "worker_cycles_behind";
     }
     if (route.proxy != reinterpret_cast<IDXGISwapChain*>(scope.proxy)) return "proxy_changed";
     if (route.source != queue) return "source_queue_changed";
     if (route.forward != fence) return "forward_fence_changed";
-    if (scope.input.source <= route.previous_frame || scope.input.source <= route.abandoned.frame) return "source_frame_not_newer";
-    if (value <= route.previous_forward || value <= route.abandoned.forward) return "forward_value_not_newer";
+    if (scope.input.source <= route.previous_frame || scope.input.source <= route.cycle.input.source) return "source_frame_not_newer";
+    if (value <= route.previous_forward || value <= route.cycle.forward) return "forward_value_not_newer";
     if (route.successes && route.sites[0] != site) return SiteChangedReasons[0];
     return nullptr;
 }
@@ -627,32 +662,34 @@ const char* SourceWaitRejection(const StreamlineInputScope& scope, ID3D12Command
     if (route.cycle.input.transaction != scope.input.transaction) return "source_wait_transaction_changed";
     if (route.cycle.begun & 2) return "source_wait_repeated";
     if (fence == route.forward) return "source_wait_on_forward_fence";
-    if (value <= route.previous_back || value <= route.abandoned.back) return "back_value_not_newer";
+    if (value <= route.previous_back || (route.late_count && value <= route.late[route.late_count - 1].back))
+        return "back_value_not_newer";
     return nullptr;
 }
-const char* WorkerWaitRejection(ID3D12CommandQueue* queue, uint64_t site) noexcept {
+const char* WorkerWaitRejection(ID3D12CommandQueue* queue, uint64_t site, const Cycle& cycle) noexcept {
     if (!site) return "worker_wait_site_missing";
     if (queue == route.source) return "worker_wait_on_source_queue";
-    if (route.cycle.begun & 4) return "worker_wait_repeated";
+    if (cycle.begun & 4) return "worker_wait_repeated";
     return nullptr;
 }
-// WorkerMatches(), split so the name says which part differed.
-const char* WorkerSignalRejection(ID3D12CommandQueue* queue, uint64_t site) noexcept {
+// WorkerScopeCycle(), split so the name says which part differed, for the worker's cycle `cycle`.
+const char* WorkerSignalRejection(ID3D12CommandQueue* queue, uint64_t site, const Cycle& cycle) noexcept {
     if (!site) return "worker_signal_site_missing";
-    if (worker_scope.epoch != route.epoch || worker_scope.transaction != route.cycle.input.transaction)
+    if (worker_scope.epoch != route.epoch || worker_scope.transaction != cycle.input.transaction)
         return "worker_signal_without_wait";
-    if (route.cycle.worker_thread != GetCurrentThreadId()) return "worker_signal_thread_changed";
+    if (cycle.worker_thread != GetCurrentThreadId()) return "worker_signal_thread_changed";
     if (worker_scope.queue != route.worker || queue != route.worker) return "worker_signal_queue_changed";
-    if (route.cycle.begun & 8) return "worker_signal_repeated";
-    if (!route.cycle.executions) return "worker_signal_before_execute";
+    if (cycle.begun & 8) return "worker_signal_repeated";
+    if (!cycle.executions) return "worker_signal_before_execute";
     // No worker-local Present. With a separate presenter that is the rule. Its cycle stands while present-first
     // ordering holds this source queue for the presenter's Present (fg_present_order.h); the binding is first
     // authorized only with the fence-chain proof as well, and holds only while it holds (Authorize). Otherwise the
     // cycle fails, and the failure names a separate presenter on positive evidence only: a Present of another
-    // thread and queue inside this cycle, or the ordering unit's (which does not depend on a Present falling into
-    // a cycle's span, a matter of the phase between two threads).
-    if (!route.cycle.callbacks && !FgPresentOrder_ProvesSeparatePresenter(route.source))
-        return (separate.seen_cycle.load(std::memory_order_relaxed) == separate.cycle.load(std::memory_order_relaxed) &&
+    // thread and queue since this cycle's source Signal (the newest token a Present recorded is this cycle's or a
+    // later one's), or the ordering unit's (which does not depend on a Present falling into a cycle's span, a matter
+    // of the phase between two threads).
+    if (!cycle.callbacks && !FgPresentOrder_ProvesSeparatePresenter(route.source))
+        return (cycle.token && separate.seen_cycle.load(std::memory_order_relaxed) >= cycle.token &&
                 separate.worker_queue.load(std::memory_order_relaxed) == route.worker) ||
             FgPresentOrder_Orders(route.source)
             ? OtherQueuePresentReason : "worker_signal_before_present";
@@ -664,6 +701,15 @@ const char* UnexpectedFenceRejection(ID3D12Fence* fence, bool signal) noexcept {
     if (fence == route.forward) return signal ? "forward_signal_outside_input" : "forward_wait_value_mismatch";
     if (fence == route.back) return signal ? "back_signal_value_mismatch" : "back_wait_outside_input";
     return "fence_not_in_route";
+}
+// The worker called for a cycle other than the oldest outstanding one: a newer cycle's forward Wait or back Signal.
+bool OutOfOrderWorkerCall(const Cycle& worker_cycle, ID3D12Fence* fence, uint64_t value, bool signal) noexcept {
+    const auto other = [&](const Cycle& cycle) {
+        return &cycle != &worker_cycle && !cycle.complete && cycle.input.transaction &&
+            (signal ? fence == route.back && value == cycle.back : fence == route.forward && value == cycle.forward);
+    };
+    for (unsigned i = 0; i < route.late_count; ++i) if (other(route.late[i])) return true;
+    return other(route.cycle);
 }
 const char* WorkerPresentRejection(const StreamlineBoundaryEvidence& evidence) noexcept {
     if (evidence.swapchain != worker_scope.native) return "worker_present_swapchain_changed";
@@ -687,29 +733,42 @@ void Authorize() noexcept {
     authorized_proof.store(route.separate ? route.source : nullptr, std::memory_order_release);
     authorized.store(route.epoch, std::memory_order_release);
 }
-void CompleteCycle(const char* validated_reason = nullptr, bool validated = false) noexcept {
-    auto& cycle = route.cycle;
-    if (!cycle.outer_done && cycle.input.transaction &&
-        completed_source_transaction.load(std::memory_order_acquire) == cycle.input.transaction)
-        cycle.outer_done = true;
-    if (cycle.complete || !cycle.outer_done || cycle.finished != 15 || cycle.begun != 15 ||
-        !cycle.executions || (!cycle.callbacks && !cycle.separate) || route.epoch != epoch.load(std::memory_order_acquire)) return;
-    if (const auto* reason = validated ? validated_reason : InputRejection(cycle.input)) { Reject(nullptr, reason); return; }
-    if (!route.successes) { route.sites = cycle.sites; route.separate = cycle.separate; }
-    else if (route.sites != cycle.sites) { Reject(nullptr, "cycle_sites_changed"); return; }
-    else if (route.separate != cycle.separate) { Reject(nullptr, "cycle_presenter_changed"); return; }
-    // Distinct input and consumer sites are learned from exact fence edges,
-    // not fixed RVAs, signal ordinals, thread/FPS ratios or module ownership alone.
-    if (cycle.sites[0] == cycle.sites[3] || cycle.sites[1] == cycle.sites[2]) { Reject(nullptr, "cycle_sites_not_distinct"); return; }
-    cycle.complete = true;
-    route.abandoned = {};
-    if (cycle.separate) TagSeparate();
-    else separate.evident.store(false, std::memory_order_relaxed); // a completed cycle proves the worker-local route
-    route.previous_frame = cycle.input.source;
-    route.previous_forward = cycle.forward;
-    route.previous_back = cycle.back;
-    if (route.successes < RequiredCycles) ++route.successes;
-    Authorize();
+// Caller holds the lock. Completes cycles in order, oldest first: a late cycle (its source returned before the next
+// source Signal pushed it) when its worker's back Signal finished, the newest once its source has returned as well.
+// `validated`: the Service's InputRejection of the newest input, computed outside the lock. Every cycle of a binding
+// has its identity (SamePolicy at each source Signal), so that answer is each cycle's; otherwise it is computed here
+// once, when a cycle first meets every other condition.
+void CompleteCycles(const char* validated_reason = nullptr, bool validated = false) noexcept {
+    auto& newest = route.cycle;
+    if (!newest.outer_done && newest.input.transaction &&
+        completed_source_transaction.load(std::memory_order_acquire) == newest.input.transaction)
+        newest.outer_done = true;
+    const char* reason = validated_reason;
+    bool judged = validated;
+    for (;;) {
+        auto& cycle = route.late_count ? route.late[0] : newest;
+        if (cycle.complete || !cycle.outer_done || cycle.finished != 15 || cycle.begun != 15 ||
+            !cycle.executions || (!cycle.callbacks && !cycle.separate) || route.epoch != epoch.load(std::memory_order_acquire)) return;
+        if (!judged) { reason = InputRejection(cycle.input); judged = true; }
+        if (reason) { Reject(nullptr, reason); return; }
+        if (!route.successes) { route.sites = cycle.sites; route.separate = cycle.separate; }
+        else if (route.sites != cycle.sites) { Reject(nullptr, "cycle_sites_changed"); return; }
+        else if (route.separate != cycle.separate) { Reject(nullptr, "cycle_presenter_changed"); return; }
+        // Distinct input and consumer sites are learned from exact fence edges,
+        // not fixed RVAs, signal ordinals, thread/FPS ratios or module ownership alone.
+        if (cycle.sites[0] == cycle.sites[3] || cycle.sites[1] == cycle.sites[2]) { Reject(nullptr, "cycle_sites_not_distinct"); return; }
+        cycle.complete = true;
+        if (cycle.separate) TagSeparate(cycle.input);
+        else separate.evident.store(false, std::memory_order_relaxed); // a completed cycle proves the worker-local route
+        route.previous_frame = cycle.input.source;
+        route.previous_forward = cycle.forward;
+        route.previous_back = cycle.back;
+        if (route.successes < RequiredCycles) ++route.successes;
+        Authorize();
+        if (!route.late_count) return;
+        for (unsigned i = 1; i < route.late_count; ++i) route.late[i - 1] = route.late[i];
+        route.late[--route.late_count] = {};
+    }
 }
 // `separate_route`: the worker does not present, so a compute queue is accepted for it.
 bool CheckDevices(bool separate_route) noexcept {
@@ -948,7 +1007,7 @@ StreamlineInputScope::~StreamlineInputScope() {
     if (owns_cycle) {
         // Never lose a successful outer completion to a competing callback or
         // maintenance lock. The two source calls completed on this owning thread;
-        // worker edges remain independently required by CompleteCycle under mutex.
+        // worker edges remain independently required by CompleteCycles under mutex.
         if (!failure && successful_source_fences != 3) failure = "source_fences_incomplete";
         const bool valid = !failure;
         if (valid) completed_source_transaction.store(input.transaction, std::memory_order_release);
@@ -976,7 +1035,7 @@ StreamlineFenceCall StreamlineHandoff_BeforeFence(ID3D12CommandQueue* queue, ID3
     if (!lock.held) return {};
     // The worker may have finished before the outer source scope published its
     // return. Resolve that pending completion before considering a new input.
-    if (source && signal) CompleteCycle();
+    if (source && signal) CompleteCycles();
     if (source && (!Current(scope->input) || scope->config != GpuPresent_GetConfig().word ||
         scope->multiplier != g_fg_multiplier.load(std::memory_order_acquire))) { Reject(scope, "source_policy_changed"); return {}; }
     unsigned role = 0;
@@ -988,17 +1047,20 @@ StreamlineFenceCall StreamlineHandoff_BeforeFence(ID3D12CommandQueue* queue, ID3
                 route.epoch = scope->input.binding; route.config = scope->config; route.multiplier = scope->multiplier;
                 route.sync_interval = scope->sync_interval;
                 route.cycle.input = scope->input;
+                route.first_forward = value; route.draining = true;
                 if (!Retain(reinterpret_cast<IDXGISwapChain*>(scope->proxy), &route.proxy) ||
                     !Retain(queue, &route.source) || !Retain(fence, &route.forward)) { Reject(scope, "source_retain_failed"); return {}; }
                 chain.source_queue.store(queue, std::memory_order_release);
                 chain.forward_fence.store(fence, std::memory_order_relaxed);
                 source_key.store((route.epoch << 3) | route.sync_interval, std::memory_order_release);
             } else if (const auto* reason = SourceSignalRejection(*scope, queue, fence, value, site)) { Reject(scope, reason); return {}; }
+            else if (!route.cycle.complete) route.late[route.late_count++] = route.cycle; // its worker is late
             completed_source_transaction.store(0, std::memory_order_relaxed);
             route.cycle = {}; route.cycle.input = scope->input; route.cycle.forward = value; route.cycle.begin = Now();
             separate.generation.store(scope->input.swapchain, std::memory_order_relaxed);
             separate.native.store(scope->input.native, std::memory_order_relaxed);
-            separate.cycle.fetch_add(1, std::memory_order_release); // opens this cycle's evidence
+            // Opens this cycle's evidence.
+            route.cycle.token = separate.cycle.fetch_add(1, std::memory_order_release) + 1;
             scope->owns_cycle = true; pins.fetch_add(1, std::memory_order_acq_rel);
             tracking.store(true, std::memory_order_release);
             forward_filter.store(route.forward, std::memory_order_release);
@@ -1008,6 +1070,7 @@ StreamlineFenceCall StreamlineHandoff_BeforeFence(ID3D12CommandQueue* queue, ID3
             if (!route.back) {
                 if (!Retain(fence, &route.back)) { Reject(scope, "back_retain_failed"); return {}; }
                 chain.back_fence.store(fence, std::memory_order_relaxed);
+                route.first_back = value;
             }
             else if (route.back != fence) { Reject(scope, "back_fence_changed"); return {}; }
             route.cycle.back = value; role = 2;
@@ -1015,35 +1078,44 @@ StreamlineFenceCall StreamlineHandoff_BeforeFence(ID3D12CommandQueue* queue, ID3
         }
     } else {
         if (route.epoch != epoch.load(std::memory_order_acquire)) return {};
-        if (route.abandoned.forward && (!route.worker || queue == route.worker) &&
-            ((!signal && fence == route.forward && value == route.abandoned.forward) ||
-             (signal && fence == route.back && value == route.abandoned.back))) return {};
-        if (route.cycle.complete) { Reject(nullptr, "fence_call_after_cycle_complete"); return {}; }
-        if (!signal && fence == route.forward && value == route.cycle.forward) {
-            if (const auto* reason = WorkerWaitRejection(queue, site)) { Reject(nullptr, reason); return {}; }
+        // A frame of the source cycles between the previous binding and this one: its worker Wait came before tracking
+        // started, its back Signal after this binding's first source Wait admitted the back fence. Only on the worker's
+        // known queue, with values below this binding's first cycle's, and only until this binding's first worker Wait:
+        // the worker is sequential, so from then on every call of it belongs to this binding's cycles.
+        if (route.draining && queue && queue == separate.worker_queue.load(std::memory_order_acquire) &&
+            ((!signal && fence == route.forward && value < route.first_forward) ||
+             (signal && fence == route.back && route.first_back && value < route.first_back))) return {};
+        Cycle* const cycle = WorkerCycle();
+        if (!cycle) { Reject(nullptr, "fence_call_after_cycle_complete"); return {}; }
+        if (!signal && fence == route.forward && value == cycle->forward) {
+            if (const auto* reason = WorkerWaitRejection(queue, site, *cycle)) { Reject(nullptr, reason); return {}; }
             if (!route.worker) { if (!Retain(queue, &route.worker)) { Reject(nullptr, "worker_retain_failed"); return {}; } }
             else if (route.worker != queue) { Reject(nullptr, "worker_queue_changed"); return {}; }
-            route.cycle.worker_thread = GetCurrentThreadId();
-            separate.worker_thread.store(route.cycle.worker_thread, std::memory_order_relaxed);
+            cycle->worker_thread = GetCurrentThreadId();
+            separate.worker_thread.store(cycle->worker_thread, std::memory_order_relaxed);
             separate.worker_queue.store(queue, std::memory_order_release);
             PushChainSeen(ChainRecord::Kind::WorkerSeen, queue, false);
-            worker_scope = {route.epoch, route.cycle.input.transaction, queue, route.cycle.input.native, route.cycle.input.swapchain};
+            worker_scope = {route.epoch, cycle->input.transaction, queue, cycle->input.native, cycle->input.swapchain};
+            route.draining = false;
             role = 3;
-        } else if (signal && fence == route.back && value == route.cycle.back) {
-            route.cycle.executions = worker_scope.executed;
-            route.cycle.callbacks = worker_scope.presented;
-            if (const auto* reason = WorkerSignalRejection(queue, site)) { RejectRoute(reason); return {}; }
+        } else if (signal && fence == route.back && value == cycle->back) {
+            cycle->executions = worker_scope.executed;
+            cycle->callbacks = worker_scope.presented;
+            if (const auto* reason = WorkerSignalRejection(queue, site, *cycle)) { RejectRoute(reason, *cycle); return {}; }
             // Only this transaction's worker may clear the separate-presenter evidence.
             if (worker_scope.presented) separate.evident.store(false, std::memory_order_relaxed);
             worker_scope.signaling = true; // the Present boundary, unlike Execute, is not behind the queue recursion guard
-            route.cycle.separate = !route.cycle.callbacks;
+            cycle->separate = !cycle->callbacks;
             role = 4;
-        } else { Reject(nullptr, UnexpectedFenceRejection(fence, signal)); return {}; }
+        } else if (OutOfOrderWorkerCall(*cycle, fence, value, signal)) { Reject(nullptr, "worker_cycle_out_of_order"); return {}; }
+        else { Reject(nullptr, UnexpectedFenceRejection(fence, signal)); return {}; }
     }
+    // Source calls are the newest cycle's, worker calls the oldest outstanding one's (nothing completes in between).
+    Cycle& target = role <= 2 ? route.cycle : *WorkerCycle();
     if (route.successes && route.sites[role - 1] != site) { Reject(scope, SiteChangedReasons[role - 1]); return {}; }
-    route.cycle.sites[role - 1] = site;
-    route.cycle.begun |= 1u << (role - 1);
-    const StreamlineFenceCall call{route.epoch, route.cycle.input.transaction, role};
+    target.sites[role - 1] = site;
+    target.begun |= 1u << (role - 1);
+    const StreamlineFenceCall call{route.epoch, target.input.transaction, role};
     const bool gate = role == 1 && StreamlineHandoff_IsCurrent(call.epoch);
     lock.Unlock();
     // The hook's recursion guard masks our timestamp/Wait/retirement submissions.
@@ -1067,8 +1139,9 @@ void StreamlineHandoff_AfterFence(const StreamlineFenceCall& call, HRESULT resul
     using namespace streamline_handoff;
     if (!call.role) return;
     Lock lock("fence_after_lock_busy");
-    if (!lock.held || call.epoch != epoch.load(std::memory_order_acquire) || route.epoch != call.epoch ||
-        route.cycle.input.transaction != call.transaction) return;
+    if (!lock.held || call.epoch != epoch.load(std::memory_order_acquire) || route.epoch != call.epoch) return;
+    Cycle* const cycle = FindCycle(call.transaction);
+    if (!cycle) return;
     if (result != S_OK) { Reject(nullptr, "fence_call_failed"); return; }
     if (call.role <= 2) {
         auto* scope = StreamlineInputScope::Current();
@@ -1077,9 +1150,9 @@ void StreamlineHandoff_AfterFence(const StreamlineFenceCall& call, HRESULT resul
         }
         scope->successful_source_fences |= 1u << (call.role - 1);
     }
-    route.cycle.finished |= 1u << (call.role - 1);
+    cycle->finished |= 1u << (call.role - 1);
     if (call.role == 4) worker_scope = {};
-    CompleteCycle();
+    CompleteCycles(); // a late cycle's completion can complete the cycles after it as well
 }
 void StreamlineHandoff_Execute(ID3D12CommandQueue* queue) noexcept {
     using namespace streamline_handoff;
@@ -1111,7 +1184,8 @@ void StreamlineHandoff_Boundary(const StreamlineBoundaryEvidence& evidence) noex
         worker_scope.epoch != epoch.load(std::memory_order_acquire)) return;
     if (const auto* reason = WorkerPresentRejection(evidence)) {
         Lock lock("worker_present_lock_busy");
-        if (lock.held && route.epoch == epoch.load(std::memory_order_acquire) && WorkerMatches()) RejectRoute(reason);
+        const Cycle* cycle = lock.held && route.epoch == epoch.load(std::memory_order_acquire) ? WorkerScopeCycle() : nullptr;
+        if (cycle) RejectRoute(reason, *cycle);
         return;
     }
     worker_scope.presented = true; // consumed only by the matching transaction's back Signal
@@ -1145,22 +1219,27 @@ void StreamlineHandoff_Service(bool final) noexcept {
     const auto binding = route.epoch;
     const auto transaction = route.cycle.input.transaction;
     const auto input = route.cycle.input;
-    const auto begin = route.cycle.begin;
-    const bool complete = route.cycle.complete;
+    // The oldest cycle not complete, for the timeout: a worker that stopped is found by its oldest cycle, whatever the
+    // frame rate, not only once the newest has waited.
+    const Cycle* oldest = WorkerCycle();
+    const auto oldest_transaction = oldest ? oldest->input.transaction : 0;
+    const auto begin = oldest ? oldest->begin : 0;
     snapshot_lock.Unlock();
     const bool current = binding == epoch.load(std::memory_order_acquire);
     const char* failure = current ? InputRejection(input) : nullptr;
-    const auto context = current && !complete && begin > 0 ? NativeGate_GetContext(Now()) : NativeGateContext{};
+    const auto context = current && oldest_transaction && begin > 0 ? NativeGate_GetContext(Now()) : NativeGateContext{};
     // If a source replaced this cycle while validation was in flight, the
     // next service pass will inspect it. Never apply old policy to a new input.
     Lock lock(nullptr);
     if (!lock.held || route.epoch != binding || route.cycle.input.transaction != transaction) return;
     if (current && route.epoch == epoch.load(std::memory_order_acquire)) {
-        CompleteCycle(failure, true); // consumes worker-before-source completion
+        CompleteCycles(failure, true); // consumes worker-before-source completion
         if (failure && route.epoch == epoch.load(std::memory_order_acquire)) Reject(nullptr, failure);
-        if (route.epoch == epoch.load(std::memory_order_acquire) && !route.cycle.complete &&
-            route.cycle.begin == begin && begin > 0 && context.qpc_frequency > 0 &&
-            context.now_qpc - begin > context.qpc_frequency / 4) Reject(nullptr, "incomplete_cycle_timeout");
+        const Cycle* stalled = WorkerCycle();
+        if (route.epoch == epoch.load(std::memory_order_acquire) && stalled &&
+            stalled->input.transaction == oldest_transaction && stalled->begin == begin && begin > 0 &&
+            context.qpc_frequency > 0 && context.now_qpc - begin > context.qpc_frequency / 4)
+            Reject(nullptr, "incomplete_cycle_timeout");
     }
     if (route.epoch != epoch.load(std::memory_order_acquire)) {
         if (pins.load(std::memory_order_acquire)) return;
