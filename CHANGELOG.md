@@ -1,5 +1,17 @@
 # Changelog
 
+## 4.1.6
+
+### Frame generation
+
+- **Lower latency with frame generation at a frame rate cap.** Where the GPU only just reaches the cap, ReLimiter started some frames earlier than the GPU could use, so they waited in front of it. In testing 1 to 2 ms less latency with 4x at the VRR cap, with smoothness unchanged.
+
+### Pacing preference
+
+- **Lower latency goes further.** With frame generation at a cap it now also starts each frame later, so frames wait less for the GPU. In testing 2 to 3 ms lower latency than Balanced, for a 1% low 4 to 6 fps lower and slightly less even frames.
+- **Smoother no longer adds latency at a cap the GPU only just reaches.** One of its rules cost about 12 ms there with 4x frame generation and gave nothing back; it is removed. Without a cap Smoother still gives far fewer hitches, for about 2% frame rate and 3 to 4 ms of latency.
+- **Balanced** stays the default and changes only by the latency fix above.
+
 ## 4.1.5
 
 ### Frame generation
