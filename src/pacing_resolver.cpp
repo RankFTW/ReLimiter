@@ -262,6 +262,8 @@ namespace
         std::atomic<int> unified_queue_margin_end{ kDefaultConfig.unified_queue_margin_end };
         std::atomic<int> unified_queue_allow_us{ kDefaultConfig.unified_queue_allow_us };
         std::atomic<int> fg_lead_extra_us{ kDefaultConfig.fg_lead_extra_us };
+        std::atomic<int> fg_lead_coverage{ kDefaultConfig.fg_lead_coverage };
+        std::atomic<bool> fg_lead_floor{ kDefaultConfig.fg_lead_floor };
     };
     ConfigPublication s_config;
 
@@ -281,6 +283,8 @@ namespace
         config.unified_queue_margin_end = s_config.unified_queue_margin_end.load(std::memory_order_relaxed);
         config.unified_queue_allow_us = s_config.unified_queue_allow_us.load(std::memory_order_relaxed);
         config.fg_lead_extra_us = s_config.fg_lead_extra_us.load(std::memory_order_relaxed);
+        config.fg_lead_coverage = s_config.fg_lead_coverage.load(std::memory_order_relaxed);
+        config.fg_lead_floor = s_config.fg_lead_floor.load(std::memory_order_relaxed);
         return config;
     }
 
@@ -401,7 +405,11 @@ PacingPipelineSnapshot PacingPipeline_Resolve(
     // Off and Idle resolve source only; auto_rung keeps its source-only default.
     result.rung = decision.rung;
     result.reason = decision.reason;
-    result.lead_quantile = kLeadCoverageQuantile[static_cast<size_t>(kPacingLeadCoverage)];
+    // The FG input wait's lead covers the configuration's share of its samples when it names one (developer key
+    // fg_lead_coverage, the Lower latency position's lever); every other rung, and that one at 0, the pipeline's.
+    result.lead_quantile = decision.rung == PacingRung::FgInputWait && safe_config.fg_lead_coverage > 0
+        ? static_cast<double>(safe_config.fg_lead_coverage) / 100.0
+        : kLeadCoverageQuantile[static_cast<size_t>(kPacingLeadCoverage)];
     // The FG input wait's lead carries the extra allowance of the configuration (developer key fg_lead_extra_us, the
     // Smooth position's lever); every other rung keeps the base.
     result.allowance_us = kLeadAllowanceUs +
@@ -440,6 +448,8 @@ PacingPipelineConfig PacingPipeline_ClampConfig(PacingPipelineConfig config) noe
     config.unified_queue_margin_end = std::clamp(config.unified_queue_margin_end, 0, kPacingUnifiedQueueMarginEndMax);
     config.unified_queue_allow_us = std::clamp(config.unified_queue_allow_us, 0, kPacingUnifiedQueueAllowMaxUs);
     config.fg_lead_extra_us = std::clamp(config.fg_lead_extra_us, 0, kPacingFgLeadExtraMaxUs);
+    config.fg_lead_coverage = config.fg_lead_coverage <= 0 ? kPacingFgLeadCoverageDefault
+        : std::clamp(config.fg_lead_coverage, kPacingFgLeadCoverageMin, kPacingFgLeadCoverageMax);
     // The queue law, its probe source, the stamps and the margin end are 64-bit only.
     if (sizeof(void*) != 8) {
         config.unified_hold_share = kPacingUnifiedHoldShareDefault;
@@ -476,6 +486,8 @@ void PacingPipeline_SetConfig(const PacingPipelineConfig& config) noexcept
     s_config.unified_queue_margin_end.store(safe_config.unified_queue_margin_end, std::memory_order_relaxed);
     s_config.unified_queue_allow_us.store(safe_config.unified_queue_allow_us, std::memory_order_relaxed);
     s_config.fg_lead_extra_us.store(safe_config.fg_lead_extra_us, std::memory_order_relaxed);
+    s_config.fg_lead_coverage.store(safe_config.fg_lead_coverage, std::memory_order_relaxed);
+    s_config.fg_lead_floor.store(safe_config.fg_lead_floor, std::memory_order_relaxed);
     EndWrite(&s_config.sequence, claimed);
 }
 

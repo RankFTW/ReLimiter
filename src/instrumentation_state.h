@@ -62,6 +62,10 @@ inline std::atomic<int> g_fg_flip_batch_frames{0};
 // by the scheduler owner at each plan, and the lead keeps the word with the frame. Its own initial value stays false
 // as the start limit's does: nothing is corrected before the configuration is published.
 inline std::atomic<bool> g_lead_queue_correction{false};
+// Developer key fg_lead_chain (default on, kPacingFgLeadChainDefault; lead_controller.h, the serial chain): the FG
+// input wait's lead samples leave out what the GPU's serial chain did to a frame, and its queue-order verdict stands
+// through a few concurrent pairs. Published and read as the switch above; initial value false for the same reason.
+inline std::atomic<bool> g_fg_lead_chain{false};
 // Developer switch gpu_wait_present_first (default on, kPacingGpuWaitPresentFirstDefault; gpu_hold_order.h): in a
 // game whose render queue is not its presenting queue, the render queue's next frame waits until a held frame's
 // Present has become runnable, and the collision guard stands aside for the frames so ordered

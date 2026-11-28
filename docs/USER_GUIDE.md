@@ -243,13 +243,13 @@ Games that do not call the Reflex Sleep and NVIDIA Smooth Motion wait only at th
 | Choice | What it does |
 |--------|--------------|
 | **Balanced** (default) | The recommended behaviour. |
-| **Smoother** | With DLSS frame generation. At a cap the GPU can hold, starts each frame 1 ms earlier so fewer frames arrive late: fewer hitches for up to about 1.5 ms more latency. With 2x and no cap the GPU can hold, gives up about 3% frame rate for more even frames and fewer hitches. No effect without frame generation. |
-| **Lower latency** | Keeps less work waiting for the GPU. In testing up to about 2 ms lower latency; in some games a slightly lower frame rate and less even frames. |
+| **Smoother** | With DLSS frame generation. With no cap the GPU can hold, gives up about 2% frame rate and 3 to 4 ms of latency for more even frames and far fewer hitches. At a cap the GPU can hold, starts each frame 1 ms earlier so fewer frames arrive late, for up to about 1.5 ms more latency. No effect without frame generation. |
+| **Lower latency** | Keeps less work waiting for the GPU. With DLSS frame generation at a cap it also starts each frame later, so more frames arrive late. In testing 2 to 3 ms lower latency at a cap, with a 1% low 4 to 6 fps lower and slightly less even frames; in some games a slightly lower frame rate. |
 
 When to use which:
 
 - Stay on **Balanced** unless something bothers you.
-- Try **Smoother** with frame generation when frames still hitch: at a cap the game holds, without a cap, or when the game cannot hold your cap.
+- Try **Smoother** with frame generation when frames still hitch, above all without a cap or when the game cannot hold your cap.
 - Try **Lower latency** when input delay matters more to you than the last bit of evenness.
 
 The INI key is `pacing_preference` under `[FrameLimiter]`: `latency`, `balanced` (default) or `smooth`. With `developer_settings=true`, a developer key set away from its default decides its own value and the panel then says that a developer setting overrides the selected position.

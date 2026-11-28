@@ -263,6 +263,68 @@ constexpr size_t LEAD_CONCURRENCY_SAMPLES = 64;
 // pairs start p50 0.7-0.9 ms before the Signal.
 constexpr double LEAD_CONCURRENCY_TOLERANCE_US = 100.0;
 
+// Serial chain (developer key fg_lead_chain, default on; the FG input wait only). Behind the wait a frame's heavy
+// GPU work cannot start before the GPU passed frame n − 1's gate (f, SampleUs), so what that chain did to a frame is
+// not the lead's to cover: a lead that learns it starts no GPU work earlier, the frame's work waits that much
+// longer in front of the GPU and PC latency rises with it. Phantom Blade Zero, frame generation 4× at the display's
+// VRR cap of 157, which the GPU just reaches (need 24.2 ms of the 25.48 ms interval; the next frame's GPU start
+// 4.97 ms after each release, p1 to p90 4.75 to 5.09): the lead stood at 61 to 63 ms, simulation start → GPU start
+// was 22.2 ms against 10.1 with ReLimiter passive at the same frame rate, PC latency 68.9 ms against 56.6. Two
+// things fed the lead what the chain did:
+// - An early start. On 16 to 18 frames of 1,500, at the same places of the route in every run, the game submits a
+//   first job at the frame's start and the driver runs it while frame n − 1 is still rendering: the report's GPU
+//   start lies 17 to 22 ms before f. That is a concurrent pair, which ended the FG output's verdict for the next 64
+//   pairs (5 to 6 times a run, 14 to 15 s of 64) and put every frame's wait for the previous frame back into the
+//   samples. And the frame's span then covers frame n − 1's work: span − A read 23 ms (p50) where the GPU never
+//   waited for a submission, so the frame kept its measured readiness as one whose own submissions set it
+//   (SampleUs), which is the lead it had plus its lateness and follows the lead.
+// - Lateness on the chain. A frame whose work waited for frame n − 1 and whose GPU time did not fit the rest of the
+//   interval is late whatever its lead (40 to 45% of that run's frames), and its sample a + (r − f) asked for that
+//   lateness as lead.
+// With the key on, for the FG input wait's frames planned with it (LeadRequest::serial_chain, carried as
+// LeadGuardOutcome::serial_chain and PendingFrame::serial_chain: a frame's sample is judged by its own plan's
+// word, whatever the key says when its report arrives; the plan-time readers, the spike floor and the
+// diagnostics, take the newest FG plan's):
+// - The verdict "behind the wait" stands while at most LEAD_FG_CONCURRENT_TOLERATED of the newest
+//   LEAD_CONCURRENCY_SAMPLES pairs are concurrent. It describes where the frames' heavy work runs, and a game that
+//   runs it beside the wait shows it on most pairs (Rogue Core 72–94%), not on one in 90. The GPU queue wait's
+//   verdict keeps the rule above: there the collision guard reads it.
+// - A frame whose GPU start lies more than LEAD_CONCURRENCY_TOLERANCE_US before f is not asked for idle inside its
+//   span (the span is not this frame's alone): its sample leaves out the wait for frame n − 1 like any other.
+// - A frame whose work waited for frame n − 1, which did not keep its readiness and whose report came, counts its
+//   readiness only up to T' = max(T, f + I), the later of its output target and one interval after f:
+//   X = max(p, min(r, T') − d) − s. What came after is the chain's. The gate holds a frame behind a late one to
+//   the previous output plus the interval less a slack at the latest (the spacing floor, cadence_grid.h), which
+//   f + I covers: a frame that made its own gate is never cut, and behind a late frame the sample stays the
+//   frame's own work, up to one interval. The frame's own release o is not the limit: behind a late frame it can
+//   stay at T (the lead limit, the horizon, the render thread check), and T − f shrinks by that frame's lateness.
+//   A frame closed without its report leaves d out as built and is not cut: nothing shows whose its lateness was.
+//   The early start is judged against f, the pair against the release o; where a pair exists (frame n − 1 waited
+//   at its gate) the two are the same instant.
+// The spike floor, the render queue q, the saturation rule and the kept readiness of a frame whose own submissions
+// set it (the GPU idled for them after it had started the frame behind f) are unchanged. Known and accepted: the
+// frame before an early start reads idle too (the driver shortens its active time by the overlap; 16 to 18 of
+// 1,500) and keeps its measured readiness, less its reported queue wait under the saturation rule; telling it
+// needs the next frame's report, which arrives after its sample. The bucket's median (MedianSampleUs, the legacy
+// planning branch's source slack) follows the samples as they are cut.
+// Replayed open loop on those captures (the samples of two runs, the verdict steady): the own lead 58.9 and
+// 61.9 ms as built, 53.0 and 53.5 ms with the three rules; at a cap of 104 with frame generation 3×, where the GPU
+// has room (need 23.1 ms of 28.85), 57.3 ms as built and 56.3 ms.
+// Live, the key off against on inside one launch (ABBA, four runs an arm), on another route of that game where the
+// early starts are 2 to 3 a run, with the readiness cut at T (the limit T' and the report's condition came after,
+// from review). Frame generation 4× at the VRR cap: the verdict ended 3 times in the off runs and
+// never in the on runs; the lead 56.0 → 54.3 ms (own 55.2 → 53.6, the spike floor sets it from there), PC latency
+// 63.9 → 62.2 ms (by pair −1.7, standard error 0.8; −1.3 and −1.1 in an earlier launch), the 1% low 106.7 and
+// 107.7 fps, the displayed frame-to-frame change 0.17 ms in both, hitches 17.5 and 19.8 a minute (by pair +2.3,
+// standard error 1.3). Frame generation 3× at a cap of 104 (need 23.6 ms of 28.85): the verdict ended 12 times off
+// and never on; the lead 56.9 and 56.8 ms, PC latency 65.7 and 65.0 ms, the 1% low 89.9 and 89.3 fps, the change
+// 0.10 and 0.11 ms, hitches 3.05 a minute in both: no difference shown. With the limit T' and the report's
+// condition, same route, two runs an arm in mirrored order: 4× at the VRR cap PC latency 64.0 → 62.2 ms, the 1% low
+// 105.9 and 106.6 fps, hitches 18.3 and 19.8 a minute; 3× at the cap of 104, 65.5 → 64.3 ms, the 1% low 93.4 and
+// 91.6 fps, hitches 0.0 and 0.8 a minute. Not measured live on the route the cause was found on, nor in a game
+// whose frames are held first (Gears of War: E-Day).
+constexpr size_t LEAD_FG_CONCURRENT_TOLERATED = 4;
+
 // Present-first ordering (developer key gpu_wait_present_first, default on; gpu_hold_order.h; design in
 // project-docs/002_unified_pacing_timing/foundation/design_present_first_hold.md). The queue order above is
 // inferred from the pairs, and a game whose render queue is not its presenting queue (Rogue Core through
@@ -624,6 +686,9 @@ struct LeadGuardOutcome {
     // render queue (above), set for GPU queue wait plans only. Kept with the frame (PendingFrame::queue_correction),
     // so its lead sample is decided at its plan, whatever the key says when the sample is judged.
     bool queue_correction = false;
+    // Serial chain (above; LeadRequest::serial_chain): the plan's word, set for FG input wait plans only. Kept with
+    // the frame (PendingFrame::serial_chain), so its lead sample is judged by its plan.
+    bool serial_chain = false;
     // The limit on the release → target distance, in µs with the anchor's delta not in it, that the executor
     // resolves no target past (PacingFramePlan::lead_limit_us): the lower of the built guard's, I + offset when
     // judged, while developer key gpu_wait_late_guard is on, and the start term's while it was applied (below);
@@ -754,6 +819,10 @@ struct LeadRequest {
     // out the game's simulation → render queue when its predecessor was planned ordered and the sample is judged
     // behind the wait. The FG input wait leaves it out always; no other rung reads this.
     bool queue_correction = false;
+    // Developer key fg_lead_chain (default on; the serial chain, above): the FG input wait's verdict stands through
+    // a few concurrent pairs, and this frame's lead sample leaves out what the chain did to it. No other rung reads
+    // it.
+    bool serial_chain = false;
     // Lead anchor (above): the planned frame's own delta = (s − B) in µs, 0
     // none (always 0 with the unified pacer off), not limited to the plan's
     // share. L itself is learned from the slots' samples, which carry their
@@ -877,6 +946,12 @@ struct LeadStatistics {
     // wait with developer key lead_queue_correction), and the newest such q.
     uint64_t queued_samples = 0;
     double last_queue_us = 0.0;
+    // Serial chain (above), FG input wait frames planned with it: samples that counted the readiness only up to the
+    // target, the newest lateness so left out, and samples of frames with an early GPU start, which were not asked
+    // for idle inside their span.
+    uint64_t chain_late_samples = 0;
+    double last_chain_late_us = 0.0;
+    uint64_t early_start_samples = 0;
     double last_sample_us = 0.0;     // newest sample added to a bucket
     // Spike floor (above): kept ℓ, GPU-rung frames left out (start not paced,
     // first work not streamed, Signal-pinned, stage times missing, Γ not yet
@@ -1235,6 +1310,11 @@ private:
         // The plan's word of developer key lead_queue_correction (LeadGuardOutcome::queue_correction): its lead
         // sample leaves out q (QueueUs). Placed with the bools above, in the padding.
         bool queue_correction = false;
+        // Serial chain (above): the plan's word (LeadGuardOutcome::serial_chain, FG input wait frames only) and the
+        // plan's output target T (LeadFrameStart::output_target_qpc): with one interval after f, where a waited
+        // frame's readiness stops counting.
+        bool serial_chain = false;
+        int64_t target_qpc = 0;
     };
 
     // Late state: the newest LEAD_LATE_FRAMES values with the grid index each belongs to.
@@ -1352,12 +1432,14 @@ private:
     // LEAD_LATE_FRAMES planned frames all arrived late and as many current D exist; else false, *offset_us kept.
     bool LateOffsetUs(size_t divisor, const LeadRequest& request, double* offset_us) const noexcept;
     // Queue order (above) of a GPU output. The two-argument form takes the regime of the newest GPU queue wait
-    // plan (ordered_), the plan-time readers' (the guard, the spike floor, the diagnostics); the
-    // three-argument form the regime the caller names. SampleBehindWait is the frame-time readers': the
-    // frame's lead sample and its wait for its report take the regime of its predecessor, the plan whose gate
-    // wait the frame's GPU work ran behind (PendingFrame::ordered of frame n − 1; built without one).
+    // plan (ordered_) and the serial chain's word of the newest FG input wait plan (fg_serial_chain_), the
+    // plan-time readers' (the guard, the spike floor, the diagnostics); the four-argument form the regime and
+    // the word the caller names. SampleBehindWait is the frame-time readers': the frame's lead sample and its
+    // wait for its report take the regime of its predecessor, the plan whose gate wait the frame's GPU work
+    // ran behind (PendingFrame::ordered of frame n − 1; built without one), and the frame's own word of the
+    // serial chain (PendingFrame::serial_chain).
     bool BehindWait(PacingRung rung, size_t divisor) const noexcept;
-    bool BehindWait(PacingRung rung, size_t divisor, bool ordered) const noexcept;
+    bool BehindWait(PacingRung rung, size_t divisor, bool ordered, bool serial) const noexcept;
     bool SampleBehindWait(const PendingFrame& frame, const PendingFrame* previous) const noexcept;
     // The collision guard's own verdict (above) in the regime of the newest GPU queue wait plan (ordered_), and
     // whether the order's instruments are current (order_instruments_).
@@ -1396,10 +1478,14 @@ private:
     // max(p, r) − s), and the lead sample from it: behind the wait without
     // the GPU wait for frame n − 1 (through predecessor_wait_us, 0
     // otherwise), unless the frame's own submissions set its readiness
-    // (through kept_wait_us, the wait kept in the sample).
+    // (through kept_wait_us, the wait kept in the sample). Serial chain (above), an FG
+    // input wait frame planned with it: through chain_late_us the lateness a waited frame's
+    // sample left out, and through early_start whether its GPU start lay before the GPU
+    // passed frame n − 1's gate, so that it was not asked for idle.
     double MeasuredUs(const PendingFrame& frame, const PendingFrame* previous) const noexcept;
     double SampleUs(const PendingFrame& frame, const PendingFrame* previous, double raw_us,
-        double* predecessor_wait_us = nullptr, double* kept_wait_us = nullptr) const noexcept;
+        double* predecessor_wait_us = nullptr, double* kept_wait_us = nullptr,
+        double* chain_late_us = nullptr, bool* early_start = nullptr) const noexcept;
     // The game's simulation → render queue q (above), in µs: the FG input wait; the GPU queue wait of a frame planned
     // with developer key lead_queue_correction whose predecessor was ordered and whose sample is judged behind the
     // wait (SampleBehindWait); 0 for other rungs and cases, or without e, w, p and the previous frame's b.
@@ -1491,6 +1577,8 @@ private:
     // form and so the plan-time readers take).
     QueueOrderWindow ordered_order_{};
     bool ordered_ = false;
+    // Serial chain (above): the newest FG input wait plan's word, which the FG output's verdict takes (BehindWait).
+    bool fg_serial_chain_ = false;
     // Start term (above), per output ([0] the GPU queue wait, [1] the FG input wait): the W samples (the resume of
     // held GPU queue wait frames, the Present return of FG frames) and the turnarounds of every frame, the output's
     // frames since the newest W sample (its age, current within LEAD_WORK_STALE_FRAMES) and since the newest

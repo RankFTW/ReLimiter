@@ -183,6 +183,9 @@ struct SourceStageRequest {
     // frames planned on present-first ordering (`ordered`, below) leave out the game's simulation → render queue.
     // Both planning branches hand it to the lead.
     bool queue_correction = false;
+    // Developer key fg_lead_chain (lead_controller.h, the serial chain; default on): the FG input wait's lead
+    // samples leave out what the GPU's serial chain did to a frame. Both planning branches hand it to the lead.
+    bool serial_chain = false;
     // Late state of the collision guard (lead_controller.h; developer key gpu_wait_late_guard, default off):
     // the unified branch lets a run of late arrivals set the lead's limit and passes the limit to the executor.
     bool late_guard = false;

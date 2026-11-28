@@ -454,11 +454,14 @@ void CheckPipelineMatchesConfig() {
     CHECK(PacingPipeline_SleepBypass() == (mode == PacingTestMode::Off));
     CHECK(pipeline.gpu_probes == g_config.gpu_present_gate_probes);
     // Keys unified_hold_share and unified_queue_rank reach the pipeline as the effective pair the pacing preference resolves
-    // with them (g_config keeps the raw values); the hold share is 64-bit only, forced to the default (0) on Win32.
+    // with them (g_config keeps the raw values); the hold share is 64-bit only, forced to the default (0) on Win32. The
+    // FG input wait's extra lead, coverage and spike floor reach it the same way.
     const PacingPreferenceResolution effective = PacingPipeline_ResolvePreference(
-        g_config.pacing_preference, g_config.unified_queue_rank, g_config.unified_hold_share, g_config.fg_lead_extra_us);
+        g_config.pacing_preference, g_config.unified_queue_rank, g_config.unified_hold_share, g_config.fg_lead_extra_us,
+        g_config.fg_lead_coverage, g_config.fg_lead_floor);
     CHECK(pipeline.unified_hold_share == (is64 ? effective.hold_share : 0.0));
     CHECK(pipeline.fg_lead_extra_us == effective.lead_extra_us);
+    CHECK(pipeline.fg_lead_coverage == effective.lead_coverage && pipeline.fg_lead_floor == effective.lead_floor);
     // The queue law forces the probe on and feeds the law while the unified pacer owns pacing (64-bit only);
     // the probe key is a 64-bit measurement; the user's values stay in g_config.
     const bool law_in_use = g_config.unified_queue_law && pipeline.unified;
@@ -1306,8 +1309,9 @@ void TestPacingPreference() {
         CHECK(pipeline.unified_hold_share ==
             (test.expected == PacingPreference::Smooth && sizeof(void*) == 8 ? kPacingPreferenceSmoothHoldShare
                                                                               : kPacingUnifiedHoldShareDefault));
-        // Smooth's second lever (the FG input wait's floor at the commanded interval) and the floor's slack default.
-        CHECK(g_fg_late_spacing_commanded.load() == (test.expected == PacingPreference::Smooth));
+        // No position turns on the FG input wait's floor at the commanded interval (the developer key alone does);
+        // the floor's slack default.
+        CHECK(!g_fg_late_spacing_commanded.load());
         CHECK(g_fg_late_spacing_slack.load() == kPacingFgLateSpacingSlackDefault && kPacingFgLateSpacingSlackDefault == 100);
         // The flip gate's cover and fit are on by default where the gate exists (64-bit), and published as 0 elsewhere.
         CHECK(kPacingFgFlipGateCoverDefault == 95 && kPacingFgFlipGateFitDefault == 75);
@@ -1317,6 +1321,11 @@ void TestPacingPreference() {
         // Smooth's third lever (the FG input wait's extra lead) reaches the pipeline; no other position sets it.
         CHECK(pipeline.fg_lead_extra_us ==
             (test.expected == PacingPreference::Smooth ? kPacingPreferenceSmoothLeadExtraUs : kPacingFgLeadExtraDefaultUs));
+        // Lower latency's second lever (the FG input wait's lead coverage without the spike floor) reaches the
+        // pipeline; the other positions keep the pipeline's coverage with the floor.
+        CHECK(pipeline.fg_lead_coverage ==
+            (test.expected == PacingPreference::Latency ? kPacingPreferenceLatencyLeadCoverage : kPacingFgLeadCoverageDefault));
+        CHECK(pipeline.fg_lead_floor == (test.expected != PacingPreference::Latency));
         CHECK(Config_DeveloperOverrides() == 0); // a user setting, not a developer override
         ReleaseStart();CHECK(OwnerShutdown());
     }
@@ -1371,6 +1380,22 @@ void TestPacingPreference() {
           g_config.fg_lead_extra_us == kPacingFgLeadExtraMaxUs && PacingPipeline_GetConfig().fg_lead_extra_us == kPacingFgLeadExtraMaxUs);
     CHECK(Config_SetLiveKey("fg_lead_extra_us", "0", error, sizeof(error)) &&
           PacingPipeline_GetConfig().fg_lead_extra_us == kPacingFgLeadExtraDefaultUs);
+    // The serial chain rule of the FG input wait's lead is published on by default, and its live key turns it off and
+    // back on; like the other measuring keys it is not counted in the developer overrides.
+    CHECK(g_config.fg_lead_chain && kPacingFgLeadChainDefault && g_fg_lead_chain.load());
+    CHECK(Config_SetLiveKey("fg_lead_chain", "false", error, sizeof(error)) && !g_config.fg_lead_chain && !g_fg_lead_chain.load());
+    CHECK(Config_SetLiveKey("fg_lead_chain", "true", error, sizeof(error)) && g_config.fg_lead_chain && g_fg_lead_chain.load());
+    // The coverage and floor developer keys reach the pipeline, clamped, in any position, and 0 gives the position's
+    // own (balanced here: the pipeline's coverage with the floor).
+    CHECK(Config_SetLiveKey("fg_lead_coverage", "90", error, sizeof(error)) && PacingPipeline_GetConfig().fg_lead_coverage == 90);
+    CHECK(Config_SetLiveKey("fg_lead_coverage", "10", error, sizeof(error)) &&
+          g_config.fg_lead_coverage == kPacingFgLeadCoverageMin && PacingPipeline_GetConfig().fg_lead_coverage == kPacingFgLeadCoverageMin);
+    CHECK(Config_SetLiveKey("fg_lead_coverage", "0", error, sizeof(error)) &&
+          PacingPipeline_GetConfig().fg_lead_coverage == kPacingFgLeadCoverageDefault);
+    CHECK(Config_SetLiveKey("fg_lead_floor", "-1", error, sizeof(error)) && !PacingPipeline_GetConfig().fg_lead_floor);
+    CHECK(Config_SetLiveKey("fg_lead_floor", "7", error, sizeof(error)) &&
+          g_config.fg_lead_floor == 1 && PacingPipeline_GetConfig().fg_lead_floor);
+    CHECK(Config_SetLiveKey("fg_lead_floor", "0", error, sizeof(error)) && PacingPipeline_GetConfig().fg_lead_floor);
     CHECK(Config_DeveloperOverrides() == 0);
 
     // Save round trip: the preference is saved as text, the raw developer keys stay raw.

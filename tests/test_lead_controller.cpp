@@ -2930,6 +2930,165 @@ void TestFgInputWaitBehindWaitSample()
     CHECK(controller->Statistics().invalid_inputs == 0);
 }
 
+// Serial chain (lead_controller.h; developer key fg_lead_chain): the script of TestFgInputWaitBehindWaitSample at a
+// lead of 20,000 with the plans made through NextLeadUs, once without the key's word and once with it. With it a
+// frame whose work waited for the frame before counts its readiness only up to the later of its target and one
+// interval after the GPU passed the previous gate (not without its report, and a frame behind a late one keeps its
+// own work), a frame whose own submissions set its readiness still keeps what was measured, late or not, a frame
+// whose GPU start lies before the GPU passed the previous gate is not asked for idle, and the verdict stands
+// through LEAD_FG_CONCURRENT_TOLERATED concurrent pairs. A frame is judged by its own plan's word. Without it each
+// of those is the built rule. The GPU queue wait's plans do not carry the word.
+void TestFgSerialChain()
+{
+    const PacingRung fg = PacingRung::FgInputWait;
+    for (const bool chain : {false, true}) {
+        auto controller = MakeController();
+        double gate_us = 0.0; // the GPU passed the previous frame's gate
+        const auto frame = [&](uint64_t k, double gpu_us, double start_after_gate_us = 2000.0,
+            double span_extra_us = 0.0, bool word = true) {
+            const double target = 1'000'000.0 + static_cast<double>(k) * kInterval;
+            const double source = target - 20000.0;
+            const double free = gate_us > 0.0 ? gate_us : target - kInterval;
+            const double ready = free + gpu_us;
+            const bool held = ready <= target;
+            const double release = held ? target : ready;
+            LeadRequest request = Request(fg, 500.0, kInterval, 2.0);
+            request.serial_chain = chain && word;
+            LeadGuardOutcome guard{};
+            controller->NextLeadUs(request, nullptr, &guard);
+            CHECK(guard.serial_chain == (chain && word));
+            LeadFrameStart start = Start(k, fg, source, kInterval, 2.0);
+            SetLead(&start, 20000.0);
+            start.guard = guard;
+            controller->OnSourceRelease(start);
+            controller->OnStageEvent(Event(k, Kind::RenderSubmitStart, source + 2000.0));
+            controller->OnStageEvent(Event(k, Kind::PresentCall, source + 8000.0));
+            controller->OnStageEvent(Event(k, Kind::GpuReady, ready));
+            controller->OnStageEvent(Event(k, Kind::OutputRelease, release,
+                held ? PacingPlanStatus::Held : PacingPlanStatus::Late));
+            Report(controller.get(), Key(k).producer_epoch, Key(k).frame_id, 7000.0,
+                Qpc(free + start_after_gate_us), 7000.0 + span_extra_us);
+            gate_us = std::max(ready, release);
+        };
+        const auto behind = [&]() { return controller->NextGpuWorkBehindWait(fg, 2.0); };
+        const auto last = [&]() { return controller->Statistics().last_sample_us; };
+
+        // 33 frames make the verdict; behind the wait the frame's own work is 2,000 + 9,000.
+        uint64_t k = 1;
+        for (; k <= 34; ++k) frame(k, 9000.0);
+        CHECK(behind());
+        CHECK_NEAR(last(), 11000.0);
+
+        // A frame the GPU needs 13 ms for is ready 3,000 after T; its work was at the driver 8,000 before the GPU
+        // could take it. With the word its readiness counts to T (20,000 after the release) less that wait; without
+        // it the lateness is in. The frames behind it are ready 2,000 and 1,000 after their targets, inside one
+        // interval after the gate passed late: their own work, 11,000, with the word too.
+        frame(k++, 13000.0);
+        CHECK_NEAR(last(), chain ? 12000.0 : 15000.0);
+        frame(k++, 9000.0);
+        CHECK_NEAR(last(), 11000.0);
+        frame(k++, 9000.0);
+        CHECK_NEAR(last(), 11000.0);
+        frame(k++, 9000.0); // ready at its target: held
+        CHECK_NEAR(last(), 11000.0);
+        CHECK(controller->Statistics().chain_late_samples == (chain ? 1u : 0u));
+        CHECK_NEAR(controller->Statistics().last_chain_late_us, chain ? 3000.0 : 0.0);
+        // Two such frames in a row: the second is ready 6,000 after its target and 3,000 after one interval behind
+        // the first one's late pass. With the word it counts to that interval: 2,000 + 10,000.
+        frame(k++, 13000.0);
+        frame(k++, 13000.0);
+        CHECK_NEAR(last(), chain ? 12000.0 : 15000.0);
+        CHECK_NEAR(controller->Statistics().last_chain_late_us, chain ? 3000.0 : 0.0);
+        for (int i = 0; i < 7; ++i) frame(k++, 9000.0); // back to the targets
+        CHECK_NEAR(last(), 11000.0);
+
+        // The GPU idled 1,100 µs inside the frame for its submissions: the measured readiness, with the word too,
+        // and also when that frame is 3,000 late, which a longer lead would have brought in.
+        frame(k++, 9000.0, 2000.0, 1000.0 + 1100.0);
+        CHECK_NEAR(last(), 19000.0);
+        frame(k++, 13000.0, 2000.0, 5000.0);
+        CHECK_NEAR(last(), 23000.0);
+        CHECK(controller->Statistics().kept_wait_samples == 2);
+        // Back to the targets, and one frame ready 1,000 before its own: the next pair needs a frame that waited.
+        for (int i = 0; i < 4; ++i) frame(k++, 9000.0);
+        CHECK_NEAR(last(), 11000.0);
+
+        // Without its report a late frame is not cut: nothing shows whose its lateness was. It closes with the
+        // wait left out, as built (15,000).
+        {
+            const uint64_t before = controller->Statistics().chain_late_samples;
+            const double target = 1'000'000.0 + static_cast<double>(k) * kInterval;
+            const double source = target - 20000.0;
+            const double ready = gate_us + 13000.0;
+            LeadRequest request = Request(fg, 500.0, kInterval, 2.0);
+            request.serial_chain = chain;
+            LeadGuardOutcome guard{};
+            controller->NextLeadUs(request, nullptr, &guard);
+            LeadFrameStart start = Start(k, fg, source, kInterval, 2.0);
+            SetLead(&start, 20000.0);
+            start.guard = guard;
+            controller->OnSourceRelease(start);
+            controller->OnStageEvent(Event(k, Kind::RenderSubmitStart, source + 2000.0));
+            controller->OnStageEvent(Event(k, Kind::PresentCall, source + 8000.0));
+            controller->OnStageEvent(Event(k, Kind::GpuReady, ready));
+            controller->OnStageEvent(Event(k, Kind::OutputRelease, ready, PacingPlanStatus::Late));
+            gate_us = ready;
+            ++k;
+            const uint64_t missing = controller->Statistics().report_missing_samples;
+            for (uint64_t i = 0; i <= LEAD_PENDING_EXPIRY_FRAMES + 4; ++i) frame(k++, 9000.0);
+            CHECK(controller->Statistics().report_missing_samples == missing + 1);
+            CHECK(controller->Statistics().chain_late_samples == before);
+            CHECK_NEAR(last(), 11000.0);
+        }
+
+        // An early start: the report's GPU start 3,000 before the GPU passed the previous gate, the span that much
+        // longer, 3,000 beyond the active time and the hold. Built, the concurrent pair ends the verdict and the
+        // sample is the measured readiness. With the word the verdict stands, the span is no idle of the frame's
+        // own, and the sample leaves the wait out.
+        const uint64_t kept_before = controller->Statistics().kept_wait_samples;
+        frame(k++, 9000.0, -3000.0, 1000.0 + 3000.0);
+        CHECK(controller->ConcurrentPairs(fg) == 1);
+        CHECK(behind() == chain);
+        CHECK_NEAR(last(), chain ? 11000.0 : 19000.0);
+        CHECK(controller->Statistics().early_start_samples == (chain ? 1u : 0u));
+        CHECK(controller->Statistics().kept_wait_samples == kept_before);
+        if (!chain) continue;
+
+        // LEAD_FG_CONCURRENT_TOLERATED such pairs among the newest 64 leave the verdict standing; one more ends it,
+        // until the pairs have left with newer ones.
+        frame(k++, 9000.0);
+        CHECK_NEAR(last(), 11000.0);
+        for (size_t i = 1; i < LEAD_FG_CONCURRENT_TOLERATED; ++i) frame(k++, 9000.0, -3000.0);
+        CHECK(controller->ConcurrentPairs(fg) == LEAD_FG_CONCURRENT_TOLERATED && behind());
+        CHECK_NEAR(last(), 11000.0);
+        frame(k++, 9000.0, -3000.0);
+        CHECK(controller->ConcurrentPairs(fg) == LEAD_FG_CONCURRENT_TOLERATED + 1 && !behind());
+        CHECK_NEAR(last(), 19000.0);
+        size_t frames = 0;
+        for (; !behind() && frames < 2 * LEAD_CONCURRENCY_SAMPLES; ++frames) frame(k++, 9000.0);
+        CHECK(behind() && controller->ConcurrentPairs(fg) == LEAD_FG_CONCURRENT_TOLERATED);
+        CHECK(frames > 0 && frames <= LEAD_CONCURRENCY_SAMPLES);
+        frame(k++, 9000.0);
+        CHECK_NEAR(last(), 11000.0);
+
+        // A plan without the word is the built rule at once: a concurrent pair among the newest 64 ends the verdict.
+        frame(k++, 9000.0, 2000.0, 0.0, false);
+        CHECK(!behind());
+        CHECK_NEAR(last(), 19000.0);
+        frame(k++, 9000.0);
+        CHECK(behind());
+        CHECK_NEAR(last(), 11000.0);
+    }
+
+    // The word is the FG input wait's: a GPU queue wait plan does not carry it.
+    auto controller = MakeController();
+    LeadRequest request = Request(PacingRung::GpuQueueWait);
+    request.serial_chain = true;
+    LeadGuardOutcome guard{};
+    controller->NextLeadUs(request, nullptr, &guard);
+    CHECK(!guard.serial_chain);
+}
+
 // Closed loop behind the FG input wait (CONTROL Resonant FG 2× at 130):
 // frame n's GPU work starts 2,000 µs (frame n − 1's frame generation) after
 // the GPU passed frame n − 1's gate, P = 9,400–10,399 µs at I = 10,000, and
@@ -2939,7 +3098,7 @@ void TestFgInputWaitBehindWaitSample()
 // own work and the lead comes down to about Q95(w − s + P) + 0.5 ms, while as
 // many frames are late as before over the same 1,000 GPU periods: the GPU
 // sets their readiness, not the lead.
-void TestFgBehindWaitLeadFalls()
+void RunFgBehindWaitLeadFalls(bool chain)
 {
     auto controller = MakeController();
     const PacingRung fg = PacingRung::FgInputWait;
@@ -2948,7 +3107,10 @@ void TestFgBehindWaitLeadFalls()
     const auto run = [&](uint64_t first, uint64_t count, bool reports) {
         uint32_t late = 0;
         for (uint64_t n = first; n < first + count; ++n) {
-            lead = controller->NextLeadUs(Request(fg, 500.0, kInterval, 2.0));
+            LeadRequest request = Request(fg, 500.0, kInterval, 2.0);
+            request.serial_chain = chain;
+            LeadGuardOutcome guard{};
+            lead = controller->NextLeadUs(request, nullptr, &guard);
             const double target = 100'000.0 + static_cast<double>(n) * kInterval;
             const double source = target - lead;
             const double submit = source + 2000.0 + static_cast<double>((n * 37) % 1000);
@@ -2961,6 +3123,7 @@ void TestFgBehindWaitLeadFalls()
             const double release = held ? target : ready;
             LeadFrameStart start = Start(n, fg, source, kInterval, 2.0);
             SetLead(&start, lead);
+            start.guard = guard;
             controller->OnSourceRelease(start);
             controller->OnStageEvent(Event(n, Kind::RenderSubmitStart, submit));
             controller->OnStageEvent(Event(n, Kind::PresentCall, present));
@@ -2981,12 +3144,20 @@ void TestFgBehindWaitLeadFalls()
     run(2001, 1000, true);
     const uint32_t late_own = run(3001, 1000, true);
     const double lead_own = lead;
-    std::printf("FG behind-wait loop: lead %.0f us measured, %.0f us own work; late %u / %u of 1,000\n",
-        lead_measured, lead_own, late_measured, late_own);
+    std::printf("FG behind-wait loop%s: lead %.0f us measured, %.0f us own work; late %u / %u of 1,000\n",
+        chain ? " (serial chain)" : "", lead_measured, lead_own, late_measured, late_own);
     CHECK(lead_measured > 24000.0);
     CHECK(lead_own > 12000.0 && lead_own < 15000.0);
     CHECK(late_own <= late_measured + 10 && late_measured <= late_own + 10);
     CHECK(controller->NextGpuWorkBehindWait(fg, 2.0));
+}
+
+// Both loops also run with the serial chain's word on the plans (lead_controller.h): the lead has to settle where
+// it does without it, on the frames' own work, with no more frames late.
+void TestFgBehindWaitLeadFalls()
+{
+    RunFgBehindWaitLeadFalls(false);
+    RunFgBehindWaitLeadFalls(true);
 }
 
 // Closed loop behind the FG input wait where the cap holds the frames and
@@ -3000,7 +3171,7 @@ void TestFgBehindWaitLeadFalls()
 // submissions, so they keep X and at the default 99% coverage the lead
 // covers them; leaving out their wait for the previous frame set the lead
 // at 29.3 ms with 465 of 1,000 frames late.
-void TestFgSubmissionSetLeadCoversReadiness()
+void RunFgSubmissionSetLeadCoversReadiness(bool chain)
 {
     auto controller = MakeController();
     const PacingRung fg = PacingRung::FgInputWait;
@@ -3010,8 +3181,10 @@ void TestFgSubmissionSetLeadCoversReadiness()
     uint32_t late = 0;
     LeadRequest request = Request(fg, 500.0, kCap, 2.0);
     request.quantile = 0.99; // the default lead coverage
+    request.serial_chain = chain;
     for (uint64_t n = 1; n <= 3000; ++n) {
-        lead = controller->NextLeadUs(request);
+        LeadGuardOutcome guard{};
+        lead = controller->NextLeadUs(request, nullptr, &guard);
         const double target = 100'000.0 + static_cast<double>(n) * kCap;
         const double source = target - lead;
         const double x = n % 50 == 0 ? 34000.0 : 29000.0 + 100.0 * static_cast<double>((n * 37) % 10);
@@ -3022,6 +3195,7 @@ void TestFgSubmissionSetLeadCoversReadiness()
         const double release = held ? target : ready;
         LeadFrameStart start = Start(n, fg, source, kCap, 2.0);
         SetLead(&start, lead);
+        start.guard = guard;
         controller->OnSourceRelease(start);
         controller->OnStageEvent(Event(n, Kind::RenderSubmitStart, source + 5000.0));
         controller->OnStageEvent(Event(n, Kind::PresentCall, source + 16900.0));
@@ -3034,11 +3208,17 @@ void TestFgSubmissionSetLeadCoversReadiness()
         gate_us = std::max(ready, release);
         if (n > 2000 && !held) ++late;
     }
-    std::printf("FG submission-set loop: lead %.0f us, late %u of 1,000\n", lead, late);
+    std::printf("FG submission-set loop%s: lead %.0f us, late %u of 1,000\n", chain ? " (serial chain)" : "", lead, late);
     CHECK(controller->NextGpuWorkBehindWait(fg, 2.0));
     CHECK(lead > 34000.0 && lead < 35500.0);
     CHECK(late == 0);
     CHECK(controller->Statistics().kept_wait_samples > 0);
+}
+
+void TestFgSubmissionSetLeadCoversReadiness()
+{
+    RunFgSubmissionSetLeadCoversReadiness(false);
+    RunFgSubmissionSetLeadCoversReadiness(true);
 }
 
 // Closed loop with back-pressure (Gears of War: E-Day, FG 2× at 120, the cap
@@ -3055,7 +3235,7 @@ void TestFgSubmissionSetLeadCoversReadiness()
 // submissions set their readiness (X = 27,750–30,450) hold it near its top.
 // Keeping X for the held, starved frames (X = L + 700) kept the lead where
 // it was.
-void TestFgHeldFirstWorkLeadFalls()
+void RunFgHeldFirstWorkLeadFalls(bool chain)
 {
     auto controller = MakeController();
     const PacingRung fg = PacingRung::FgInputWait;
@@ -3064,6 +3244,7 @@ void TestFgHeldFirstWorkLeadFalls()
     double lead = 0.0;
     LeadRequest request = Request(fg, 500.0, kCap, 2.0);
     request.quantile = 0.99;
+    request.serial_chain = chain;
     uint64_t held_first = 0;
     double lead_min = 1e9;
     double lead_max = 0.0;
@@ -3071,7 +3252,8 @@ void TestFgHeldFirstWorkLeadFalls()
         uint32_t late = 0;
         held_first = 0;
         for (uint64_t n = first; n < first + count; ++n) {
-            lead = controller->NextLeadUs(request);
+            LeadGuardOutcome guard{};
+            lead = controller->NextLeadUs(request, nullptr, &guard);
             lead_min = std::min(lead_min, lead);
             lead_max = std::max(lead_max, lead);
             const double target = 100'000.0 + static_cast<double>(n) * kCap;
@@ -3089,6 +3271,7 @@ void TestFgHeldFirstWorkLeadFalls()
             const double release = on_time ? target : ready;
             LeadFrameStart start = Start(n, fg, source, kCap, 2.0);
             SetLead(&start, lead);
+            start.guard = guard;
             controller->OnSourceRelease(start);
             controller->OnStageEvent(Event(n, Kind::RenderSubmitStart, submit));
             controller->OnStageEvent(Event(n, Kind::PresentCall, submit_end + 2500.0));
@@ -3113,8 +3296,9 @@ void TestFgHeldFirstWorkLeadFalls()
     lead_min = 1e9;
     lead_max = 0.0;
     const uint32_t late = run(5001, 1000, true);
-    std::printf("FG held-first-work loop: lead %.0f us measured (%llu of 1,000 held), %.0f-%.0f us with reports; "
-        "late %u of 1,000\n", lead_measured, static_cast<unsigned long long>(held_measured), lead_min, lead_max, late);
+    std::printf("FG held-first-work loop%s: lead %.0f us measured (%llu of 1,000 held), %.0f-%.0f us with reports; "
+        "late %u of 1,000\n", chain ? " (serial chain)" : "", lead_measured,
+        static_cast<unsigned long long>(held_measured), lead_min, lead_max, late);
     CHECK(lead_measured > 36400.0 && held_measured > 900);
     CHECK(controller->NextGpuWorkBehindWait(fg, 2.0));
     // Within 1 ms of the longest release path (30,450), ready after T on a
@@ -3123,6 +3307,12 @@ void TestFgHeldFirstWorkLeadFalls()
     CHECK(held_first == 0);
     CHECK(late <= 30);
     CHECK(controller->Statistics().kept_wait_samples > 0);
+}
+
+void TestFgHeldFirstWorkLeadFalls()
+{
+    RunFgHeldFirstWorkLeadFalls(false);
+    RunFgHeldFirstWorkLeadFalls(true);
 }
 
 namespace
@@ -6174,6 +6364,7 @@ int main()
     TestFgBehindWaitLeadFalls();
     TestFgSubmissionSetLeadCoversReadiness();
     TestFgHeldFirstWorkLeadFalls();
+    TestFgSerialChain();
     TestLeadSpikeFloor();
     TestSpikeFloorPerOutput();
     TestSpikeMemoryCountsFrames();

@@ -154,7 +154,9 @@ namespace
             left.unified_queue_upstream == right.unified_queue_upstream &&
             (sizeof(void*) != 8 || left.unified_queue_margin_end == right.unified_queue_margin_end) &&
             left.unified_queue_allow_us == right.unified_queue_allow_us &&
-            left.fg_lead_extra_us == right.fg_lead_extra_us;
+            left.fg_lead_extra_us == right.fg_lead_extra_us &&
+            left.fg_lead_coverage == right.fg_lead_coverage &&
+            left.fg_lead_floor == right.fg_lead_floor;
     }
 
     // ── Initial publication (must run first) ──
@@ -1031,6 +1033,7 @@ namespace
         config.unified_queue_rank = 100;
         config.unified_queue_allow_us = -5;
         config.fg_lead_extra_us = 9000;
+        config.fg_lead_coverage = 20;
         config.unified_hold_share = nan;
         PacingPipeline_SetConfig(config);
         const PacingPipelineConfig stored = PacingPipeline_GetConfig();
@@ -1040,6 +1043,13 @@ namespace
         CHECK(stored.unified_queue_rank == kPacingUnifiedQueueRankMax);
         CHECK(stored.unified_queue_allow_us == 0);
         CHECK(stored.fg_lead_extra_us == kPacingFgLeadExtraMaxUs && kPacingFgLeadExtraMaxUs == 4000);
+        CHECK(stored.fg_lead_coverage == kPacingFgLeadCoverageMin && kPacingFgLeadCoverageMin == 50);
+        config.fg_lead_coverage = 150;
+        PacingPipeline_SetConfig(config);
+        CHECK(PacingPipeline_GetConfig().fg_lead_coverage == kPacingFgLeadCoverageMax && kPacingFgLeadCoverageMax == 99);
+        config.fg_lead_coverage = -4; // none named: the pipeline's coverage
+        PacingPipeline_SetConfig(config);
+        CHECK(PacingPipeline_GetConfig().fg_lead_coverage == kPacingFgLeadCoverageDefault);
         CHECK(stored.unified_hold_share == 0.0);
 
         // The kept fields round-trip through the seqlock; a test mode takes the owner from the unified pacer.
@@ -1050,6 +1060,8 @@ namespace
         config.unified_queue_need_frames = 7;
         config.unified_queue_allow_us = 1500;
         config.fg_lead_extra_us = 1500;
+        config.fg_lead_coverage = 75;
+        config.fg_lead_floor = false;
         PacingPipeline_SetConfig(config);
         CHECK(SameConfig(PacingPipeline_GetConfig(), config));
         CHECK(!PacingPipeline_GetConfig().unified);
@@ -1283,6 +1295,21 @@ namespace
         CHECK(Resolve(extra, QualifiedDx12(), ActiveFg()).allowance_us == 500.0 + kPacingFgLeadExtraMaxUs);
         extra.fg_lead_extra_us = -3;
         CHECK(Resolve(extra, QualifiedDx12(), ActiveFg()).allowance_us == 500.0);
+
+        // The FG input wait's lead coverage (developer key fg_lead_coverage, the Lower latency position's lever) is
+        // that rung's quantile only, a change is a new result, and 0 keeps the pipeline's coverage.
+        PacingPipelineConfig covered{};
+        covered.fg_lead_coverage = 75;
+        const PacingPipelineSnapshot shorter = Resolve(covered, QualifiedDx12(), ActiveFg());
+        CHECK(held.lead_quantile == 0.99 && shorter.lead_quantile == 0.75);
+        CHECK(!PacingPipeline_SameResult(shorter, held));
+        CHECK(Resolve(covered, QualifiedDx12(), ActiveVrr()).lead_quantile == 0.99); // GPU queue wait
+        CHECK(Resolve(covered, VulkanPcl(), ActiveVrr()).lead_quantile == 0.99);     // marker hold
+        CHECK(Resolve(covered, PresentBased(), ActiveVrr()).lead_quantile == 0.99);  // source only
+        covered.fg_lead_coverage = 10;
+        CHECK(Resolve(covered, QualifiedDx12(), ActiveFg()).lead_quantile == 0.50);
+        covered.fg_lead_coverage = 0;
+        CHECK(Resolve(covered, QualifiedDx12(), ActiveFg()).lead_quantile == 0.99);
     }
 
     template <typename Enum, typename TextOf>
@@ -1467,6 +1494,30 @@ namespace
             CHECK(resolve(preference, rank_default, 0.0625).hold_share == 0.0625);
             CHECK(resolve(preference, 6, 0.0625).hold_share == 0.0625);
             CHECK(resolve(preference, rank_default, share_default, 1500).lead_extra_us == 1500);
+        }
+        // The Lower latency position's second lever: the FG input wait's lead covers 75% of its samples without the
+        // spike floor; the other positions keep the pipeline's coverage (0) with the floor. A developer coverage or
+        // floor wins in every position, each on its own.
+        CHECK(resolve(PacingPreference::Latency, rank_default, share_default).lead_coverage == kPacingPreferenceLatencyLeadCoverage);
+        CHECK(!resolve(PacingPreference::Latency, rank_default, share_default).lead_floor);
+        CHECK(kPacingPreferenceLatencyLeadCoverage == 75 && !kPacingPreferenceLatencyLeadFloor);
+        CHECK(kPacingPreferenceLatencyLeadCoverage >= kPacingFgLeadCoverageMin &&
+            kPacingPreferenceLatencyLeadCoverage <= kPacingFgLeadCoverageMax);
+        for (const PacingPreference preference : {PacingPreference::Balanced, PacingPreference::Smooth}) {
+            CHECK(resolve(preference, rank_default, share_default).lead_coverage == kPacingFgLeadCoverageDefault);
+            CHECK(resolve(preference, rank_default, share_default).lead_floor);
+        }
+        for (const PacingPreference preference : {PacingPreference::Latency, PacingPreference::Balanced, PacingPreference::Smooth}) {
+            const bool latency = preference == PacingPreference::Latency;
+            const PacingPreferenceResolution covered =
+                PacingPipeline_ResolvePreference(preference, rank_default, share_default, lead_default, 90);
+            CHECK(covered.lead_coverage == 90 && covered.lead_floor == !latency);
+            const PacingPreferenceResolution floored =
+                PacingPipeline_ResolvePreference(preference, rank_default, share_default, lead_default, 0, 1);
+            CHECK(floored.lead_floor && floored.lead_coverage == (latency ? kPacingPreferenceLatencyLeadCoverage : 0));
+            const PacingPreferenceResolution bare =
+                PacingPipeline_ResolvePreference(preference, rank_default, share_default, lead_default, 0, -1);
+            CHECK(!bare.lead_floor && bare.queue_rank == (latency ? kPacingPreferenceLatencyRank : rank_default));
         }
         // The levers are independent: Latency leaves a developer share, Smooth leaves a developer rank, and a
         // developer rank does not stop Smooth's share (nor a developer share Latency's rank); a developer extra lead

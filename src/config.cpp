@@ -236,6 +236,9 @@ void ValidateConfig() {
     g_config.unified_queue_margin_end = Clamp(g_config.unified_queue_margin_end, 0, kPacingUnifiedQueueMarginEndMax);
     g_config.unified_queue_allow_us = Clamp(g_config.unified_queue_allow_us, 0, kPacingUnifiedQueueAllowMaxUs);
     g_config.fg_lead_extra_us = Clamp(g_config.fg_lead_extra_us, 0, kPacingFgLeadExtraMaxUs);
+    g_config.fg_lead_coverage = g_config.fg_lead_coverage <= 0 ? kPacingFgLeadCoverageDefault
+        : Clamp(g_config.fg_lead_coverage, kPacingFgLeadCoverageMin, kPacingFgLeadCoverageMax);
+    g_config.fg_lead_floor = Clamp(g_config.fg_lead_floor, -1, 1);
 
     // ── Monitor Selection ──
     g_config.selected_monitor = Clamp(g_config.selected_monitor, 0, 8);
@@ -436,6 +439,9 @@ void LoadConfig(HMODULE hModule) {
     g_config.fg_lead_extra_us=ReadINIInt(S,"fg_lead_extra_us",kPacingFgLeadExtraDefaultUs,P);
     g_config.fg_flip_batch_percent=ReadINIInt(S,"fg_flip_batch_percent",0,P);
     g_config.fg_flip_batch_frames=ReadINIInt(S,"fg_flip_batch_frames",0,P);
+    g_config.fg_lead_chain=ReadINIBool(S,"fg_lead_chain",kPacingFgLeadChainDefault,P);
+    g_config.fg_lead_coverage=ReadINIInt(S,"fg_lead_coverage",kPacingFgLeadCoverageDefault,P);
+    g_config.fg_lead_floor=ReadINIInt(S,"fg_lead_floor",kPacingFgLeadFloorDefault,P);
     g_config.unified_hold_share=ReadINIDouble(S,"unified_hold_share",kPacingUnifiedHoldShareDefault,P);
     g_config.unified_queue_law=ReadINIBool(S,"unified_queue_law",kPacingUnifiedQueueLawDefault,P);
     g_config.unified_queue_rank=ReadINIInt(S,"unified_queue_rank",kPacingUnifiedQueueRankDefault,P);
@@ -916,13 +922,16 @@ static PacingPipelineConfig PacingPipelineConfigFrom(const Config& config) {
 void Config_ApplyPacingPipeline() {
     PacingPipelineConfig pipeline = PacingPipelineConfigFrom(g_config);
     // The pacing preference meets the developer keys here, once: the pipeline carries only the effective rank, hold
-    // share and extra lead (g_config and the INI keep the raw values; the clamp and the 32-bit forcing run on the
-    // effective values).
+    // share, extra lead and the FG input wait's lead coverage and spike floor (g_config and the INI keep the raw
+    // values; the clamp and the 32-bit forcing run on the effective values).
     const PacingPreferenceResolution effective = PacingPipeline_ResolvePreference(
-        g_config.pacing_preference, g_config.unified_queue_rank, g_config.unified_hold_share, g_config.fg_lead_extra_us);
+        g_config.pacing_preference, g_config.unified_queue_rank, g_config.unified_hold_share, g_config.fg_lead_extra_us,
+        g_config.fg_lead_coverage, g_config.fg_lead_floor);
     pipeline.unified_queue_rank = effective.queue_rank;
     pipeline.unified_hold_share = effective.hold_share;
     pipeline.fg_lead_extra_us = effective.lead_extra_us;
+    pipeline.fg_lead_coverage = effective.lead_coverage;
+    pipeline.fg_lead_floor = effective.lead_floor;
     // The owner of pacing is resolved here, once: the saved test mode counts only with developer_settings, and the
     // clamp below derives the one `unified` state from it (64-bit and no test mode). The observers it gates (the
     // queue law's probe and feed) follow the same state. It is noted for the Sleep-mode reconcile BEFORE the
@@ -959,13 +968,12 @@ void Config_ApplyPacingPipeline() {
     g_fg_flip_gate_fit.store(sizeof(void*) == 8 && g_config.fg_flip_gate_fit > 0
         ? std::clamp(g_config.fg_flip_gate_fit, 50, 99) : 0, std::memory_order_relaxed);
     g_fg_late_spacing_slack.store(std::clamp(g_config.fg_late_spacing_slack, 0, 1000), std::memory_order_relaxed);
-    g_fg_late_spacing_commanded.store(g_config.fg_late_spacing_commanded ||
-        (kPacingPreferenceSmoothFloorCommanded && g_config.pacing_preference == PacingPreference::Smooth),
-        std::memory_order_relaxed);
+    g_fg_late_spacing_commanded.store(g_config.fg_late_spacing_commanded, std::memory_order_relaxed);
     const int percent = g_config.fg_flip_batch_percent <= 0 ? 0 : std::clamp(g_config.fg_flip_batch_percent, 10, 400);
     const int frames = std::clamp(g_config.fg_flip_batch_frames, 0, 8);
     g_fg_flip_batch_percent.store(percent, std::memory_order_relaxed);
     g_fg_flip_batch_frames.store(frames, std::memory_order_relaxed);
+    g_fg_lead_chain.store(g_config.fg_lead_chain, std::memory_order_relaxed);
     // Report effective transitions here (including turning both keys off), not on each driver's batch.
     static std::atomic<int> last_flip_batch_keys{0};
     const int keys = (percent << 4) | frames; // frames is 0–8
@@ -1046,6 +1054,9 @@ constexpr Key kKeys[] = {
     {"fg_lead_extra_us", &SetInt<&Config::fg_lead_extra_us>, Publish::Pipeline},
     {"fg_flip_batch_percent", &SetInt<&Config::fg_flip_batch_percent>, Publish::Pipeline},
     {"fg_flip_batch_frames", &SetInt<&Config::fg_flip_batch_frames>, Publish::Pipeline},
+    {"fg_lead_chain", &SetBool<&Config::fg_lead_chain>, Publish::Pipeline},
+    {"fg_lead_coverage", &SetInt<&Config::fg_lead_coverage>, Publish::Pipeline},
+    {"fg_lead_floor", &SetInt<&Config::fg_lead_floor>, Publish::Pipeline},
     {"unified_queue_margin_end", &SetInt<&Config::unified_queue_margin_end>, Publish::Pipeline},
     {"unified_hold_share", &SetDouble<&Config::unified_hold_share>, Publish::Pipeline},
     {"pacing_test_mode", &SetEnum<PacingTestMode, &Config::pacing_test_mode, PacingTestMode_FromText>, Publish::Pipeline},
@@ -1169,10 +1180,11 @@ void ApplyConfig() {
     LOG_INFO("Reflex Sleep bypass: %s (applies while ReLimiter paces a positive cap)",
         PacingPipeline_SleepBypass()?"on":"off");
     const PacingPipelineConfig applied = PacingPipeline_GetConfig();
-    LOG_INFO("Pacing pipeline: probes=%u pacing_preference=%s queue_rank=%d hold_share=%.5f pacing_test_mode=%s",
+    LOG_INFO("Pacing pipeline: probes=%u pacing_preference=%s queue_rank=%d hold_share=%.5f fg_lead_coverage=%d "
+             "fg_lead_floor=%u pacing_test_mode=%s",
         g_config.gpu_present_gate_probes ? 1u : 0u,
         PacingPreference_Text(g_config.pacing_preference), applied.unified_queue_rank, applied.unified_hold_share,
-        PacingTestMode_Text(applied.test_mode));
+        applied.fg_lead_coverage, applied.fg_lead_floor ? 1u : 0u, PacingTestMode_Text(applied.test_mode));
     if (applied.test_mode != PacingTestMode::Off)
         LOG_WARN("Diagnostic pacing test mode %s: ReLimiter %s", PacingTestMode_Text(applied.test_mode),
             applied.test_mode == PacingTestMode::ReflexOnly
@@ -1239,6 +1251,18 @@ void ApplyConfig() {
         LOG_WARN("Diagnostic FG lead extra: the FG input wait's lead gets %d us more allowance, so every frame starts "
                  "that much earlier against its output target (fg_lead_extra_us=%d; 64-bit Direct3D 12)",
             g_config.fg_lead_extra_us, g_config.fg_lead_extra_us);
+    // The serial chain rule of the FG input wait's lead is on by default: a line only when it is off.
+    if (g_config.fg_lead_chain != kPacingFgLeadChainDefault)
+        LOG_WARN("Diagnostic FG lead chain off: the FG input wait's lead samples keep what the GPU's serial chain "
+                 "did to a frame, and one early GPU start ends the queue-order verdict "
+                 "(fg_lead_chain=false; 64-bit Direct3D 12)");
+    if (g_config.fg_lead_coverage != kPacingFgLeadCoverageDefault || g_config.fg_lead_floor != kPacingFgLeadFloorDefault)
+        LOG_WARN("Diagnostic FG lead coverage: the FG input wait's lead covers %d%% of its samples (0: the pacing "
+                 "preference's) with the spike floor %s, whatever the pacing preference says "
+                 "(fg_lead_coverage=%d, fg_lead_floor=%d; 64-bit Direct3D 12)",
+            g_config.fg_lead_coverage,
+            g_config.fg_lead_floor > 0 ? "on" : g_config.fg_lead_floor < 0 ? "off" : "as the preference has it",
+            g_config.fg_lead_coverage, g_config.fg_lead_floor);
     // The frame generation ordering switches are on by default (the INI only reads them and never saves them; they
     // act only where frame generation presents from its own thread, once present-first ordering is established): a
     // line only when one is off.

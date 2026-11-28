@@ -158,6 +158,7 @@ void LeadController::Reset(int64_t qpc_frequency) noexcept
     for (LeadSampleWindow& work : work_windows_) work.Reset();
     ordered_order_ = QueueOrderWindow{};
     ordered_ = false;
+    fg_serial_chain_ = false;
     ResetStartTerm();
     work_age_frames_.fill(0);
     work_report_seen_.fill(false);
@@ -366,6 +367,12 @@ double LeadController::NextLeadUs(const LeadRequest& request, bool* budget_limit
             guard->ordered = request.ordered;
             guard->queue_correction = request.queue_correction;
         }
+    }
+    // Serial chain (lead_controller.h): the FG input wait's plans carry the key's word, and the FG output's verdict
+    // (BehindWait) takes the newest one.
+    if (request.rung == PacingRung::FgInputWait) {
+        fg_serial_chain_ = request.serial_chain;
+        if (guard != nullptr) guard->serial_chain = request.serial_chain;
     }
     const double interval_us = request.interval_us;
     const double max_lead_us = LEAD_BUDGET_INTERVALS * interval_us;
@@ -767,6 +774,8 @@ void LeadController::OnSourceRelease(const LeadFrameStart& frame) noexcept
     slot.late_state = frame.guard.late_state;
     slot.ordered = frame.guard.ordered;
     slot.queue_correction = frame.guard.queue_correction;
+    slot.serial_chain = frame.rung == PacingRung::FgInputWait && frame.guard.serial_chain;
+    slot.target_qpc = frame.output_target_qpc;
     // Start term (lead_controller.h): the game's arrival; one later than the release is none.
     slot.arrival_qpc = frame.arrival_qpc > 0 && frame.arrival_qpc <= frame.source_release_qpc ? frame.arrival_qpc : 0;
     slot.paced_start = frame.paced_start;
@@ -1478,10 +1487,10 @@ void LeadController::RecordStartPair(PendingFrame* frame) noexcept
 
 bool LeadController::BehindWait(PacingRung rung, size_t divisor) const noexcept
 {
-    return BehindWait(rung, divisor, ordered_);
+    return BehindWait(rung, divisor, ordered_, fg_serial_chain_);
 }
 
-bool LeadController::BehindWait(PacingRung rung, size_t divisor, bool ordered) const noexcept
+bool LeadController::BehindWait(PacingRung rung, size_t divisor, bool ordered, bool serial) const noexcept
 {
     if (!IsGpuRung(rung)) return false;
     const bool fg = rung == PacingRung::FgInputWait;
@@ -1494,24 +1503,29 @@ bool LeadController::BehindWait(PacingRung rung, size_t divisor, bool ordered) c
             work_age_frames_[divisor] <= LEAD_WORK_STALE_FRAMES;
     }
     const QueueOrderWindow& window = queue_order_[fg ? 1 : 0];
-    if (window.count < LEAD_WARM_SAMPLES || window.concurrent != 0) return false;
+    // Serial chain (lead_controller.h): with the plan's word the FG output's verdict stands through a few
+    // concurrent pairs.
+    const size_t tolerated = fg && serial ? LEAD_FG_CONCURRENT_TOLERATED : 0;
+    if (window.count < LEAD_WARM_SAMPLES || window.concurrent > tolerated) return false;
     return fg ? fg_report_age_frames_[divisor] <= LEAD_WORK_STALE_FRAMES : WorkCurrent(divisor);
 }
 
 // The queue order a frame's lead sample is judged by (SampleUs, LeadSampleWaitsForReport): the regime of the
 // frame's predecessor, whose gate wait the frame's GPU work ran behind (present-first ordering,
 // lead_controller.h). Without a predecessor, or with one planned as built, it is the built evidence, which is
-// all there is with the key off.
+// all there is with the key off. The serial chain's word is the frame's own plan's (PendingFrame::serial_chain),
+// so a frame is judged by the rule it was planned with whatever the key says when its report arrives.
 bool LeadController::SampleBehindWait(const PendingFrame& frame, const PendingFrame* previous) const noexcept
 {
-    return BehindWait(frame.rung, frame.bucket % LEAD_DIVISOR_BUCKETS, previous != nullptr && previous->ordered);
+    return BehindWait(frame.rung, frame.bucket % LEAD_DIVISOR_BUCKETS, previous != nullptr && previous->ordered,
+        frame.serial_chain);
 }
 
 // The built guard (lead_controller.h) applies on a concurrent pair or without the instruments, and stands aside
 // otherwise; the ordered rule is BehindWait's.
 bool LeadController::GuardStandsAside(size_t divisor) const noexcept
 {
-    if (ordered_) return BehindWait(PacingRung::GpuQueueWait, divisor, true);
+    if (ordered_) return BehindWait(PacingRung::GpuQueueWait, divisor, true, false);
     return queue_order_[0].concurrent == 0 && OrderMeasurable(divisor);
 }
 
@@ -1735,7 +1749,10 @@ void LeadController::EmitLeadSample(PendingFrame* frame) noexcept
     const double raw_us = MeasuredUs(*frame, previous);
     double predecessor_wait_us = 0.0;
     double kept_wait_us = 0.0;
-    const double sample_us = SampleUs(*frame, previous, raw_us, &predecessor_wait_us, &kept_wait_us);
+    double chain_late_us = 0.0;
+    bool early_start = false;
+    const double sample_us = SampleUs(*frame, previous, raw_us, &predecessor_wait_us, &kept_wait_us,
+        &chain_late_us, &early_start);
     if (!std::isfinite(sample_us)) {
         ++statistics_.invalid_inputs;
         return;
@@ -1748,6 +1765,12 @@ void LeadController::EmitLeadSample(PendingFrame* frame) noexcept
         ++statistics_.kept_wait_samples;
         statistics_.last_kept_wait_us = kept_wait_us;
     }
+    // Serial chain (lead_controller.h): the lateness a waited frame's sample left out, and the early starts.
+    if (chain_late_us > 0.0) {
+        ++statistics_.chain_late_samples;
+        statistics_.last_chain_late_us = chain_late_us;
+    }
+    if (early_start) ++statistics_.early_start_samples;
     // The lead learns X without the time the finished frame waited for the render thread to leave the previous
     // Present (QueueUs: the FG input wait, and the GPU queue wait on present-first ordering with the key).
     const double queue_us = QueueUs(*frame, previous);
@@ -1861,11 +1884,25 @@ double LeadController::MeasuredUs(const PendingFrame& frame, const PendingFrame*
 //   The queue order is the predecessor's regime (SampleBehindWait): with
 //   present-first ordering frame n's work ran behind frame n − 1's gate wait
 //   exactly when frame n − 1 was ordered, whatever frame n's own plan says.
+//   Serial chain (lead_controller.h; an FG input wait frame planned with the
+//   key): a frame whose GPU start lies before f by more than the queue order's
+//   tolerance is not asked for idle, because its span covers frame n − 1's
+//   work; and a frame that leaves d out counts its readiness only up to
+//   T' = max(T, f + I), the later of its output target and one interval after
+//   the GPU passed frame n − 1's gate, X = max(p, min(r, T') − d) − s: its
+//   work was at the driver before the GPU could take it, so no lead would
+//   have brought the rest in. f + I is the latest the gate's spacing floor
+//   holds a frame behind a late one, so a frame that made its own gate is
+//   never cut, and behind a late frame the sample stays the frame's own work
+//   up to one interval. The wait reported through predecessor_wait_us stays
+//   the built one, which the saturation rule subtracts against.
 double LeadController::SampleUs(const PendingFrame& frame, const PendingFrame* previous, double raw_us,
-    double* predecessor_wait_us, double* kept_wait_us) const noexcept
+    double* predecessor_wait_us, double* kept_wait_us, double* chain_late_us, bool* early_start) const noexcept
 {
     if (predecessor_wait_us != nullptr) *predecessor_wait_us = 0.0;
     if (kept_wait_us != nullptr) *kept_wait_us = 0.0;
+    if (chain_late_us != nullptr) *chain_late_us = 0.0;
+    if (early_start != nullptr) *early_start = false;
     if (!IsGpuRung(frame.rung) || previous == nullptr || !previous->started || !IsGpuRung(previous->rung) ||
         !SampleBehindWait(frame, previous)) {
         return raw_us;
@@ -1893,15 +1930,29 @@ double LeadController::SampleUs(const PendingFrame& frame, const PendingFrame* p
     }
     const double wait_us = free_us - start_us;
     if (!(wait_us > 0.0)) return raw_us;
+    const bool serial = frame.rung == PacingRung::FgInputWait && frame.serial_chain;
+    const bool early = serial && frame.gpu_start_qpc > 0 &&
+        MicrosecondsBetween(source, frame.gpu_start_qpc) < free_us - LEAD_CONCURRENCY_TOLERANCE_US;
+    if (early_start != nullptr) *early_start = early;
     double idle_us = 0.0;
-    if (frame.first_work_streamed && GpuIdleInSpanUs(frame, &idle_us) &&
+    if (!early && frame.first_work_streamed && GpuIdleInSpanUs(frame, &idle_us) &&
         idle_us >= LEAD_HANDOFF_GPU_IDLE_US) {
         if (kept_wait_us != nullptr) *kept_wait_us = wait_us;
         return raw_us;
     }
-    const double sample = std::max(present_us, ready_us - wait_us);
-    if (predecessor_wait_us != nullptr) *predecessor_wait_us = raw_us - sample;
-    return sample;
+    const double built_us = std::max(present_us, ready_us - wait_us);
+    if (predecessor_wait_us != nullptr) *predecessor_wait_us = raw_us - built_us;
+    // Only with the frame's own report: a frame closed without one cannot show that its own submissions set its
+    // readiness, so its lateness is not taken for the chain's (it leaves d out, as built).
+    if (serial && frame.gpu_active_us > 0.0 && frame.target_qpc > 0) {
+        const double limit_us = std::max(MicrosecondsBetween(source, frame.target_qpc), free_us + frame.interval_us);
+        if (ready_us > limit_us) {
+            const double sample_us = std::max(present_us, limit_us - wait_us);
+            if (chain_late_us != nullptr) *chain_late_us = built_us - sample_us;
+            return sample_us;
+        }
+    }
+    return built_us;
 }
 
 // The game's simulation → render queue (lead_controller.h):

@@ -394,18 +394,21 @@ static void DrawPacingPreferenceControl(bool* config_dirty) {
         *config_dirty = true;
     }
     HelpTip("Smoother: with DLSS frame generation. At a cap the GPU can hold, starts each frame 1 ms earlier so "
-        "fewer frames arrive late, for up to about 1.5 ms more latency. With 2x and no cap the GPU can hold, "
-        "gives up about 3% frame rate for more even frames. No effect without frame generation. Lower latency: "
-        "keeps less work waiting for the GPU; in testing up to about 2 ms lower latency, in some games a "
-        "slightly lower frame rate and less even frames. Balanced is the default. Applies to 64-bit "
-        "DirectX 12 games.");
+        "fewer frames arrive late, for up to about 1.5 ms more latency. With no cap the GPU can hold, gives up "
+        "about 2% frame rate and a few ms of latency for more even frames. No effect without frame generation. "
+        "Lower latency: "
+        "keeps less work waiting for the GPU; with DLSS frame generation at a cap it also starts each frame "
+        "later, so more frames arrive late. In testing 2 to 3 ms lower latency at a cap, a 1% low 4 to 6 fps "
+        "lower and slightly less even frames. Balanced is the default. Applies to 64-bit DirectX 12 games.");
     // A developer key that differs from its default decides its own value: the selected position is then not what runs.
     const PacingPreferenceResolution position = PacingPipeline_ResolvePreference(g_config.pacing_preference,
         kPacingUnifiedQueueRankDefault, kPacingUnifiedHoldShareDefault, kPacingFgLeadExtraDefaultUs);
     const PacingPreferenceResolution effective = PacingPipeline_ResolvePreference(g_config.pacing_preference,
-        g_config.unified_queue_rank, g_config.unified_hold_share, g_config.fg_lead_extra_us);
+        g_config.unified_queue_rank, g_config.unified_hold_share, g_config.fg_lead_extra_us,
+        g_config.fg_lead_coverage, g_config.fg_lead_floor);
     if (position.queue_rank != effective.queue_rank || position.hold_share != effective.hold_share ||
-        position.lead_extra_us != effective.lead_extra_us)
+        position.lead_extra_us != effective.lead_extra_us || position.lead_coverage != effective.lead_coverage ||
+        position.lead_floor != effective.lead_floor)
         ImGui::TextDisabled("A developer setting overrides the selected position.");
 }
 #endif

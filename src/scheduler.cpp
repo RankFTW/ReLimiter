@@ -353,6 +353,9 @@ int s_logged_start_limit = -1;
 // The first lead sample that left out the game's simulation → render queue
 // (lead_controller.h) has been logged. Once per process.
 bool s_logged_lead_queue = false;
+// The serial chain's counts (lead_controller.h) are logged when they first appear and each time they have grown
+// fourfold since, so a capture's log tells how often the rule acted without a line per frame.
+uint64_t s_logged_lead_chain_next = 1;
 // The queue-order verdicts last logged (lead_controller.h): the next frame's
 // GPU work runs behind the GPU queue wait or behind the FG input wait (the
 // lead samples leave out the frame's wait for the previous frame).
@@ -538,6 +541,17 @@ static void ObserveCollisionGuard(double fg_divisor, bool ordered, bool gpu_queu
                  "(sample %.0f us; the render thread was still inside the previous Present)",
                  statistics.last_queue_us, statistics.last_sample_us);
         s_logged_lead_queue = true;
+    }
+    // Serial chain (lead_controller.h): the lead's counts start over with its statistics.
+    const uint64_t chain_events = statistics.chain_late_samples + statistics.early_start_samples;
+    if (chain_events * 4 < s_logged_lead_chain_next) s_logged_lead_chain_next = 1;
+    if (chain_events >= s_logged_lead_chain_next) {
+        LOG_INFO("Lead: serial chain: %llu FG input wait samples counted the readiness only up to one interval "
+                 "behind the previous frame (newest: %.0f us left out), %llu frames whose GPU start lay inside the "
+                 "previous frame's work were not taken for frames waiting on their own submissions",
+                 static_cast<unsigned long long>(statistics.chain_late_samples), statistics.last_chain_late_us,
+                 static_cast<unsigned long long>(statistics.early_start_samples));
+        s_logged_lead_chain_next = chain_events * 4;
     }
     // The GPU queue wait's lines only on its own plans: its verdicts take the regime of the newest GPU queue wait
     // plan, which a frame planned on another rung does not tell.
@@ -1362,9 +1376,14 @@ static SourceStageFrame RunPlanned(
     // route and mode Off excluded): the unified branch of the source stage plans it.
     const bool unified = SourceStage_UnifiedPlans(pipeline, config.unified, s_source_stage.UnifiedEnabled());
     // Lead spike floor (lead_controller.h).
-    request.spike_floor = kPacingLeadSpikeFloor;
+    // The FG input wait's lead leaves it out where the configuration says so (developer key fg_lead_floor, the Lower
+    // latency position's lever).
+    request.spike_floor = kPacingLeadSpikeFloor && (pipeline.rung != PacingRung::FgInputWait || config.fg_lead_floor);
     // Developer key lead_queue_correction (lead_controller.h): read once per plan, kept by the lead with the frame.
     request.queue_correction = g_lead_queue_correction.load(std::memory_order_relaxed);
+    // Developer key fg_lead_chain (lead_controller.h, the serial chain): read once per plan, kept by the lead with
+    // the frame; only the FG input wait's plans use it.
+    request.serial_chain = g_fg_lead_chain.load(std::memory_order_relaxed);
     // Developer A/B switches of the collision guard (lead_controller.h): the late state (gpu_wait_late_guard), the
     // start limit (gpu_wait_start_limit) and present-first ordering (gpu_wait_present_first; gpu_hold_order.h), with
     // the interleave key gpu_wait_ab_interleave_s (the periods and what each period does: SourceStage_Switches,

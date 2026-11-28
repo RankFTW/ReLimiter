@@ -128,6 +128,20 @@ constexpr int kPacingFgFlipGateFitDefault = 75;
 // the FG input wait rung only (no other rung's lead changes); the Smooth position sets it (below).
 constexpr int kPacingFgLeadExtraDefaultUs = 0;
 constexpr int kPacingFgLeadExtraMaxUs = 4000;
+// Developer key fg_lead_chain (default on; lead_controller.h, the serial chain): behind the FG input wait the lead's
+// samples leave out what the GPU's serial chain did to a frame (the lateness of a frame whose work waited for the
+// frame before, and the measured readiness of a frame whose GPU start the driver stamped inside the previous
+// frame's work), and the queue-order verdict stands through a few such starts. False is the lead as it was built
+// before, the developer's off switch.
+constexpr bool kPacingFgLeadChainDefault = true;
+// Developer keys fg_lead_coverage (default 0, the position's own; else kPacingFgLeadCoverageMin to
+// kPacingFgLeadCoverageMax percent) and fg_lead_floor (default 0, the position's own | 1 on | -1 off): the share of
+// its samples the FG input wait's lead covers, and whether the spike floor is part of that lead (lead_controller.h).
+// The pacing preference sets both (below). Every other rung keeps kPacingLeadCoverage and kPacingLeadSpikeFloor.
+constexpr int kPacingFgLeadCoverageDefault = 0;
+constexpr int kPacingFgLeadCoverageMin = 50;
+constexpr int kPacingFgLeadCoverageMax = 99;
+constexpr int kPacingFgLeadFloorDefault = 0;
 
 // ── Constants of the removed pacing settings ──
 // Each fixes the value of a setting that no longer exists. Under the unified pacer it is what
@@ -141,16 +155,8 @@ constexpr bool kPacingLeadSpikeFloor = true;                                    
 // The pacing preference's levers (see PacingPipeline_ResolvePreference).
 constexpr int kPacingPreferenceLatencyRank = 4;
 constexpr double kPacingPreferenceSmoothHoldShare = 1.0 / 32.0;
-// The Smooth position's second lever (Config_ApplyPacingPipeline; the developer key fg_late_spacing_commanded turns the
-// same thing on in any position): the FG input wait's output spacing floor keeps the commanded interval, so the frames
-// the hold share holds while the GPU sets the pace are spaced as well. Measured on top of the share with frame
-// generation 2x and hardware flip metering, no cap, record N.211: Gears 1% low +3.7 fps, hitches 23.5 to 17.0 a
-// minute, displayed change 0.47 to 0.33 ms, for 1.2% of the frame rate and 1.9 ms; Phantom Blade Zero hitches 46.7
-// to 38.6, 1% low +0.8, the change level, for 0.8% and 0.9 ms. At a reachable cap it acts only in the moments the
-// GPU binds (Gears at 90: +0.8 ms, the lows level).
-constexpr bool kPacingPreferenceSmoothFloorCommanded = true;
 
-// The Smooth position's third lever (PacingPipeline_ResolvePreference; the developer key fg_lead_extra_us sets the
+// The Smooth position's second lever (PacingPipeline_ResolvePreference; the developer key fg_lead_extra_us sets the
 // same in any position): extra lead for the FG input wait, the slack a frame's CPU side gets before its output
 // target (the frames late at a cap are late on the game's CPU side, record N.211 finding 1241). Owner, 2026-11-23:
 // one to two milliseconds are acceptable in Smooth where the gain is significant. Measured under Smooth with frame
@@ -161,26 +167,57 @@ constexpr bool kPacingPreferenceSmoothFloorCommanded = true;
 // changed nothing in either game (frame rate, lows, latency all inside the noise).
 constexpr int kPacingPreferenceSmoothLeadExtraUs = 1000;
 
+// The Lower latency position's second lever (PacingPipeline_ResolvePreference; the developer keys fg_lead_coverage
+// and fg_lead_floor set the same in any position): the FG input wait's lead covers 75% of its samples and leaves the
+// spike floor out. At a cap every frame then starts later against its output target and waits less in front of the
+// GPU, and more frames are ready after their target. Sweep of the coverage with the lead's serial chain rule on,
+// Phantom Blade Zero on an RTX 4090, two runs a setting in mirrored order (2026-11-27; 99, 95 and 90% with the
+// floor, 90, 75 and 50% without). Frame generation 3x at a cap of 104 the GPU holds with room: PC latency 64.3 /
+// 64.3 / 64.3 / 62.9 / 62.0 / 62.1 ms, 1% low 91.6 / 85.1 / 86.2 / 84.1 / 85.2 / 81.6 fps, hitches 0.8 / 3.0 / 3.8
+// / 2.3 / 2.3 / 5.3 a minute, displayed frame-to-frame change 0.10 / 0.12 / 0.12 / 0.14 / 0.15 / 0.18 ms, frames
+// ready after their target 5 / 16 / 17 / 20 / 21 / 43%. Frame generation 4x at the display's VRR cap, which the GPU
+// just reaches: PC latency 62.2 / 64.0 / 62.2 / 61.7 / 61.2 / 61.3 ms, 1% low 106.6 / 107.2 / 107.9 / 106.2 / 106.5
+// / 104.6 fps, hitches 19.8 / 20.6 / 23.6 / 19.8 / 25.9 / 28.9 a minute. So a lower coverage with the floor gives no
+// latency back and costs the lows, which is why Balanced keeps 99% with the floor; 75% without the floor is where
+// the latency stops falling (−2.3 and −1.0 ms), and 50% only adds late frames. The whole position (this lever and
+// the rank) against Balanced, three runs each in one launch, every position once in each place of the order: at
+// the cap of 104, PC latency 65.3 → 62.2 ms, 1% low 89.4 → 83.6 fps, hitches 1.5 → 3.0 a minute, displayed
+// frame-to-frame change 0.10 → 0.16 ms; 4× at the VRR cap, 63.6 → 61.1 ms, 1% low 106.4 → 102.7 fps, hitches
+// 21.8 → 26.9 a minute, the change 0.18 and 0.19 ms.
+constexpr int kPacingPreferenceLatencyLeadCoverage = 75;
+constexpr bool kPacingPreferenceLatencyLeadFloor = false;
+
+// lead_coverage: 0 keeps the pipeline's coverage (kPacingLeadCoverage), else the percent of its samples the FG input
+// wait's lead covers. lead_floor: whether the spike floor is part of the FG input wait's lead.
 struct PacingPreferenceResolution {
     int queue_rank;
     double hold_share;
     int lead_extra_us;
+    int lead_coverage;
+    bool lead_floor;
 };
 
-// The queue law's rank, the hold share and the FG input wait's extra lead the pipeline carries. A developer key that
-// differs from its own default decides its own value whatever the preference; a developer key at its default inherits
-// the preference. The levers are independent: Latency changes only the rank, Smooth the share and the extra lead,
-// Balanced none.
+// The queue law's rank, the hold share and the FG input wait's extra lead, coverage and spike floor the pipeline
+// carries. A developer key that differs from its own default decides its own value whatever the preference; a
+// developer key at its default inherits the preference. The levers are independent: Latency changes the rank and
+// the FG input wait's coverage and floor, Smooth the share and the extra lead, Balanced none.
 constexpr PacingPreferenceResolution PacingPipeline_ResolvePreference(PacingPreference preference,
-    int developer_rank, double developer_hold_share, int developer_lead_extra_us) noexcept
+    int developer_rank, double developer_hold_share, int developer_lead_extra_us,
+    int developer_lead_coverage = kPacingFgLeadCoverageDefault,
+    int developer_lead_floor = kPacingFgLeadFloorDefault) noexcept
 {
-    PacingPreferenceResolution resolved{ developer_rank, developer_hold_share, developer_lead_extra_us };
+    PacingPreferenceResolution resolved{ developer_rank, developer_hold_share, developer_lead_extra_us,
+        developer_lead_coverage, developer_lead_floor >= 0 };
     if (preference == PacingPreference::Latency && developer_rank == kPacingUnifiedQueueRankDefault)
         resolved.queue_rank = kPacingPreferenceLatencyRank;
     if (preference == PacingPreference::Smooth && developer_hold_share == kPacingUnifiedHoldShareDefault)
         resolved.hold_share = kPacingPreferenceSmoothHoldShare;
     if (preference == PacingPreference::Smooth && developer_lead_extra_us == kPacingFgLeadExtraDefaultUs)
         resolved.lead_extra_us = kPacingPreferenceSmoothLeadExtraUs;
+    if (preference == PacingPreference::Latency && developer_lead_coverage == kPacingFgLeadCoverageDefault)
+        resolved.lead_coverage = kPacingPreferenceLatencyLeadCoverage;
+    if (preference == PacingPreference::Latency && developer_lead_floor == kPacingFgLeadFloorDefault)
+        resolved.lead_floor = kPacingPreferenceLatencyLeadFloor;
     return resolved;
 }
 
@@ -271,6 +308,12 @@ struct PacingPipelineConfig {
     // Key fg_lead_extra_us [0, kPacingFgLeadExtraMaxUs] µs (developer; the effective value, so the Smooth position's
     // lever too): PacingPipeline_Resolve adds it to the allowance of the FG input wait rung's lead. ClampConfig clamps.
     int fg_lead_extra_us = kPacingFgLeadExtraDefaultUs;
+    // Keys fg_lead_coverage and fg_lead_floor (developer; the effective values, so the Lower latency position's lever
+    // too). Coverage: 0 keeps the pipeline's coverage, kPacingFgLeadCoverageMin to kPacingFgLeadCoverageMax percent is
+    // the FG input wait rung's lead quantile (PacingPipeline_Resolve); ClampConfig clamps it. Floor: false leaves the
+    // spike floor out of the FG input wait's lead (the scheduler owner reads it at each plan).
+    int fg_lead_coverage = kPacingFgLeadCoverageDefault;
+    bool fg_lead_floor = true;
 };
 
 // ── Inputs ──
